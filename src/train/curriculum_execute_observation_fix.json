@@ -1,0 +1,81 @@
+{
+  "mode": "execute",
+  "device": "cuda",
+  "bf16_enabled": true,
+  "dora_applied": true,
+  "stages": [
+    {
+      "stage_name": "stage1-monophonic-foundation",
+      "steps_executed": 1,
+      "mean_loss": 6.264346599578857,
+      "min_loss": 6.264346599578857,
+      "max_loss": 6.264346599578857,
+      "final_loss": 6.264346599578857,
+      "lr_dora": 0.003,
+      "lr_new_modules": 0.001,
+      "non_finite_events": 0,
+      "grad_alert_count": 0
+    },
+    {
+      "stage_name": "stage2-polyphonic",
+      "steps_executed": 1,
+      "mean_loss": 6.254968643188477,
+      "min_loss": 6.254968643188477,
+      "max_loss": 6.254968643188477,
+      "final_loss": 6.254968643188477,
+      "lr_dora": 0.0015,
+      "lr_new_modules": 0.0005,
+      "non_finite_events": 0,
+      "grad_alert_count": 0
+    },
+    {
+      "stage_name": "stage3-full-complexity",
+      "steps_executed": 1,
+      "mean_loss": 6.2205400466918945,
+      "min_loss": 6.2205400466918945,
+      "max_loss": 6.2205400466918945,
+      "final_loss": 6.2205400466918945,
+      "lr_dora": 0.00075,
+      "lr_new_modules": 0.00025,
+      "non_finite_events": 0,
+      "grad_alert_count": 0
+    }
+  ],
+  "dora_target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "out_proj",
+    "cross_attn_q",
+    "cross_attn_k",
+    "cross_attn_v",
+    "cross_attn_out",
+    "ffn_gate",
+    "ffn_up",
+    "ffn_down"
+  ],
+  "dora_config": {
+    "adapter_type": "dora",
+    "rank": 16,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "out_proj",
+      "cross_attn_q",
+      "cross_attn_k",
+      "cross_attn_v",
+      "cross_attn_out",
+      "ffn_gate",
+      "ffn_up",
+      "ffn_down"
+    ],
+    "alpha": 16,
+    "dropout": 0.05
+  },
+  "step_log_path": "src\\train\\training_steps_observation_fix.jsonl",
+  "checkpoint_dir": "src\\train\\checkpoints",
+  "checkpoints_written": [],
+  "validation_events": [],
+  "grad_alerts": []
+}

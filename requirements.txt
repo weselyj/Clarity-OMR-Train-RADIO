@@ -1,0 +1,45 @@
+# Clarity OMR dependencies
+# Install: pip install -r requirements.txt
+#
+# For GPU (CUDA) support, install PyTorch with CUDA first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Then install the rest:
+#   pip install -r requirements.txt
+#
+# For CPU only (PyTorch CPU is installed automatically):
+#   pip install -r requirements.txt
+
+# PyTorch (CPU wheels - override with CUDA install above if you have a GPU)
+torch
+torchvision
+
+# Model download
+huggingface_hub
+
+# PDF rendering (install at least one)
+pymupdf
+
+# Stage A - staff detection
+ultralytics
+
+# Stage B - token recognition
+timm
+transformers
+peft
+
+# MusicXML export
+music21
+lxml
+
+# Image processing
+Pillow
+numpy
+scikit-image
+
+# Config
+PyYAML
+
+# Evaluation (optional)
+# mir_eval
+# verovio
+# cairosvg

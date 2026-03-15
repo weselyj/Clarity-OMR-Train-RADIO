@@ -1,0 +1,131 @@
+{
+  "audit_type": "OMR Architecture Compliance",
+  "checks": [
+    {
+      "check_id": 1,
+      "name": "Vocabulary size",
+      "pass": true,
+      "value": 380,
+      "expected": 380,
+      "category": "Tokenizer"
+    },
+    {
+      "check_id": 2,
+      "name": "Stage A detection class count",
+      "pass": true,
+      "value": 5,
+      "expected": 5,
+      "category": "Stage A (YOLO)"
+    },
+    {
+      "check_id": 3,
+      "name": "Stage A vertical padding (config standard)",
+      "pass": true,
+      "value": 0.15,
+      "expected": 0.15,
+      "note": "Standard value defined in architecture",
+      "category": "Stage A (YOLO)"
+    },
+    {
+      "check_id": 4,
+      "name": "Stage A horizontal padding (config standard)",
+      "pass": true,
+      "value": 0.03,
+      "expected": 0.03,
+      "note": "Standard value defined in architecture",
+      "category": "Stage A (YOLO)"
+    },
+    {
+      "check_id": 5,
+      "name": "Stage A vertical overlap threshold (config standard)",
+      "pass": true,
+      "value": 0.5,
+      "expected": 0.5,
+      "note": "Standard value used in overlaps_vertically() method",
+      "category": "Stage A (YOLO)"
+    },
+    {
+      "check_id": 6,
+      "name": "Stage A (YOLO) configuration import",
+      "pass": true,
+      "value": "YoloStageAConfig created successfully",
+      "category": "Stage A (YOLO)"
+    },
+    {
+      "check_id": 7,
+      "name": "Stage B encoder dimension",
+      "pass": true,
+      "value": 768,
+      "expected": 768,
+      "category": "Stage B (Florence)"
+    },
+    {
+      "check_id": 8,
+      "name": "Stage B decoder dimension",
+      "pass": true,
+      "value": 512,
+      "expected": 512,
+      "category": "Stage B (Florence)"
+    },
+    {
+      "check_id": 9,
+      "name": "Stage B decoder attention heads",
+      "pass": true,
+      "value": 8,
+      "expected": 8,
+      "category": "Stage B (Florence)"
+    },
+    {
+      "check_id": 10,
+      "name": "Stage B decoder layers",
+      "pass": true,
+      "value": 6,
+      "expected": 6,
+      "category": "Stage B (Florence)"
+    },
+    {
+      "check_id": 11,
+      "name": "Stage B max decode length",
+      "pass": true,
+      "value": 512,
+      "expected": 512,
+      "category": "Stage B (Florence)"
+    },
+    {
+      "check_id": 12,
+      "name": "Stage B DoRA adapter rank",
+      "pass": true,
+      "value": 16,
+      "expected": 16,
+      "category": "Stage B (Florence) - DoRA"
+    },
+    {
+      "check_id": 13,
+      "name": "Stage 1 (Monophonic Foundation) epochs",
+      "pass": true,
+      "value": 15,
+      "expected": 15,
+      "category": "Training Configuration"
+    },
+    {
+      "check_id": 14,
+      "name": "Stage 2 (Polyphonic) epochs",
+      "pass": true,
+      "value": 15,
+      "expected": 15,
+      "category": "Training Configuration"
+    },
+    {
+      "check_id": 15,
+      "name": "Stage 3 (Full Complexity) epochs",
+      "pass": true,
+      "value": 20,
+      "expected": 20,
+      "category": "Training Configuration"
+    }
+  ],
+  "summary": {
+    "pass": 15,
+    "fail": 0
+  }
+}

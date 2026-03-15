@@ -1,0 +1,114 @@
+{
+  "mode": "dry-run",
+  "stages": [
+    {
+      "stage_name": "stage1-monophonic-foundation",
+      "epochs": 15,
+      "effective_samples_per_epoch": 114000,
+      "batch_size": 32,
+      "max_sequence_length": 256,
+      "lr_dora": 0.003,
+      "lr_new_modules": 0.001,
+      "warmup_steps": 2000,
+      "schedule": "cosine",
+      "label_smoothing": 0.1,
+      "checkpoint_every_steps": 1000,
+      "validate_every_steps": 500,
+      "sources": {
+        "primus": {
+          "split": "train",
+          "required": true,
+          "available_samples": 74311,
+          "target_samples_per_epoch": 79800
+        },
+        "cameraprimus": {
+          "split": "train",
+          "required": true,
+          "available_samples": 74596,
+          "target_samples_per_epoch": 34200
+        }
+      },
+      "warnings": []
+    },
+    {
+      "stage_name": "stage2-polyphonic",
+      "epochs": 15,
+      "effective_samples_per_epoch": 46000,
+      "batch_size": 32,
+      "max_sequence_length": 384,
+      "lr_dora": 0.0015,
+      "lr_new_modules": 0.0005,
+      "warmup_steps": 1000,
+      "schedule": "cosine-warm-restart",
+      "label_smoothing": 0.1,
+      "checkpoint_every_steps": 1000,
+      "validate_every_steps": 500,
+      "sources": {
+        "grandstaff": {
+          "split": "train",
+          "required": true,
+          "available_samples": 91606,
+          "target_samples_per_epoch": 8000
+        },
+        "synthetic_polyphonic": {
+          "split": "train",
+          "required": false,
+          "available_samples": 0,
+          "target_samples_per_epoch": 28800
+        },
+        "primus": {
+          "split": "train",
+          "required": true,
+          "available_samples": 74311,
+          "target_samples_per_epoch": 9200
+        }
+      },
+      "warnings": [
+        "Dataset 'synthetic_polyphonic' split 'train' has no samples; target=28800 will be deferred."
+      ]
+    },
+    {
+      "stage_name": "stage3-full-complexity",
+      "epochs": 20,
+      "effective_samples_per_epoch": 154000,
+      "batch_size": 32,
+      "max_sequence_length": 512,
+      "lr_dora": 0.00075,
+      "lr_new_modules": 0.00025,
+      "warmup_steps": 1000,
+      "schedule": "cosine-warm-restart",
+      "label_smoothing": 0.1,
+      "checkpoint_every_steps": 1000,
+      "validate_every_steps": 500,
+      "sources": {
+        "synthetic_fullpage": {
+          "split": "train",
+          "required": false,
+          "available_samples": 0,
+          "target_samples_per_epoch": 115200
+        },
+        "lieder-main": {
+          "split": "train",
+          "required": true,
+          "available_samples": 1093,
+          "target_samples_per_epoch": 8000
+        },
+        "primus": {
+          "split": "train",
+          "required": true,
+          "available_samples": 74311,
+          "target_samples_per_epoch": 15400
+        },
+        "grandstaff": {
+          "split": "train",
+          "required": true,
+          "available_samples": 91606,
+          "target_samples_per_epoch": 15400
+        }
+      },
+      "warnings": [
+        "Dataset 'synthetic_fullpage' split 'train' has no samples; target=115200 will be deferred."
+      ]
+    }
+  ]
+}

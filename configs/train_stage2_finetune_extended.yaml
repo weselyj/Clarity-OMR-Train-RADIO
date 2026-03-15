@@ -1,0 +1,37 @@
+stage_name: stage2-polyphonic-finetune-extended
+epochs: 10
+effective_samples_per_epoch: 16000
+batch_size: 8
+grad_accumulation_steps: 4
+max_sequence_length: 384
+lr_dora: 0.00006
+lr_new_modules: 0.00003
+loraplus_lr_ratio: 2.0
+warmup_steps: 200
+schedule: cosine
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+weight_decay: 0.01
+checkpoint_every_steps: 500
+validate_every_steps: 250
+dataset_mix:
+  - dataset: grandstaff
+    ratio: 0.40
+    split: train
+    required: true
+  - dataset: synthetic_polyphonic
+    ratio: 0.25
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.10
+    split: train
+    required: true
+  - dataset: synthetic_fullpage
+    ratio: 0.15
+    split: train
+    required: true
+  - dataset: lieder-main
+    ratio: 0.10
+    split: train
+    required: false

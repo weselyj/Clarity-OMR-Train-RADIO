@@ -1,0 +1,48 @@
+{
+  "steps": 3,
+  "stages_seen": [
+    "stage1-monophonic-foundation",
+    "stage2-polyphonic",
+    "stage3-full-complexity"
+  ],
+  "latest": {
+    "global_step": 3,
+    "stage_name": "stage3-full-complexity",
+    "loss": 6.341756343841553,
+    "lr_new_modules": 5e-07,
+    "lr_dora": 1.5e-06,
+    "grad_norm": 3.375962972640991,
+    "timestamp_utc": "2026-02-18T12:32:54.754353+00:00"
+  },
+  "loss": {
+    "min": 6.3289618492126465,
+    "max": 6.341756343841553,
+    "latest": 6.341756343841553,
+    "mean_recent_window": 6.336757342020671,
+    "mean_previous_window": null
+  },
+  "lr": {
+    "min_new_modules": 5e-07,
+    "max_new_modules": 1e-06,
+    "latest_new_modules": 5e-07,
+    "distinct_new_modules": 2,
+    "min_dora": 1.5e-06,
+    "max_dora": 3e-06,
+    "latest_dora": 1.5e-06,
+    "distinct_dora": 2
+  },
+  "grad_norm": {
+    "min": 3.248685836791992,
+    "max": 3.937072277069092,
+    "latest": 3.375962972640991,
+    "mean_recent_window": 3.520573695500692
+  },
+  "anomalies": {
+    "non_finite_loss_steps": [],
+    "non_finite_grad_steps": [],
+    "high_grad_steps": [],
+    "loss_spike_steps": []
+  },
+  "alerts": [],
+  "healthy": true
+}

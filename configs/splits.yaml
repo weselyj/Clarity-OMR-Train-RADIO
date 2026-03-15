@@ -1,0 +1,22 @@
+seed: 1337
+default:
+  train: 0.85
+  val: 0.05
+  test: 0.10
+datasets:
+  primus:
+    train: 0.85
+    val: 0.05
+    test: 0.10
+  cameraprimus:
+    train: 0.85
+    val: 0.05
+    test: 0.10
+  grandstaff:
+    train: 0.85
+    val: 0.05
+    test: 0.10
+  lieder-main:
+    train: 0.75
+    val: 0.05
+    test: 0.20

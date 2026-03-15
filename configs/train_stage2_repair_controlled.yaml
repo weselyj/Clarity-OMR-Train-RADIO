@@ -1,0 +1,29 @@
+stage_name: stage2-polyphonic-repair-controlled
+epochs: 4
+effective_samples_per_epoch: 10000
+batch_size: 8
+grad_accumulation_steps: 1
+max_sequence_length: 384
+lr_dora: 0.002
+lr_new_modules: 0.0005
+loraplus_lr_ratio: 2.0
+warmup_steps: 400
+schedule: cosine
+label_smoothing: 0.05
+contour_loss_weight: 0.1
+weight_decay: 0.0
+checkpoint_every_steps: 500
+validate_every_steps: 250
+dataset_mix:
+  - dataset: grandstaff
+    ratio: 0.50
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.25
+    split: train
+    required: true
+  - dataset: cameraprimus
+    ratio: 0.25
+    split: train
+    required: true

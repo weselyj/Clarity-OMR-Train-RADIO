@@ -1,0 +1,67 @@
+stage_name: stage2-polyphonic-bold-r64
+
+# ── Resume ────────────────────────────────────────────────────────
+# Continues from refine2 step 4500 weights with FRESH optimizer/scheduler
+# Use: --resume-checkpoint info/stage2-polyphonic-refine2-r64_step_0004500.pt --start-stage 1
+
+# ── Duration ──────────────────────────────────────────────────────
+# 20 epochs × 24k samples / effective-batch-32 = 15,000 steps
+epochs: 20
+effective_samples_per_epoch: 24000
+
+# ── Batch ─────────────────────────────────────────────────────────
+batch_size: 8
+grad_accumulation_steps: 4
+max_sequence_length: 512
+
+# ── Learning rates ────────────────────────────────────────────────
+# 4× higher than refine2's plateau LR, fresh optimizer + warmup
+# Cosine decays to 10% of peak (1e-5)
+lr_dora: 0.0001
+lr_new_modules: 0.00005
+loraplus_lr_ratio: 2.0
+
+# ── Schedule ──────────────────────────────────────────────────────
+# 750-step warmup (~5%) then cosine decay
+warmup_steps: 750
+schedule: cosine
+
+# ── Regularization ────────────────────────────────────────────────
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+weight_decay: 0.02
+
+# ── Checkpointing ────────────────────────────────────────────────
+checkpoint_every_steps: 1000
+validate_every_steps: 500
+
+# ── Dataset mix ───────────────────────────────────────────────────
+dataset_mix:
+  - dataset: grandstaff
+    ratio: 0.30
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.20
+    split: train
+    required: true
+  - dataset: cameraprimus
+    ratio: 0.15
+    split: train
+    required: true
+  - dataset: synthetic_polyphonic
+    ratio: 0.15
+    split: train
+    required: true
+  - dataset: synthetic_fullpage
+    ratio: 0.10
+    split: train
+    required: true
+  - dataset: focus_bold_r64
+    ratio: 0.05
+    split: train
+    required: true
+  - dataset: lieder-main
+    ratio: 0.05
+    split: train
+    required: false

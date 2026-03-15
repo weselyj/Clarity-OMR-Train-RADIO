@@ -1,0 +1,1774 @@
+#!/usr/bin/env python3
+"""Curriculum training driver for Stage-B staff recognition."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import random
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import yaml
+
+if __package__ in {None, ""}:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from src.tokenizer.vocab import build_default_vocabulary
+from src.train.model_factory import (
+    ModelFactoryConfig,
+    build_stage_b_components,
+    model_factory_config_from_checkpoint_payload,
+)
+
+
+PITCH_CLASS_TO_SEMITONE = {
+    "C": 0,
+    "C#": 1,
+    "Db": 1,
+    "D": 2,
+    "D#": 3,
+    "Eb": 3,
+    "E": 4,
+    "F": 5,
+    "F#": 6,
+    "Gb": 6,
+    "G": 7,
+    "G#": 8,
+    "Ab": 8,
+    "A": 9,
+    "A#": 10,
+    "Bb": 10,
+    "B": 11,
+}
+
+CONTOUR_DOWN = 0
+CONTOUR_SAME = 1
+CONTOUR_UP = 2
+
+
+@dataclass(frozen=True)
+class DatasetMix:
+    dataset: str
+    ratio: float
+    split: str = "train"
+    required: bool = False
+
+
+@dataclass(frozen=True)
+class StageTrainingConfig:
+    stage_name: str
+    epochs: int
+    effective_samples_per_epoch: int
+    batch_size: int
+    max_sequence_length: int
+    lr_dora: float
+    lr_new_modules: float
+    warmup_steps: int
+    schedule: str
+    label_smoothing: float
+    contour_loss_weight: float
+    weight_decay: float
+    checkpoint_every_steps: int
+    validate_every_steps: int
+    grad_accumulation_steps: int
+    loraplus_lr_ratio: float
+    dataset_mix: Tuple[DatasetMix, ...]
+
+
+def load_yaml(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config file must decode to an object: {path}")
+    return payload
+
+
+def load_stage_config(path: Path) -> StageTrainingConfig:
+    raw = load_yaml(path)
+    mix_raw = raw.get("dataset_mix", [])
+    if not isinstance(mix_raw, list) or not mix_raw:
+        raise ValueError(f"dataset_mix must be a non-empty list in {path}")
+
+    mix: List[DatasetMix] = []
+    for item in mix_raw:
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid dataset mix entry in {path}: {item}")
+        mix.append(
+            DatasetMix(
+                dataset=str(item["dataset"]).lower(),
+                ratio=float(item["ratio"]),
+                split=str(item.get("split", "train")).lower(),
+                required=bool(item.get("required", False)),
+            )
+        )
+
+    ratio_sum = sum(item.ratio for item in mix)
+    if not math.isclose(ratio_sum, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"dataset_mix ratios must sum to 1.0 in {path}, got {ratio_sum}")
+
+    return StageTrainingConfig(
+        stage_name=str(raw["stage_name"]),
+        epochs=int(raw["epochs"]),
+        effective_samples_per_epoch=int(raw["effective_samples_per_epoch"]),
+        batch_size=int(raw["batch_size"]),
+        max_sequence_length=int(raw["max_sequence_length"]),
+        lr_dora=float(raw["lr_dora"]),
+        lr_new_modules=float(raw["lr_new_modules"]),
+        warmup_steps=int(raw["warmup_steps"]),
+        schedule=str(raw.get("schedule", "cosine")).lower(),
+        label_smoothing=float(raw.get("label_smoothing", 0.0)),
+        contour_loss_weight=float(raw.get("contour_loss_weight", 0.1)),
+        weight_decay=max(0.0, float(raw.get("weight_decay", 0.01))),
+        checkpoint_every_steps=max(1, int(raw.get("checkpoint_every_steps", 1000))),
+        validate_every_steps=max(1, int(raw.get("validate_every_steps", 500))),
+        grad_accumulation_steps=max(1, int(raw.get("grad_accumulation_steps", 1))),
+        loraplus_lr_ratio=float(raw.get("loraplus_lr_ratio", 1.0)),
+        dataset_mix=tuple(mix),
+    )
+
+
+def load_token_manifest(path: Path) -> List[Dict[str, object]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Token manifest not found: {path}")
+    entries: List[Dict[str, object]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON line in {path}:{line_no}") from exc
+    return entries
+
+
+def _resolve_manifest_paths(project_root: Path, manifest_arg: str) -> List[Path]:
+    resolved: List[Path] = []
+    for manifest_str in manifest_arg.split(","):
+        raw = manifest_str.strip()
+        if not raw:
+            continue
+        manifest_path = Path(raw)
+        if not manifest_path.is_absolute():
+            manifest_path = project_root / manifest_path
+        resolved.append(manifest_path.resolve())
+    return resolved
+
+
+def _assert_not_stale_merged_manifest(project_root: Path, manifest_paths: Sequence[Path]) -> None:
+    if len(manifest_paths) != 1:
+        return
+    merged_path = manifest_paths[0]
+    if merged_path.name.lower() != "token_manifest_train.jsonl":
+        return
+    if not merged_path.exists():
+        return
+
+    base_manifest = (project_root / "src" / "data" / "manifests" / "token_manifest.jsonl").resolve()
+    synthetic_manifest = (
+        project_root / "data" / "processed" / "synthetic" / "manifests" / "synthetic_token_manifest.jsonl"
+    ).resolve()
+    dependencies = [path for path in (base_manifest, synthetic_manifest) if path.exists()]
+    if len(dependencies) < 2:
+        return
+
+    merged_mtime = merged_path.stat().st_mtime
+    newer_dependencies = [path for path in dependencies if path.stat().st_mtime > (merged_mtime + 1.0)]
+    if not newer_dependencies:
+        return
+
+    newer_paths = ", ".join(str(path) for path in newer_dependencies)
+    raise RuntimeError(
+        "Detected stale merged token manifest "
+        f"'{merged_path}'. Newer dependency manifest(s): {newer_paths}. "
+        "Regenerate token_manifest_train.jsonl or pass comma-separated manifests directly "
+        "(src/data/manifests/token_manifest.jsonl,data/processed/synthetic/manifests/synthetic_token_manifest.jsonl)."
+    )
+
+
+def group_entries_by_dataset_and_split(
+    entries: Sequence[Dict[str, object]]
+) -> Dict[Tuple[str, str], List[Dict[str, object]]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+    for entry in entries:
+        dataset = str(entry.get("dataset", "")).lower()
+        split = str(entry.get("split", "train")).lower()
+        grouped.setdefault((dataset, split), []).append(entry)
+    return grouped
+
+
+def sanitize_token_entries(
+    entries: Sequence[Dict[str, object]],
+    *,
+    enforce_strict_sequences: bool = True,
+    allow_relaxed_fallback: bool = True,
+) -> Tuple[List[Dict[str, object]], int]:
+    if not enforce_strict_sequences:
+        return list(entries), 0
+
+    from src.data.convert_tokens import validate_token_sequence
+
+    vocab = build_default_vocabulary()
+    cleaned: List[Dict[str, object]] = []
+    dropped = 0
+    for entry in entries:
+        sequence = entry.get("token_sequence", [])
+        if not isinstance(sequence, list) or not sequence:
+            dropped += 1
+            continue
+        normalized_sequence = [str(token) for token in sequence]
+        try:
+            vocab.encode(normalized_sequence, strict=True)
+        except Exception:
+            dropped += 1
+            continue
+        try:
+            validate_token_sequence(normalized_sequence, strict=True)
+        except Exception:
+            if not allow_relaxed_fallback:
+                dropped += 1
+                continue
+            try:
+                validate_token_sequence(normalized_sequence, strict=False)
+            except Exception:
+                dropped += 1
+                continue
+        cleaned.append(entry)
+    return cleaned, dropped
+
+
+def _compute_sample_targets(total: int, mix: Sequence[DatasetMix]) -> Dict[str, int]:
+    raw_targets = [total * item.ratio for item in mix]
+    floored = [int(math.floor(value)) for value in raw_targets]
+    remainder = total - sum(floored)
+    order = sorted(range(len(mix)), key=lambda idx: raw_targets[idx] - floored[idx], reverse=True)
+    for idx in order[:remainder]:
+        floored[idx] += 1
+    return {mix[idx].dataset: floored[idx] for idx in range(len(mix))}
+
+
+def build_stage_plan(
+    stage: StageTrainingConfig,
+    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
+) -> Dict[str, object]:
+    targets = _compute_sample_targets(stage.effective_samples_per_epoch, stage.dataset_mix)
+    source_summary: Dict[str, Dict[str, object]] = {}
+    warnings: List[str] = []
+
+    for source in stage.dataset_mix:
+        available = len(grouped_entries.get((source.dataset, source.split), []))
+        target = targets[source.dataset]
+        source_summary[source.dataset] = {
+            "split": source.split,
+            "required": source.required,
+            "available_samples": available,
+            "target_samples_per_epoch": target,
+        }
+        if source.required and available == 0:
+            raise ValueError(
+                f"Required dataset '{source.dataset}' split '{source.split}' is empty for stage '{stage.stage_name}'."
+            )
+        if available == 0:
+            warnings.append(
+                f"Dataset '{source.dataset}' split '{source.split}' has no samples; target={target} will be deferred."
+            )
+
+    return {
+        "stage_name": stage.stage_name,
+        "epochs": stage.epochs,
+        "effective_samples_per_epoch": stage.effective_samples_per_epoch,
+        "batch_size": stage.batch_size,
+        "max_sequence_length": stage.max_sequence_length,
+        "lr_dora": stage.lr_dora,
+        "lr_new_modules": stage.lr_new_modules,
+        "warmup_steps": stage.warmup_steps,
+        "schedule": stage.schedule,
+        "label_smoothing": stage.label_smoothing,
+        "contour_loss_weight": stage.contour_loss_weight,
+        "weight_decay": stage.weight_decay,
+        "checkpoint_every_steps": stage.checkpoint_every_steps,
+        "validate_every_steps": stage.validate_every_steps,
+        "sources": source_summary,
+        "warnings": warnings,
+    }
+
+
+def _sample_stage_batch(
+    stage: StageTrainingConfig,
+    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
+    rng: random.Random,
+    *,
+    split_override: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    split = split_override.lower() if split_override else None
+    targets = _compute_sample_targets(stage.batch_size, stage.dataset_mix)
+    batch: List[Dict[str, object]] = []
+    for source in stage.dataset_mix:
+        source_split = split if split is not None else source.split
+        candidates = grouped_entries.get((source.dataset, source_split), [])
+        target_count = targets[source.dataset]
+        if not candidates or target_count == 0:
+            continue
+        for _ in range(target_count):
+            batch.append(candidates[rng.randrange(0, len(candidates))])
+    while len(batch) < stage.batch_size:
+        fallback_sources = [
+            item
+            for item in stage.dataset_mix
+            if grouped_entries.get((item.dataset, split if split is not None else item.split))
+        ]
+        if not fallback_sources:
+            break
+        source = fallback_sources[rng.randrange(0, len(fallback_sources))]
+        source_split = split if split is not None else source.split
+        candidates = grouped_entries[(source.dataset, source_split)]
+        batch.append(candidates[rng.randrange(0, len(candidates))])
+    rng.shuffle(batch)
+    return batch[: stage.batch_size]
+
+
+def _parse_note_token_to_midi(token: str) -> Optional[int]:
+    if not token.startswith("note-"):
+        return None
+    symbol = token[5:]
+    if len(symbol) < 2:
+        return None
+    octave_text = symbol[-1]
+    pitch_class = symbol[:-1]
+    if not octave_text.isdigit():
+        return None
+    if pitch_class not in PITCH_CLASS_TO_SEMITONE:
+        return None
+    octave = int(octave_text)
+    return 12 * (octave + 1) + PITCH_CLASS_TO_SEMITONE[pitch_class]
+
+
+def _derive_pitch_contour(sequence: Sequence[str]) -> int:
+    notes: List[int] = []
+    for token in sequence:
+        pitch = _parse_note_token_to_midi(str(token))
+        if pitch is None:
+            continue
+        notes.append(pitch)
+        if len(notes) >= 2:
+            break
+    if len(notes) < 2:
+        return CONTOUR_SAME
+    if notes[1] > notes[0]:
+        return CONTOUR_UP
+    if notes[1] < notes[0]:
+        return CONTOUR_DOWN
+    return CONTOUR_SAME
+
+
+def _resolve_project_path(project_root: Path, value: object) -> Optional[Path]:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = project_root / path
+    resolved = path.resolve()
+    if not resolved.exists():
+        return None
+    return resolved
+
+
+def _fit_grayscale_to_canvas(image_obj, *, height: int, max_width: int):
+    from PIL import Image
+
+    source_width, source_height = image_obj.size
+    if source_height <= 0:
+        raise ValueError("Invalid source image height.")
+    target_width = int(round((float(source_width) / float(source_height)) * float(height)))
+    target_width = max(1, min(max_width, target_width))
+    resized = image_obj.convert("L").resize((target_width, height), Image.Resampling.BILINEAR)
+    canvas = Image.new("L", (max_width, height), color=255)
+    canvas.paste(resized, (0, 0))
+    return canvas, target_width
+
+
+def _load_raster_image_tensor(path: Path, *, height: int, max_width: int):
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    with Image.open(path) as image_obj:
+        canvas, content_width = _fit_grayscale_to_canvas(image_obj, height=height, max_width=max_width)
+    array = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).unsqueeze(0), int(content_width)
+
+
+def _render_symbolic_source_tensor(path: Path, *, height: int, max_width: int):
+    import numpy as np
+    import torch
+    import verovio
+    from PIL import Image
+    from cairosvg import svg2png
+    from io import BytesIO
+
+    candidates = [path]
+    for extension in (".mxl", ".mscx", ".musicxml", ".xml"):
+        candidate = path.with_suffix(extension)
+        if candidate.exists() and candidate not in candidates:
+            candidates.append(candidate)
+
+    svg_text = None
+    for candidate in candidates:
+        renderer = verovio.toolkit()
+        renderer.loadFile(str(candidate))
+        renderer.setOptions(
+            {
+                "font": "Bravura",
+                "pageWidth": int(max_width * 3),
+                "pageHeight": int(height * 3),
+                "scale": 40,
+                "breaks": "auto",
+                "svgBoundingBoxes": True,
+                "svgViewBox": True,
+            }
+        )
+        renderer.redoLayout()
+        page_count = int(renderer.getPageCount())
+        if page_count < 1:
+            continue
+        svg_text = renderer.renderToSVG(1)
+        break
+
+    if svg_text is None:
+        raise ValueError(f"Could not render symbolic source to image: {path}")
+
+    png_bytes = svg2png(bytestring=svg_text.encode("utf-8"), background_color="white")
+    with Image.open(BytesIO(png_bytes)) as image_obj:
+        if "A" in image_obj.getbands():
+            rgba = image_obj.convert("RGBA")
+            white_bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            grayscale_source = Image.alpha_composite(white_bg, rgba).convert("L")
+        else:
+            grayscale_source = image_obj.convert("L")
+        canvas, content_width = _fit_grayscale_to_canvas(grayscale_source, height=height, max_width=max_width)
+    array = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).unsqueeze(0), int(content_width)
+
+
+def _load_entry_image_tensor(
+    entry: Dict[str, object],
+    *,
+    project_root: Path,
+    height: int,
+    max_width: int,
+):
+    sample_id = str(entry.get("sample_id", "<unknown>"))
+    image_path = _resolve_project_path(project_root, entry.get("image_path"))
+    if image_path is not None:
+        return _load_raster_image_tensor(image_path, height=height, max_width=max_width)
+
+    source_path = _resolve_project_path(project_root, entry.get("source_path"))
+    if source_path is None:
+        raise FileNotFoundError(
+            f"Missing image_path and source_path for sample '{sample_id}'. "
+            "Regenerate token manifest after converter update."
+        )
+
+    # Backward compatibility for older token manifests that omitted image_path.
+    for extension in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"):
+        candidate = source_path.with_suffix(extension)
+        if candidate.exists():
+            return _load_raster_image_tensor(candidate, height=height, max_width=max_width)
+
+    if source_path.suffix.lower() in {".mxl", ".musicxml", ".xml", ".mscx"}:
+        return _render_symbolic_source_tensor(source_path, height=height, max_width=max_width)
+
+    raise FileNotFoundError(
+        f"Could not resolve image for sample '{sample_id}'. "
+        f"Tried image_path/source-derived raster for '{source_path}'."
+    )
+
+
+def _encode_batch(
+    batch: Sequence[Dict[str, object]],
+    max_sequence_length: int,
+    *,
+    project_root: Path,
+    image_height: int = 250,
+    image_width: int = 2500,
+):
+    import torch
+
+    vocab = build_default_vocabulary()
+    pad_id = vocab.token_to_id["<pad>"]
+    bos_id = vocab.token_to_id["<bos>"]
+    eos_id = vocab.token_to_id["<eos>"]
+    measure_end_id = vocab.token_to_id.get("<measure_end>")
+
+    decoder_inputs: List[List[int]] = []
+    labels: List[List[int]] = []
+    contour_targets: List[int] = []
+    images: List[torch.Tensor] = []
+    content_widths: List[int] = []
+    for entry in batch:
+        sample_id = str(entry.get("sample_id", "<unknown>"))
+        try:
+            image_tensor, content_width = _load_entry_image_tensor(
+                entry,
+                project_root=project_root,
+                height=image_height,
+                max_width=image_width,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            print(f"[train] skipping sample {sample_id}: {exc}", file=sys.stderr)
+            continue
+
+        sequence = entry.get("token_sequence", [])
+        if not isinstance(sequence, list) or not sequence:
+            sequence = ["<bos>", "<eos>"]
+        try:
+            token_ids = vocab.encode(sequence, strict=True)
+        except KeyError as exc:
+            print(f"[train] skipping sample {sample_id}: {exc}", file=sys.stderr)
+            continue
+        if len(token_ids) < 2:
+            token_ids = [bos_id, eos_id]
+        if len(token_ids) > max_sequence_length:
+            # Smart truncation: cut at last <measure_end> before limit, then append <eos>
+            # Reserve one slot so the final sequence (with <eos>) fits max_sequence_length.
+            truncated = token_ids[: max_sequence_length - 1]
+            if measure_end_id is not None:
+                last_me = -1
+                for i in range(len(truncated) - 1, -1, -1):
+                    if truncated[i] == measure_end_id:
+                        last_me = i
+                        break
+                if last_me > 0:
+                    token_ids = truncated[: last_me + 1] + [eos_id]
+                else:
+                    token_ids = truncated + [eos_id]
+            else:
+                token_ids = truncated + [eos_id]
+
+        contour_targets.append(_derive_pitch_contour(sequence))
+        images.append(image_tensor)
+        content_widths.append(int(content_width))
+
+        input_ids = token_ids[:-1]
+        label_ids = token_ids[1:]
+        if not input_ids:
+            input_ids = [bos_id]
+            label_ids = [eos_id]
+
+        input_pad = [pad_id] * max(0, max_sequence_length - 1 - len(input_ids))
+        label_pad = [-100] * max(0, max_sequence_length - 1 - len(label_ids))
+        decoder_inputs.append((input_ids + input_pad)[: max_sequence_length - 1])
+        labels.append((label_ids + label_pad)[: max_sequence_length - 1])
+
+    if not images:
+        raise RuntimeError("No loadable samples in batch after image resolution.")
+    images_tensor = torch.stack(images, dim=0)
+    decoder_tensor = torch.tensor(decoder_inputs, dtype=torch.long)
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    contour_tensor = torch.tensor(contour_targets, dtype=torch.long)
+    widths_tensor = torch.tensor(content_widths, dtype=torch.long)
+    return images_tensor, decoder_tensor, labels_tensor, contour_tensor, widths_tensor, vocab.size
+
+
+def _apply_online_augmentations(images, rng: random.Random):
+    from io import BytesIO
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+    from torchvision.transforms import functional as TF
+
+    augmented = images.clone()
+    for idx in range(augmented.shape[0]):
+        image = augmented[idx]
+        if rng.random() < 0.8:
+            image = TF.affine(
+                image,
+                angle=rng.uniform(-2.0, 2.0),
+                translate=[0, 0],
+                scale=rng.uniform(0.92, 1.08),
+                shear=[0.0, 0.0],
+            )
+        if rng.random() < 0.65:
+            image = TF.adjust_brightness(image, rng.uniform(0.90, 1.10))
+        if rng.random() < 0.65:
+            image = TF.adjust_contrast(image, rng.uniform(0.88, 1.12))
+        if rng.random() < 0.45:
+            image = TF.gaussian_blur(image, kernel_size=[3, 3], sigma=rng.uniform(0.0, 1.0))
+        if rng.random() < 0.25:
+            quality = int(rng.randint(70, 95))
+            as_uint8 = (
+                image.squeeze(0).detach().cpu().clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).numpy()
+            )
+            source = Image.fromarray(as_uint8, mode="L")
+            buffer = BytesIO()
+            source.save(buffer, format="JPEG", quality=quality)
+            buffer.seek(0)
+            with Image.open(buffer) as jpeg_image:
+                restored = np.asarray(jpeg_image.convert("L"), dtype=np.float32) / 255.0
+            image = torch.from_numpy(restored).unsqueeze(0).to(device=image.device, dtype=image.dtype)
+        if rng.random() < 0.25:
+            h, w = image.shape[-2:]
+            factor = rng.uniform(0.85, 1.0)
+            down = F.interpolate(
+                image.unsqueeze(0),
+                size=(max(1, int(h * factor)), max(1, int(w * factor))),
+                mode="bilinear",
+                align_corners=False,
+            )
+            image = F.interpolate(down, size=(h, w), mode="bilinear", align_corners=False).squeeze(0)
+        if rng.random() < 0.30:
+            array = image.squeeze(0).detach().cpu().numpy().copy()
+            flat = array.reshape(-1)
+            noise_fraction = rng.uniform(0.001, 0.0025)
+            noise_count = max(1, int(round(flat.size * noise_fraction)))
+            generator = np.random.default_rng(rng.randrange(0, 2**32))
+            indices = generator.choice(flat.size, size=noise_count, replace=False)
+            split_idx = noise_count // 2
+            flat[indices[:split_idx]] = 0.0
+            flat[indices[split_idx:]] = 1.0
+            image = torch.from_numpy(array).unsqueeze(0).to(device=image.device, dtype=image.dtype)
+        augmented[idx] = image.clamp(0.0, 1.0)
+    return augmented
+
+
+def _build_optimizer(model, stage: StageTrainingConfig):
+    import torch
+
+    weight_decay = max(0.0, float(stage.weight_decay))
+    no_decay_keywords = ("bias", "norm", "embedding")
+    lr_ratio = stage.loraplus_lr_ratio
+    # LoRA+ splits: lora_A gets base LR, lora_B + lora_magnitude get ratio * LR
+    dora_a_decay_params = []
+    dora_a_no_decay_params = []
+    dora_b_decay_params = []
+    dora_b_no_decay_params = []
+    new_module_decay_params = []
+    new_module_no_decay_params = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        lowered = str(name).lower()
+        use_no_decay = any(keyword in lowered for keyword in no_decay_keywords)
+        if "lora_" in name:
+            # lora_B and lora_magnitude get the higher learning rate
+            is_b_or_mag = "lora_B" in name or "lora_magnitude" in name
+            if is_b_or_mag:
+                if use_no_decay:
+                    dora_b_no_decay_params.append(parameter)
+                else:
+                    dora_b_decay_params.append(parameter)
+            else:
+                if use_no_decay:
+                    dora_a_no_decay_params.append(parameter)
+                else:
+                    dora_a_decay_params.append(parameter)
+        else:
+            if use_no_decay:
+                new_module_no_decay_params.append(parameter)
+            else:
+                new_module_decay_params.append(parameter)
+
+    param_groups = []
+    if dora_a_decay_params:
+        param_groups.append(
+            {
+                "params": dora_a_decay_params,
+                "lr": stage.lr_dora,
+                "weight_decay": weight_decay,
+                "group_name": "dora_A",
+            }
+        )
+    if dora_a_no_decay_params:
+        param_groups.append(
+            {
+                "params": dora_a_no_decay_params,
+                "lr": stage.lr_dora,
+                "weight_decay": 0.0,
+                "group_name": "dora_A",
+            }
+        )
+    if dora_b_decay_params:
+        param_groups.append(
+            {
+                "params": dora_b_decay_params,
+                "lr": stage.lr_dora * lr_ratio,
+                "weight_decay": weight_decay,
+                "group_name": "dora_B",
+            }
+        )
+    if dora_b_no_decay_params:
+        param_groups.append(
+            {
+                "params": dora_b_no_decay_params,
+                "lr": stage.lr_dora * lr_ratio,
+                "weight_decay": 0.0,
+                "group_name": "dora_B",
+            }
+        )
+    if new_module_decay_params:
+        param_groups.append(
+            {
+                "params": new_module_decay_params,
+                "lr": stage.lr_new_modules,
+                "weight_decay": weight_decay,
+                "group_name": "new_modules",
+            }
+        )
+    if new_module_no_decay_params:
+        param_groups.append(
+            {
+                "params": new_module_no_decay_params,
+                "lr": stage.lr_new_modules,
+                "weight_decay": 0.0,
+                "group_name": "new_modules",
+            }
+        )
+    if not param_groups:
+        raise RuntimeError("No trainable parameters found for optimizer setup.")
+    return torch.optim.AdamW(param_groups)
+
+
+def _build_scheduler(optimizer, stage: StageTrainingConfig, total_steps: int):
+    import torch
+
+    warmup_steps = max(1, stage.warmup_steps)
+    total_steps = max(1, total_steps)
+    cosine_span = max(1, total_steps - warmup_steps)
+    restart_cycle = max(1, cosine_span // 3)
+    # Cosine decays to min_lr_ratio * max_lr, not to zero.
+    # Research: "min LR is typically 10% of max, not zero."
+    min_lr_ratio = 0.1
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        warm_step = max(0, step - warmup_steps)
+        progress = min(1.0, max(0.0, warm_step / cosine_span))
+        if stage.schedule == "cosine":
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+        if stage.schedule == "cosine-warm-restart":
+            cycle_progress = (warm_step % restart_cycle) / float(restart_cycle)
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * cycle_progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _categorize_parameter_group(name: str) -> str:
+    lowered = name.lower()
+    if "lora_" in lowered:
+        return "dora"
+    if "encoder." in lowered:
+        return "encoder"
+    if "deformable_attention" in lowered:
+        return "encoder_adapter"
+    if "decoder_blocks" in lowered or "decoder_norm" in lowered:
+        return "decoder"
+    if "lm_head" in lowered:
+        return "lm_head"
+    if "contour_head" in lowered:
+        return "contour_head"
+    return "other"
+
+
+def _compute_per_group_grad_norms(model) -> Dict[str, float]:
+    accum: Dict[str, float] = {}
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        group = _categorize_parameter_group(name)
+        value = float(parameter.grad.detach().float().norm(2).item())
+        accum[group] = accum.get(group, 0.0) + (value * value)
+    return {group: math.sqrt(value) for group, value in accum.items()}
+
+
+def _detect_grad_anomalies(
+    grad_norms: Dict[str, float],
+    running_average: Dict[str, float],
+    *,
+    threshold_multiplier: float = 10.0,
+) -> List[str]:
+    alerts: List[str] = []
+    for group, norm in grad_norms.items():
+        baseline = running_average.get(group)
+        if baseline is not None and baseline > 0 and norm > (threshold_multiplier * baseline):
+            alerts.append(
+                f"grad_norm_spike[{group}]: current={norm:.4f}, baseline={baseline:.4f}, ratio={norm / baseline:.2f}"
+            )
+        if baseline is None:
+            running_average[group] = norm
+        else:
+            running_average[group] = 0.95 * baseline + 0.05 * norm
+    return alerts
+
+
+def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
+    new_module_keywords = (
+        "token_embedding",
+        "lm_head",
+        "decoder_norm",
+        "contour_head",
+        "deformable_attention",
+        "positional_bridge",
+    )
+
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+        import torch.nn as torch_nn
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "peft is required for DoRA training but is not installed. Install with: pip install peft"
+        ) from exc
+
+    configured_targets = list(dora_config.get("target_modules", []))
+    linear_targets: List[str] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch_nn.Linear):
+            continue
+        if any(marker in name for marker in new_module_keywords):
+            continue
+        linear_targets.append(name)
+    if configured_targets:
+        linear_targets = [
+            name
+            for name in linear_targets
+            if any(name.endswith(target) or f".{target}" in name for target in configured_targets)
+            or name.startswith("encoder.backbone")
+        ]
+    if not linear_targets:
+        raise RuntimeError(
+            "DoRA target-module matching failed; no linear layers matched configured targets."
+        )
+
+    peft_config = LoraConfig(
+        r=int(dora_config["rank"]),
+        lora_alpha=int(dora_config["alpha"]),
+        lora_dropout=float(dora_config["dropout"]),
+        target_modules=linear_targets,
+        task_type=TaskType.FEATURE_EXTRACTION,
+        use_dora=True,
+        bias="none",
+        modules_to_save=list(new_module_keywords),
+    )
+    try:
+        model = get_peft_model(model, peft_config)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to apply DoRA adapters: {exc}") from exc
+    dora_applied = True
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    for name, parameter in model.named_parameters():
+        if "lora_" in name or any(marker in name for marker in new_module_keywords):
+            parameter.requires_grad = True
+    if not any(parameter.requires_grad for parameter in model.parameters()):
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+
+    return model, dora_applied
+
+
+def _run_validation(
+    model,
+    stage: StageTrainingConfig,
+    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
+    project_root: Path,
+    image_height: int,
+    image_width: int,
+    device,
+    rng: random.Random,
+    bf16_enabled: bool,
+    validation_batches: int,
+) -> Optional[Dict[str, float]]:
+    import torch
+    import torch.nn.functional as F
+
+    losses: List[float] = []
+    contour_losses: List[float] = []
+    model.eval()
+    with torch.no_grad():
+        for _ in range(validation_batches):
+            batch = _sample_stage_batch(stage, grouped_entries, rng, split_override="val")
+            if not batch:
+                break
+            images, decoder_inputs, labels, contour_targets, _content_widths, vocab_size = _encode_batch(
+                batch=batch,
+                max_sequence_length=stage.max_sequence_length,
+                project_root=project_root,
+                image_height=image_height,
+                image_width=image_width,
+            )
+            images = images.to(device)
+            decoder_inputs = decoder_inputs.to(device)
+            labels = labels.to(device)
+            contour_targets = contour_targets.to(device)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=bf16_enabled,
+            ):
+                outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+                token_loss = F.cross_entropy(
+                    outputs["logits"].reshape(-1, vocab_size),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                    label_smoothing=stage.label_smoothing,
+                )
+                contour_loss = F.cross_entropy(outputs["contour_logits"], contour_targets)
+                total_loss = token_loss + (stage.contour_loss_weight * contour_loss)
+            losses.append(float(total_loss.item()))
+            contour_losses.append(float(contour_loss.item()))
+    model.train()
+    if not losses:
+        return None
+    return {
+        "val_loss": float(sum(losses) / len(losses)),
+        "val_contour_loss": float(sum(contour_losses) / len(contour_losses)),
+    }
+
+
+def _save_checkpoint(
+    checkpoint_dir: Path,
+    model,
+    optimizer,
+    scheduler=None,
+    *,
+    stage_name: str,
+    global_step: int,
+    stage_step: Optional[int] = None,
+    stage_steps_total: Optional[int] = None,
+    stage_b_config: Optional[Dict[str, object]] = None,
+) -> Path:
+    import torch
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"{stage_name}_step_{global_step:07d}.pt"
+    payload = {
+        "stage_name": stage_name,
+        "global_step": global_step,
+        "stage_step": stage_step,
+        "stage_steps_total": stage_steps_total,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "stage_b_config": stage_b_config,
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(payload, checkpoint_path)
+    return checkpoint_path
+
+
+def _expand_lora_rank_tensors_for_resume(
+    state_dict: Dict[str, object],
+    model_state: Dict[str, object],
+) -> Tuple[Dict[str, object], List[str]]:
+    import torch
+
+    expanded_state = dict(state_dict)
+    notes: List[str] = []
+    for key, source_value in list(expanded_state.items()):
+        target_value = model_state.get(key)
+        if target_value is None:
+            continue
+        if not isinstance(source_value, torch.Tensor) or not isinstance(target_value, torch.Tensor):
+            continue
+        source_shape = tuple(int(dim) for dim in source_value.shape)
+        target_shape = tuple(int(dim) for dim in target_value.shape)
+        if source_shape == target_shape:
+            continue
+
+        if "lora_A" in key and len(source_shape) == 2 and len(target_shape) == 2:
+            same_input = source_shape[1] == target_shape[1]
+            rank_expand = source_shape[0] < target_shape[0]
+            if same_input and rank_expand:
+                expanded = target_value.detach().clone()
+                expanded[: source_shape[0], :] = source_value.to(device=expanded.device, dtype=expanded.dtype)
+                expanded_state[key] = expanded
+                notes.append(f"{key}: expanded lora_A rank {source_shape[0]} -> {target_shape[0]}")
+                continue
+
+        if "lora_B" in key and len(source_shape) == 2 and len(target_shape) == 2:
+            same_output = source_shape[0] == target_shape[0]
+            rank_expand = source_shape[1] < target_shape[1]
+            if same_output and rank_expand:
+                expanded = target_value.detach().clone()
+                expanded[:, : source_shape[1]] = source_value.to(device=expanded.device, dtype=expanded.dtype)
+                expanded_state[key] = expanded
+                notes.append(f"{key}: expanded lora_B rank {source_shape[1]} -> {target_shape[1]}")
+                continue
+    return expanded_state, notes
+
+
+def run_execute_mode(
+    stages: Sequence[StageTrainingConfig],
+    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
+    project_root: Path,
+    image_height: int,
+    image_width: int,
+    max_steps_per_stage: Optional[int],
+    seed: int,
+    step_log_path: Optional[Path] = None,
+    checkpoint_dir: Optional[Path] = None,
+    validation_batches: int = 2,
+    resume_checkpoint: Optional[Path] = None,
+    start_stage: Optional[str] = None,
+    stage_b_backbone: str = "davit_base.msft_in1k",
+    stage_b_decoder_dim: int = 768,
+    stage_b_decoder_layers: int = 8,
+    stage_b_decoder_heads: int = 12,
+    stage_b_dora_rank: Optional[int] = None,
+) -> Dict[str, object]:
+    import torch
+    import torch.nn.functional as F
+
+    if max_steps_per_stage is not None and max_steps_per_stage <= 0:
+        raise ValueError("max_steps_per_stage must be positive when provided")
+
+    rng = random.Random(seed)
+    vocab = build_default_vocabulary()
+    factory_cfg = ModelFactoryConfig(
+        stage_b_vocab_size=vocab.size,
+        stage_b_backbone=stage_b_backbone,
+        stage_b_decoder_dim=stage_b_decoder_dim,
+        stage_b_decoder_layers=stage_b_decoder_layers,
+        stage_b_decoder_heads=stage_b_decoder_heads,
+    )
+    resume_payload = None
+    resume_factory_cfg = None
+    if resume_checkpoint is not None:
+        if not resume_checkpoint.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_checkpoint}")
+        resume_payload = torch.load(resume_checkpoint, map_location="cpu")
+        resume_factory_cfg = model_factory_config_from_checkpoint_payload(
+            resume_payload,
+            vocab_size=vocab.size,
+            fallback=factory_cfg,
+        )
+        factory_cfg = resume_factory_cfg
+        if isinstance(resume_payload, dict) and isinstance(resume_payload.get("stage_b_config"), dict):
+            print(
+                "[train] loaded Stage-B architecture settings from checkpoint metadata.",
+                file=sys.stderr,
+            )
+    if stage_b_dora_rank is not None:
+        requested_rank = max(1, int(stage_b_dora_rank))
+        factory_cfg = dataclasses.replace(factory_cfg, stage_b_dora_rank=requested_rank)
+        print(
+            f"[train] overriding DoRA rank with CLI value: {requested_rank}",
+            file=sys.stderr,
+        )
+    components = build_stage_b_components(factory_cfg)
+    stage_b_config_dict = dataclasses.asdict(components["stage_b_config"])
+    base_model = components["model"]
+    model, dora_applied = _prepare_model_for_dora(base_model, components["dora_config"])
+
+    use_cuda = bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
+    if use_cuda:
+        try:
+            torch.cuda.get_device_properties(0)
+        except Exception:
+            use_cuda = False
+    device = torch.device("cuda" if use_cuda else "cpu")
+    model = model.to(device)
+    model.train()
+
+    resume_stage_name: Optional[str] = None
+    resume_optimizer_state = None
+    resume_scheduler_state = None
+    global_step = 0
+    if resume_checkpoint is not None:
+        checkpoint_payload = resume_payload
+        if checkpoint_payload is None:
+            raise RuntimeError("Resume checkpoint payload failed to load.")
+        model_state = checkpoint_payload.get("model_state_dict")
+        if not isinstance(model_state, dict):
+            raise ValueError(f"Invalid checkpoint payload (missing model_state_dict): {resume_checkpoint}")
+        checkpoint_rank = (
+            int(resume_factory_cfg.stage_b_dora_rank)
+            if resume_factory_cfg is not None
+            else int(factory_cfg.stage_b_dora_rank)
+        )
+        target_rank = int(factory_cfg.stage_b_dora_rank)
+        if target_rank < checkpoint_rank:
+            raise ValueError(
+                f"Cannot resume with smaller DoRA rank (checkpoint={checkpoint_rank}, requested={target_rank})."
+            )
+        if target_rank > checkpoint_rank:
+            model_state, expansion_notes = _expand_lora_rank_tensors_for_resume(
+                model_state,
+                model.state_dict(),
+            )
+            if expansion_notes:
+                print(
+                    f"[train] expanded {len(expansion_notes)} LoRA tensors for rank change "
+                    f"{checkpoint_rank} -> {target_rank}.",
+                    file=sys.stderr,
+                )
+        load_result = model.load_state_dict(model_state, strict=False)
+        missing_keys = set(load_result.missing_keys)
+        unexpected_keys = set(load_result.unexpected_keys)
+        allowed_ctc_keys = {
+            "ctc_head.weight",
+            "ctc_head.bias",
+            "base_model.model.ctc_head.weight",
+            "base_model.model.ctc_head.bias",
+            "ctc_head.modules_to_save.default.weight",
+            "ctc_head.modules_to_save.default.bias",
+            "base_model.model.ctc_head.modules_to_save.default.weight",
+            "base_model.model.ctc_head.modules_to_save.default.bias",
+        }
+        disallowed_missing = sorted(key for key in missing_keys if key not in allowed_ctc_keys)
+        disallowed_unexpected = sorted(key for key in unexpected_keys if key not in allowed_ctc_keys)
+        if disallowed_missing or disallowed_unexpected:
+            raise RuntimeError(
+                "Checkpoint architecture mismatch. "
+                f"missing={disallowed_missing[:10]}, unexpected={disallowed_unexpected[:10]}"
+            )
+        if missing_keys or unexpected_keys:
+            print(
+                "[train] resume checkpoint is legacy format; ignored compatibility keys.",
+                file=sys.stderr,
+            )
+        global_step = max(0, int(checkpoint_payload.get("global_step", 0)))
+        resume_stage_name = str(checkpoint_payload.get("stage_name") or "")
+        resume_optimizer_state = checkpoint_payload.get("optimizer_state_dict")
+        resume_scheduler_state = checkpoint_payload.get("scheduler_state_dict")
+        print(
+            f"[train] resuming from checkpoint: {resume_checkpoint} "
+            f"(global_step={global_step}, stage='{resume_stage_name}')",
+            file=sys.stderr,
+        )
+
+    bf16_enabled = False
+    if device.type == "cuda":
+        try:
+            bf16_enabled = bool(torch.cuda.is_bf16_supported())
+        except Exception:
+            bf16_enabled = False
+
+    stage_runtime: List[Dict[str, int]] = []
+    for stage in stages:
+        steps_per_epoch = max(1, math.ceil(stage.effective_samples_per_epoch / stage.batch_size))
+        planned_total_steps = max(1, steps_per_epoch * stage.epochs)
+        stage_total_steps = (
+            min(planned_total_steps, max_steps_per_stage)
+            if max_steps_per_stage is not None
+            else planned_total_steps
+        )
+        stage_runtime.append(
+            {
+                "steps_per_epoch": steps_per_epoch,
+                "planned_total_steps": planned_total_steps,
+                "stage_total_steps": stage_total_steps,
+            }
+        )
+
+    requested_stage_index: Optional[int] = None
+    requested_stage_label: Optional[str] = None
+    if start_stage is not None and str(start_stage).strip():
+        raw = str(start_stage).strip()
+        if raw.isdigit():
+            parsed_index = int(raw) - 1
+            if parsed_index < 0 or parsed_index >= len(stages):
+                raise ValueError(
+                    f"start-stage index out of range: {raw}. Valid range is 1..{len(stages)}."
+                )
+            requested_stage_index = parsed_index
+            requested_stage_label = stages[parsed_index].stage_name
+        else:
+            lowered = raw.lower()
+            exact_matches = [idx for idx, stage in enumerate(stages) if stage.stage_name.lower() == lowered]
+            if len(exact_matches) == 1:
+                requested_stage_index = exact_matches[0]
+            else:
+                prefix_matches = [idx for idx, stage in enumerate(stages) if stage.stage_name.lower().startswith(lowered)]
+                if len(prefix_matches) == 1:
+                    requested_stage_index = prefix_matches[0]
+                elif len(prefix_matches) > 1:
+                    choices = ", ".join(stage.stage_name for stage in stages)
+                    raise ValueError(
+                        f"start-stage '{raw}' is ambiguous. Available stages: {choices}"
+                    )
+                else:
+                    choices = ", ".join(stage.stage_name for stage in stages)
+                    raise ValueError(
+                        f"start-stage '{raw}' not found. Available stages: {choices}"
+                    )
+            if requested_stage_index is not None:
+                requested_stage_label = stages[requested_stage_index].stage_name
+
+    resume_stage_index = 0
+    resume_stage_completed_steps = 0
+    if resume_checkpoint is not None:
+        remaining_steps = global_step
+        resume_stage_index = len(stages)
+        resume_stage_completed_steps = 0
+        for stage_index, runtime in enumerate(stage_runtime):
+            stage_total_steps = int(runtime["stage_total_steps"])
+            if remaining_steps >= stage_total_steps:
+                remaining_steps -= stage_total_steps
+                continue
+            resume_stage_index = stage_index
+            resume_stage_completed_steps = remaining_steps
+            break
+        if resume_stage_index < len(stages):
+            resolved_stage_name = stages[resume_stage_index].stage_name
+            if resume_stage_name and resume_stage_name != resolved_stage_name:
+                print(
+                    "[train] warning: checkpoint stage name does not match computed stage boundary. "
+                    f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
+                    file=sys.stderr,
+                )
+
+    if requested_stage_index is not None:
+        baseline_step = sum(int(runtime["stage_total_steps"]) for runtime in stage_runtime[:requested_stage_index])
+        if resume_checkpoint is not None:
+            print(
+                "[train] start-stage override enabled: forcing start from "
+                f"'{stages[requested_stage_index].stage_name}' (index={requested_stage_index + 1}), "
+                "ignoring checkpoint stage progress.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[train] starting from stage '{stages[requested_stage_index].stage_name}' "
+                f"(index={requested_stage_index + 1}).",
+                file=sys.stderr,
+            )
+        resume_stage_index = requested_stage_index
+        resume_stage_completed_steps = 0
+        global_step = baseline_step
+
+    stage_metrics: List[Dict[str, object]] = []
+    initial_global_step = global_step
+    grad_running_average: Dict[str, float] = {}
+    grad_alerts: List[Dict[str, object]] = []
+    checkpoints_written: List[str] = []
+    validation_events: List[Dict[str, object]] = []
+    step_writer = None
+
+    if step_log_path is not None:
+        step_log_path.parent.mkdir(parents=True, exist_ok=True)
+        step_log_mode = "a" if (resume_checkpoint is not None) else "w"
+        step_writer = step_log_path.open(step_log_mode, encoding="utf-8")
+
+    try:
+        for stage_index, stage in enumerate(stages):
+            runtime = stage_runtime[stage_index]
+            stage_steps_per_epoch = int(runtime["steps_per_epoch"])
+            stage_planned_steps = int(runtime["planned_total_steps"])
+            stage_total_steps = int(runtime["stage_total_steps"])
+            stage_start_step = 1
+            resumed_stage = False
+
+            if (resume_checkpoint is not None) or (requested_stage_index is not None):
+                if stage_index < resume_stage_index:
+                    stage_metrics.append(
+                        {
+                            "stage_name": stage.stage_name,
+                            "epochs": stage.epochs,
+                            "steps_per_epoch": stage_steps_per_epoch,
+                            "planned_total_steps": stage_planned_steps,
+                            "steps_executed": 0,
+                            "truncated_by_max_steps": max_steps_per_stage is not None and stage_planned_steps > stage_total_steps,
+                            "mean_loss": None,
+                            "min_loss": None,
+                            "max_loss": None,
+                            "final_loss": None,
+                            "lr_dora": stage.lr_dora,
+                            "lr_new_modules": stage.lr_new_modules,
+                            "contour_loss_weight": stage.contour_loss_weight,
+                            "weight_decay": stage.weight_decay,
+                            "non_finite_events": 0,
+                            "grad_alert_count": 0,
+                            "skipped_by_resume": True,
+                            "resume_start_step": stage_total_steps + 1,
+                        }
+                    )
+                    continue
+                if stage_index == resume_stage_index:
+                    stage_start_step = max(1, int(resume_stage_completed_steps) + 1)
+                    resumed_stage = stage_start_step > 1
+                    if stage_start_step > stage_total_steps:
+                        stage_metrics.append(
+                            {
+                                "stage_name": stage.stage_name,
+                                "epochs": stage.epochs,
+                                "steps_per_epoch": stage_steps_per_epoch,
+                                "planned_total_steps": stage_planned_steps,
+                                "steps_executed": 0,
+                                "truncated_by_max_steps": max_steps_per_stage is not None and stage_planned_steps > stage_total_steps,
+                                "mean_loss": None,
+                                "min_loss": None,
+                                "max_loss": None,
+                                "final_loss": None,
+                                "lr_dora": stage.lr_dora,
+                                "lr_new_modules": stage.lr_new_modules,
+                                "contour_loss_weight": stage.contour_loss_weight,
+                                "weight_decay": stage.weight_decay,
+                                "non_finite_events": 0,
+                                "grad_alert_count": 0,
+                                "skipped_by_resume": True,
+                                "resume_start_step": stage_start_step,
+                            }
+                        )
+                        continue
+
+            optimizer = _build_optimizer(model, stage)
+            optimizer_steps = max(1, stage_total_steps // stage.grad_accumulation_steps)
+            scheduler = _build_scheduler(optimizer, stage, total_steps=optimizer_steps)
+            if resumed_stage:
+                if resume_optimizer_state is not None:
+                    try:
+                        optimizer.load_state_dict(resume_optimizer_state)
+                    except Exception as exc:
+                        print(
+                            f"[train] warning: failed to restore optimizer state; continuing with fresh optimizer ({exc})",
+                            file=sys.stderr,
+                        )
+                if resume_scheduler_state is not None:
+                    try:
+                        scheduler.load_state_dict(resume_scheduler_state)
+                    except Exception as exc:
+                        print(
+                            f"[train] warning: failed to restore scheduler state; using step-aligned scheduler ({exc})",
+                            file=sys.stderr,
+                        )
+                        scheduler.step(max(0, stage_start_step // stage.grad_accumulation_steps - 1))
+                else:
+                    scheduler.step(max(0, stage_start_step // stage.grad_accumulation_steps - 1))
+            losses: List[float] = []
+            non_finite_events = 0
+            stage_grad_alerts = 0
+
+            for stage_step in range(stage_start_step, stage_total_steps + 1):
+                batch = _sample_stage_batch(stage, grouped_entries=grouped_entries, rng=rng)
+                if not batch:
+                    break
+                epoch_index = ((stage_step - 1) // stage_steps_per_epoch) + 1
+                epoch_step = ((stage_step - 1) % stage_steps_per_epoch) + 1
+                images, decoder_inputs, labels, contour_targets, _content_widths, vocab_size = _encode_batch(
+                    batch=batch,
+                    max_sequence_length=stage.max_sequence_length,
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                )
+                images = _apply_online_augmentations(images, rng)
+                images = images.to(device)
+                decoder_inputs = decoder_inputs.to(device)
+                labels = labels.to(device)
+                contour_targets = contour_targets.to(device)
+
+                accum_steps = stage.grad_accumulation_steps
+                is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
+                if (stage_step - 1) % accum_steps == 0:
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_window_corrupted = False
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=bf16_enabled,
+                ):
+                    outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+                    token_loss = F.cross_entropy(
+                        outputs["logits"].reshape(-1, vocab_size),
+                        labels.reshape(-1),
+                        ignore_index=-100,
+                        label_smoothing=stage.label_smoothing,
+                    )
+                    contour_loss = F.cross_entropy(outputs["contour_logits"], contour_targets)
+                    loss = token_loss + (stage.contour_loss_weight * contour_loss)
+                    if accum_steps > 1:
+                        loss = loss / accum_steps
+
+                non_finite_loss = not bool(torch.isfinite(loss).item())
+                if non_finite_loss:
+                    non_finite_events += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_window_corrupted = True
+                    continue
+
+                if accum_window_corrupted:
+                    # Prior micro-batch in this window had non-finite loss;
+                    # skip remaining backward passes to avoid wrong gradient scale.
+                    if is_accum_step:
+                        optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                loss.backward()
+
+                if not is_accum_step:
+                    losses.append(float(loss.item()) * accum_steps)
+                    continue
+
+                grad_norm_value = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item())
+                grad_norms = _compute_per_group_grad_norms(model)
+                grad_alert_messages = _detect_grad_anomalies(grad_norms, grad_running_average)
+                if grad_alert_messages:
+                    stage_grad_alerts += len(grad_alert_messages)
+                    grad_alerts.append(
+                        {
+                            "global_step": global_step + 1,
+                            "stage_name": stage.stage_name,
+                            "alerts": grad_alert_messages,
+                        }
+                    )
+
+                non_finite_grad = False
+                for parameter in model.parameters():
+                    if parameter.grad is None:
+                        continue
+                    if not torch.isfinite(parameter.grad).all():
+                        non_finite_grad = True
+                        break
+
+                if non_finite_grad:
+                    non_finite_events += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.step()
+                scheduler.step()
+                losses.append(float(loss.item()) * accum_steps)
+                global_step += 1
+
+                lr_map = {group.get("group_name", f"group_{idx}"): group["lr"] for idx, group in enumerate(optimizer.param_groups)}
+                validation_result = None
+                if global_step % stage.validate_every_steps == 0:
+                    validation_result = _run_validation(
+                        model=model,
+                        stage=stage,
+                        grouped_entries=grouped_entries,
+                        project_root=project_root,
+                        image_height=image_height,
+                        image_width=image_width,
+                        device=device,
+                        rng=rng,
+                        bf16_enabled=bf16_enabled,
+                        validation_batches=validation_batches,
+                    )
+                    if validation_result is not None:
+                        validation_events.append(
+                            {
+                                "global_step": global_step,
+                                "stage_name": stage.stage_name,
+                                **validation_result,
+                            }
+                        )
+
+                if checkpoint_dir is not None and global_step % stage.checkpoint_every_steps == 0:
+                    checkpoint_path = _save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        stage_name=stage.stage_name,
+                        global_step=global_step,
+                        stage_step=stage_step,
+                        stage_steps_total=stage_total_steps,
+                        stage_b_config=stage_b_config_dict,
+                    )
+                    checkpoints_written.append(str(checkpoint_path))
+
+                if step_writer is not None:
+                    record = {
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "global_step": global_step,
+                        "stage_step": stage_step,
+                        "stage_steps_total": stage_total_steps,
+                        "epoch_index": epoch_index,
+                        "epoch_step": epoch_step,
+                        "epoch_steps_total": stage_steps_per_epoch,
+                        "stage_name": stage.stage_name,
+                        "loss": float(loss.item()),
+                        "token_loss": float(token_loss.item()),
+                        "contour_loss": float(contour_loss.item()),
+                        "lr_dora": float(lr_map.get("dora", stage.lr_dora)),
+                        "lr_new_modules": float(lr_map.get("new_modules", stage.lr_new_modules)),
+                        "grad_norm": grad_norm_value,
+                        "grad_norm_groups": grad_norms,
+                        "grad_alerts": grad_alert_messages,
+                        "batch_size": len(batch),
+                        "max_sequence_length": stage.max_sequence_length,
+                        "non_finite_loss": non_finite_loss,
+                        "non_finite_grad": non_finite_grad,
+                        "bf16_enabled": bf16_enabled,
+                        "validation": validation_result,
+                    }
+                    step_writer.write(json.dumps(record) + "\n")
+                    step_writer.flush()
+
+            stage_metrics.append(
+                {
+                    "stage_name": stage.stage_name,
+                    "epochs": stage.epochs,
+                    "steps_per_epoch": stage_steps_per_epoch,
+                    "planned_total_steps": stage_planned_steps,
+                    "steps_executed": len(losses),
+                    "truncated_by_max_steps": max_steps_per_stage is not None and stage_planned_steps > stage_total_steps,
+                    "mean_loss": (sum(losses) / len(losses)) if losses else None,
+                    "min_loss": min(losses) if losses else None,
+                    "max_loss": max(losses) if losses else None,
+                    "final_loss": losses[-1] if losses else None,
+                    "lr_dora": stage.lr_dora,
+                    "lr_new_modules": stage.lr_new_modules,
+                    "contour_loss_weight": stage.contour_loss_weight,
+                    "weight_decay": stage.weight_decay,
+                    "non_finite_events": non_finite_events,
+                    "grad_alert_count": stage_grad_alerts,
+                    "skipped_by_resume": False,
+                    "resume_start_step": stage_start_step,
+                }
+            )
+    finally:
+        if step_writer is not None:
+            step_writer.close()
+
+    return {
+        "mode": "execute",
+        "device": str(device),
+        "bf16_enabled": bf16_enabled,
+        "dora_applied": dora_applied,
+        "stages": stage_metrics,
+        "dora_target_modules": components["dora_target_modules"],
+        "dora_config": components["dora_config"],
+        "step_log_path": str(step_log_path) if step_log_path is not None else None,
+        "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir is not None else None,
+        "max_steps_per_stage": max_steps_per_stage,
+        "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
+        "resumed_from_global_step": initial_global_step if resume_checkpoint is not None else None,
+        "resume_stage_name": resume_stage_name if resume_checkpoint is not None else None,
+        "start_stage": str(start_stage) if start_stage is not None else None,
+        "start_stage_resolved": requested_stage_label,
+        "checkpoints_written": checkpoints_written,
+        "validation_events": validation_events,
+        "grad_alerts": grad_alerts,
+        "stage_b_config": stage_b_config_dict,
+    }
+
+
+def run_dry_mode(
+    stages: Sequence[StageTrainingConfig],
+    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
+) -> Dict[str, object]:
+    return {
+        "mode": "dry-run",
+        "stages": [build_stage_plan(stage=stage, grouped_entries=grouped_entries) for stage in stages],
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    project_root = Path(__file__).resolve().parents[2]
+    parser = argparse.ArgumentParser(description="Run curriculum training stages for OMR Stage-B.")
+    parser.add_argument(
+        "--token-manifest",
+        type=str,
+        default=",".join([
+            str(project_root / "src" / "data" / "manifests" / "token_manifest.jsonl"),
+            str(project_root / "data" / "processed" / "synthetic" / "manifests" / "synthetic_token_manifest.jsonl"),
+        ]),
+        help="Comma-separated token manifest JSONL path(s).",
+    )
+    parser.add_argument(
+        "--stage-configs",
+        type=str,
+        default="configs/train_stage1.yaml,configs/train_stage2.yaml,configs/train_stage3.yaml",
+        help="Comma-separated stage config paths.",
+    )
+    parser.add_argument(
+        "--output-summary",
+        type=Path,
+        default=project_root / "src" / "train" / "curriculum_summary.json",
+        help="Path to write execution summary JSON.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("dry-run", "execute"),
+        default="dry-run",
+        help="dry-run builds curriculum plans; execute runs stage training according to config budgets.",
+    )
+    parser.add_argument(
+        "--max-steps-per-stage",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap for execute mode debugging. "
+            "When omitted, execute uses full stage budgets from epochs and effective_samples_per_epoch."
+        ),
+    )
+    parser.add_argument(
+        "--validation-batches",
+        type=int,
+        default=2,
+        help="Validation mini-batches to run every validation cadence.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=project_root / "src" / "train" / "checkpoints",
+        help="Directory used for periodic checkpoint writing in execute mode.",
+    )
+    parser.add_argument(
+        "--step-log",
+        type=Path,
+        default=None,
+        help="Optional JSONL telemetry output path for execute mode.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional checkpoint path (.pt) to resume execute mode from model/optimizer state.",
+    )
+    parser.add_argument(
+        "--start-stage",
+        type=str,
+        default=None,
+        help=(
+            "Optional stage selector for execute mode. "
+            "Accepts 1-based index (e.g. '2') or stage name (e.g. 'stage2-polyphonic')."
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=1337, help="Random seed.")
+    parser.add_argument(
+        "--allow-invalid-token-sequences",
+        action="store_true",
+        help="Skip strict grammar/vocabulary filtering of token manifest entries.",
+    )
+    parser.add_argument(
+        "--allow-stale-merged-manifest",
+        action="store_true",
+        help="Allow using token_manifest_train.jsonl even if base/synthetic manifests are newer.",
+    )
+    parser.add_argument(
+        "--stage-b-backbone",
+        type=str,
+        default="davit_base.msft_in1k",
+        help="Stage-B timm backbone name.",
+    )
+    parser.add_argument(
+        "--stage-b-decoder-dim",
+        type=int,
+        default=768,
+        help="Decoder hidden dimension.",
+    )
+    parser.add_argument(
+        "--stage-b-decoder-layers",
+        type=int,
+        default=8,
+        help="Decoder depth.",
+    )
+    parser.add_argument(
+        "--stage-b-decoder-heads",
+        type=int,
+        default=12,
+        help="Decoder attention heads.",
+    )
+    parser.add_argument(
+        "--stage-b-dora-rank",
+        type=int,
+        default=None,
+        help="Override DoRA rank (supports rank expansion when resuming from smaller-rank checkpoints).",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=250,
+        help="Input image height for training batches.",
+    )
+    parser.add_argument(
+        "--image-max-width",
+        type=int,
+        default=2500,
+        help="Maximum preserved width (images are aspect-preserved and right-padded, max 3000).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    project_root = Path(__file__).resolve().parents[2]
+
+    stage_paths = [project_root / Path(item.strip()) for item in args.stage_configs.split(",") if item.strip()]
+    stages = [load_stage_config(path) for path in stage_paths]
+    manifest_paths = _resolve_manifest_paths(project_root, args.token_manifest)
+    if not args.allow_stale_merged_manifest:
+        _assert_not_stale_merged_manifest(project_root, manifest_paths)
+
+    token_entries: List[Dict[str, object]] = []
+    for manifest_path in manifest_paths:
+        if manifest_path.exists():
+            loaded = load_token_manifest(manifest_path)
+            print(f"[train] loaded {len(loaded):,} entries from {manifest_path.name}", file=sys.stderr)
+            token_entries.extend(loaded)
+        else:
+            print(f"[train] manifest not found, skipping: {manifest_path}", file=sys.stderr)
+    if not token_entries:
+        raise FileNotFoundError("No token entries loaded from any manifest.")
+    token_entries, dropped_entries = sanitize_token_entries(
+        token_entries,
+        enforce_strict_sequences=not args.allow_invalid_token_sequences,
+    )
+    if dropped_entries:
+        print(
+            f"[train] dropped {dropped_entries:,} token entries that failed vocabulary/grammar validation.",
+            file=sys.stderr,
+        )
+    if not token_entries:
+        raise RuntimeError("No valid token entries available after strict manifest filtering.")
+    grouped = group_entries_by_dataset_and_split(token_entries)
+
+    if args.mode == "execute":
+        resume_checkpoint = args.resume_checkpoint
+        if resume_checkpoint is not None:
+            if not resume_checkpoint.is_absolute():
+                resume_checkpoint = project_root / resume_checkpoint
+            resume_checkpoint = resume_checkpoint.resolve()
+        summary = run_execute_mode(
+            stages=stages,
+            grouped_entries=grouped,
+            project_root=project_root,
+            image_height=max(32, args.image_height),
+            image_width=min(3000, max(256, args.image_max_width)),
+            max_steps_per_stage=args.max_steps_per_stage,
+            seed=args.seed,
+            step_log_path=args.step_log,
+            checkpoint_dir=args.checkpoint_dir,
+            validation_batches=max(1, args.validation_batches),
+            resume_checkpoint=resume_checkpoint,
+            start_stage=args.start_stage,
+            stage_b_backbone=str(args.stage_b_backbone),
+            stage_b_decoder_dim=max(64, int(args.stage_b_decoder_dim)),
+            stage_b_decoder_layers=max(1, int(args.stage_b_decoder_layers)),
+            stage_b_decoder_heads=max(1, int(args.stage_b_decoder_heads)),
+            stage_b_dora_rank=(
+                None if args.stage_b_dora_rank is None else max(1, int(args.stage_b_dora_rank))
+            ),
+        )
+    else:
+        summary = run_dry_mode(stages=stages, grouped_entries=grouped)
+
+    args.output_summary.parent.mkdir(parents=True, exist_ok=True)
+    args.output_summary.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
