@@ -79,18 +79,6 @@ Input: grayscale staff crop, height 192px, width preserved up to 2048px. Feature
 
 Full cross-attention over encoder output (no windowing needed).
 
-### Parameter Summary
-
-| Component | Total Params | Trainable | Method |
-|---|---|---|---|
-| DaViT encoder | 86M | ~6M | DoRA rank-32, all linear layers |
-| Deformable attention | 3M | 3M | Full (new module) |
-| Positional bridge | 0.6M | 0.6M | Full (new module) |
-| Transformer decoder | ~50M | ~3M | DoRA rank-32, all linear layers |
-| Token embed + LM head | 0.7M | 0.7M | Full (new module) |
-| Contour head | ~0.1M | ~0.1M | Full (new module) |
-| **Total** | **~140M** | **~13M** | |
-
 ## Token Vocabulary (~487 tokens)
 
 A custom domain-specific vocabulary. Music-aware encoding achieves ~4× lower error rate than character-level encoding (Alfaro-Contreras et al., WORMS 2023).
@@ -128,13 +116,13 @@ Enharmonic spellings are kept separate (`C#` vs `Db`) — essential for correct 
 
 ## DoRA (Weight-Decomposed Low-Rank Adaptation)
 
-All linear layers in both encoder and decoder are adapted with [DoRA](https://arxiv.org/abs/2402.09353) rank-32. DoRA decomposes weight updates into magnitude and direction, outperforming standard LoRA.
+All linear layers in both encoder and decoder are adapted with [DoRA](https://arxiv.org/abs/2402.09353) rank-64. DoRA decomposes weight updates into magnitude and direction, outperforming standard LoRA.
 
 ```python
 adapter_config = {
     "method": "DoRA",
-    "r": 32,
-    "lora_alpha": 32,           # α/r = 1.0
+    "r": 64,
+    "lora_alpha": 64,           # α/r = 1.0
     "target_modules": [
         "q_proj", "k_proj", "v_proj", "out_proj",     # Self-attention
         "gate_proj", "up_proj", "down_proj",           # SwiGLU MLP
@@ -190,33 +178,6 @@ Synthetic data is generated from MusicXML sources (MuseScore corpus, IMSLP publi
 - 10% choral (SATB + piano)
 - 5% solo instrument + piano accompaniment
 
-## Training Procedure
-
-### 3-Stage Curriculum
-
-Training follows a monophonic → polyphonic → full-complexity curriculum:
-
-#### Stage 1 — Monophonic Foundation (15 epochs, ~6 hours)
-
-- **Data:** PrIMuS + Camera-PrIMuS at 30% mix (~114K samples/epoch)
-- **Learns:** Glyph→token mapping, durations, clefs, key/time signatures, measure boundaries
-- **LR:** 3e-3 (DoRA), 1e-3 (new modules) | Batch 32 | Max seq 256 | Cosine decay
-
-#### Stage 2 — Polyphonic (30 epochs)
-
-- **Data:** GrandStaff (80%) + PrIMuS (10%) + Camera-PrIMuS (10%) replay
-- **Learns:** Chords, multi-voice separation, complex rhythms, tuplets, grand staff contexts
-- **LR:** 1e-3 (DoRA), 5e-4 (new modules) | Batch 8 (2x grad accum) | Max seq 384 | Cosine
-
-#### Stage 3 — Full Complexity (20 epochs)
-
-- **Data:** Synthetic full-page crops (74.81%) + OpenScore Lieder (5.19%) + PrIMuS (10%) + GrandStaff (10%) replay
-- **Learns:** All instrument ranges, orchestral writing, dense notation, all articulations/dynamics/expressions
-- **LR:** 7.5e-4 (DoRA), 2.5e-4 (new modules) | Batch 8 (2x grad accum) | Max seq 512 | Cosine
-
-#### YOLO Training (parallel, separate)
-
-YOLOv8m trained on 5,000 synthetic full pages with Verovio layout metadata for ground truth bounding boxes. ~100 epochs, ~2 hours.
 
 ### Loss Function
 
@@ -270,17 +231,6 @@ Applied online during training (not pre-generated).
 - **Key/time signature accuracy:** Exact-match rate.
 - **Structural F1:** F1 on barlines, measure boundaries, voice assignments.
 - **Musical similarity:** Note-level precision, recall, F1 using [mir_eval](https://github.com/mir-evaluation/mir_eval) transcription metrics (onset_tolerance=50ms, pitch_tolerance=50 cents).
-
-### Targets
-
-| Benchmark | SOTA | Target |
-|---|---|---|
-| PrIMuS (monophonic) | ~4% SER | <3% SER |
-| Camera-PrIMuS (distorted) | ~8% SER | <5% SER |
-| GrandStaff (polyphonic piano) | ~12% SER | <8% SER |
-| OpenScore Lieder (piano+voice) | No baseline | <10% SER |
-| Full orchestral (synthetic) | No baseline | <12% SER |
-| MusicXML validity rate | N/A | >98% |
 
 ## Repository Structure
 
@@ -353,7 +303,7 @@ Applied online during training (not pre-generated).
 ### Prerequisites
 
 - Python 3.10+
-- CUDA-capable GPU (H100/A100 recommended, any GPU with 16+ GB VRAM works)
+- CUDA-capable GPU (H100/A100 recommended, any GPU with 48+ GB VRAM works)
 - PyTorch with CUDA
 
 ### Setup
@@ -427,13 +377,15 @@ python src/eval/compare_musicxml.py ground_truth.musicxml predicted.musicxml
 
 ## Architecture Design Rationale
 
-The full architecture decision record, including evidence-based justification for every design choice, is in [`docs/omr-final-plan.md`](docs/omr-final-plan.md). Key decisions:
+The full architecture decision record, including evidence-based justification for every design choice. 
+
+Key decisions:
 
 - **DaViT + custom decoder over Florence-2 fine-tuning:** General-purpose VLMs fail entirely at OMR transcription (Calvo-Zaragoza et al., WORMS 2024). Florence-2's 51K NL tokenizer conflicts with our 487-token music vocabulary. The SMT/SMIReT architecture (5.92% SER) validates the encoder + task-specific decoder pattern.
 - **Custom 487-token vocabulary over sub-word tokenization:** Music-aware encoding achieves 16.4% CER vs 62.3% character-level and 39.7% learned sub-word (Alfaro-Contreras et al., WORMS 2023).
 - **Grammar FSA over statistical language models:** Statistical LMs cannot enforce structural constraints like beat consistency (Torras et al., WORMS 2022).
 - **RoPE over learned positional embeddings:** Smooth extrapolation beyond training sequence length for unusually dense staves.
-- **DoRA rank-32 over standard LoRA:** Weight-decomposed adaptation outperforms standard LoRA on fine-tuning benchmarks.
+- **DoRA rank-64 over standard LoRA:** Weight-decomposed adaptation outperforms standard LoRA on fine-tuning benchmarks.
 
 ## References
 
