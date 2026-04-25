@@ -873,6 +873,30 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
         raise RuntimeError(f"Failed to apply DoRA adapters: {exc}") from exc
     dora_applied = True
 
+    # DoRA zero-row fix: if a base weight has an all-zero row, DoRA initialises
+    # the magnitude to 0.  The forward-pass recomputes weight_norm each call;
+    # if that row stays zero (base + lora_B@lora_A is zero), weight_norm=0 and
+    # magnitude/weight_norm = 0/0 = NaN.  Fix by perturbing zero base rows with
+    # a tiny constant so weight_norm > 0, and resetting the stored magnitude.
+    try:
+        import torch as _torch
+        from peft.tuners.lora import LoraLayer as _LoraLayer
+        for _module in model.modules():
+            if not (isinstance(_module, _LoraLayer) and hasattr(_module, "lora_magnitude_vector")):
+                continue
+            _base_w = _module.base_layer.weight.data  # shape (out, in)
+            _row_norms = _torch.linalg.norm(_base_w, dim=1)  # (out,)
+            _zero_rows = _row_norms == 0
+            if _zero_rows.any():
+                # Perturb zero rows with a tiny constant so weight_norm > 0
+                _base_w[_zero_rows] = 1e-6
+                # Re-derive magnitude from the corrected base weight
+                for _adapter_name, _mag_param in _module.lora_magnitude_vector.items():
+                    _new_norms = _torch.linalg.norm(_base_w, dim=1)
+                    _mag_param.data[_zero_rows] = _new_norms[_zero_rows]
+    except Exception:
+        pass  # best-effort; non-fatal if PEFT version differs
+
     for parameter in model.parameters():
         parameter.requires_grad = False
     for name, parameter in model.named_parameters():
@@ -1044,6 +1068,15 @@ def run_execute_mode(
 
     rng = random.Random(seed)
     vocab = build_default_vocabulary()
+    # Cross-stage encoder consistency check: all stages must agree on encoder choice.
+    # The encoder is a fixed architectural decision (RADIO vs DaViT) that determines
+    # model structure -- mixing them across stages would silently use stage[0]'s encoder.
+    if len(stages) > 1 and any(s.stage_b_encoder != stages[0].stage_b_encoder for s in stages[1:]):
+        raise ValueError(
+            f"All stages must use the same stage_b_encoder. "
+            f"Got: {[s.stage_b_encoder for s in stages]}"
+        )
+
     # encoder: YAML value from first stage wins; explicit CLI arg overrides.
     resolved_encoder = stage_b_encoder if stage_b_encoder else (
         stages[0].stage_b_encoder if stages else "davit"
