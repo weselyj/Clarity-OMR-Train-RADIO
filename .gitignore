@@ -183,7 +183,7 @@ data/*
 checkpoints/
 eval/results/cache/
 
-# Un-ignore READMEs inside gitignored data dirs
+# data/* ignores everything in data/, but we explicitly track READMEs
 !data/README.md
 !data/**/README.md
 

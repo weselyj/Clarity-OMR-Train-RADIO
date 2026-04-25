@@ -2,6 +2,13 @@
 
 Downloaded 2026-04-25. None of the actual data files are tracked (gitignored).
 
+## Follow-up Required
+
+- **`analyze_data.py` hardcoded path:** the upstream script hardcodes a path to the
+  upstream developer's machine (`C:\Users\clq\...`). It was patched locally to run
+  the inventory in the table below. The script should be updated to accept a `--root`
+  argument so it works on any clone without manual editing.
+
 | dir | source | version/commit | count | status |
 |---|---|---|---|---|
 | primus/ | https://grfia.dlsi.ua.es/primus/packages/primusCalvoRizoAppliedSciences2018.tgz | 2018 Applied Sciences release | 87,678 incipits | downloaded + extracted 2026-04-25 |
@@ -22,7 +29,8 @@ Run: `python analyze_data.py` (with path patched to local repo — see note belo
 | primus/ | 876,781 | 1000.2 MB | .mei: 175356, .mid: 175356, .png: 175356, .pae: 175356, .agnostic: 87678 |
 | synthetic_full_page/ | 0 | 0 B | not yet generated — see Task 13 |
 
-Note: `analyze_data.py` has a hardcoded path to the upstream developer's machine (`C:\Users\clq\...`). It was patched locally for this run by substituting the correct repo path. The script should be updated to accept a `--root` argument.
+Note: `analyze_data.py` has a hardcoded path that was patched locally for this run.
+See the **Follow-up Required** section at the top of this file for details.
 
 ## Notes
 
@@ -39,9 +47,11 @@ This fork uses underscores (camera_primus, openscore_lieder) rather than the ups
 ## Re-download from scratch
 
 ```bash
+mkdir -p data/primus data/camera_primus data/grandstaff
 git clone https://github.com/OpenScore/Lieder.git data/openscore_lieder
 git -C data/openscore_lieder checkout 6b2dc542ce2e8aa4b78c8ee62103b210efc07015
 curl -L -o data/primus/primusCalvoRizoAppliedSciences2018.tgz https://grfia.dlsi.ua.es/primus/packages/primusCalvoRizoAppliedSciences2018.tgz
 curl -L -o data/camera_primus/CameraPrIMuS.tgz https://grfia.dlsi.ua.es/primus/packages/CameraPrIMuS.tgz
 curl -L -o data/grandstaff/grandstaff.tgz https://grfia.dlsi.ua.es/musicdocs/grandstaff.tgz
+# (extract each archive in place: tar xzf <archive> -C <its parent dir>)
 ```
