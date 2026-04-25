@@ -15,6 +15,7 @@ DaViT did; the cross-attention has no length cap so this is safe.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,7 +33,6 @@ from src.models.davit_stage_b import (
 RADIO_HUB_REPO = "NVlabs/RADIO"
 RADIO_VERSION = "c-radio_v4-h"
 RADIO_HIDDEN_DIM = 1280
-RADIO_PATCH = 16
 
 
 class RadioEncoder(nn.Module):
@@ -88,6 +88,7 @@ class RadioStageBConfig:
     decoder_heads: int = 12
     vocab_size: int = 487
     max_decode_len: int = 512
+    # informational; actual dropout is hardcoded in DecoderBlock upstream
     dropout: float = 0.1
     contour_classes: int = 3
 
@@ -180,14 +181,29 @@ def build_radio_stage_b(
     decoder_heads: int = 12,
     vocab_size: int = 487,
     max_decode_len: int = 512,
+    dropout: float = 0.1,
+    contour_classes: int = 3,
     **kwargs: object,
 ) -> RadioStageB:
-    """Construct ``RadioStageB`` with the plan-aligned default dimensions."""
+    """Construct ``RadioStageB`` with the plan-aligned default dimensions.
+
+    ``dropout`` and ``contour_classes`` are forwarded to ``RadioStageBConfig``.
+    Unknown extra keyword arguments raise a warning rather than being silently
+    swallowed, so YAML typos are surfaced at construction time.
+    """
+    if kwargs:
+        warnings.warn(
+            f"build_radio_stage_b received unknown keyword arguments and will ignore them: "
+            f"{sorted(kwargs)}",
+            stacklevel=2,
+        )
     config = RadioStageBConfig(
         decoder_dim=decoder_dim,
         decoder_layers=decoder_layers,
         decoder_heads=decoder_heads,
         vocab_size=vocab_size,
         max_decode_len=max_decode_len,
+        dropout=dropout,
+        contour_classes=contour_classes,
     )
     return RadioStageB(config)

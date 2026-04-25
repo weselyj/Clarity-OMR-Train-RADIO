@@ -29,3 +29,4 @@ def test_radio_forward_shapes():
         out = model(img, tgt)
     assert "logits" in out, f"expected dict with 'logits' key, got: {out.keys() if hasattr(out, 'keys') else type(out)}"
     assert out["logits"].shape == (1, 32, 487), f"unexpected logits shape: {out['logits'].shape}"
+    assert out["contour_logits"].shape == (1, 3), f"unexpected contour_logits shape: {out['contour_logits'].shape}"
