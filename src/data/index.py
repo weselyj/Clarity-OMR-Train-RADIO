@@ -13,7 +13,14 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-DATASET_FOLDERS = ("primus", "cameraprimus", "grandstaff", "Lieder-main")
+# Maps physical folder name -> canonical dataset name used in train configs and manifest entries.
+FOLDER_TO_DATASET: dict[str, str] = {
+    "primus": "primus",
+    "camera_primus": "cameraprimus",
+    "grandstaff": "grandstaff",
+    "openscore_lieder": "lieder-main",
+}
+DATASET_FOLDERS = tuple(FOLDER_TO_DATASET.keys())
 IMAGE_EXTENSION_PRIORITY = {
     ".png": 0,
     ".jpg": 1,
@@ -362,7 +369,7 @@ def build_manifest(
 
     with output_path.open("w", encoding="utf-8") as manifest_file:
         for folder_name in DATASET_FOLDERS:
-            dataset_key = folder_name.lower()
+            dataset_key = FOLDER_TO_DATASET.get(folder_name, folder_name.lower())
             builder = builders.get(dataset_key)
             if builder is None:
                 continue
@@ -372,7 +379,7 @@ def build_manifest(
 
             ratios = dataset_ratios.get(dataset_key, default_ratios)  # type: ignore[union-attr]
             written = 0
-            for entry in builder(folder_name, dataset_dir, project_root):
+            for entry in builder(dataset_key, dataset_dir, project_root):
                 if max_samples_per_dataset is not None and written >= max_samples_per_dataset:
                     break
                 split_key = _split_key_for_entry(entry)
