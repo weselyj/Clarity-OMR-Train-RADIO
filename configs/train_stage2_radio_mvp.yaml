@@ -9,23 +9,10 @@
 #   RADIO patch-16 grid at 250x2500 => ~12x156 = 1872 spatial tokens
 #   (vs DaViT stride-32 ~6x78 = 468 tokens) -- 4x more cross-attn memory
 #
-# DoRA targets (enumerated empirically via scripts/enumerate_radio_modules.py):
-#
-#   RADIO ViT encoder (C-RADIOv4-H, 32 blocks, 128 attention/MLP linears):
-#     - qkv   : combined Q/K/V projection  (attn.qkv,  32x)
-#     - proj  : attention output projection (attn.proj, 32x)
-#     - fc1   : MLP first layer             (mlp.fc1,   32x)
-#     - fc2   : MLP second layer            (mlp.fc2,   32x)
-#
-#   Shared decoder block (same leaf names as DaViT path):
-#     - q_proj, k_proj, v_proj, out_proj  (self-attention)
-#     - cross_attn_q, cross_attn_k, cross_attn_v, cross_attn_out
-#     - gate_proj, up_proj, down_proj     (FFN / SwiGLU)
-#
-# The target list lives in model_factory.list_radio_dora_target_modules().
-# _prepare_model_for_dora matches via name.endswith(target) so leaf names
-# are sufficient -- no regex needed.  Patch-embedding and head linears are
-# intentionally excluded.
+# DoRA targets are defined in src/train/model_factory.py::list_radio_dora_target_modules().
+# To inspect or change them, edit that helper directly -- do not maintain a parallel list here.
+# Encoder targets (RADIO-specific: qkv/proj/fc1/fc2) and decoder targets are combined into
+# a single list consumed by _prepare_model_for_dora in src/train/train.py.
 #
 # Run command:
 #   venv\Scripts\python src\train\train.py \
