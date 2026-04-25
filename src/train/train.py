@@ -878,24 +878,36 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
     # if that row stays zero (base + lora_B@lora_A is zero), weight_norm=0 and
     # magnitude/weight_norm = 0/0 = NaN.  Fix by perturbing zero base rows with
     # a tiny constant so weight_norm > 0, and resetting the stored magnitude.
-    try:
-        import torch as _torch
-        from peft.tuners.lora import LoraLayer as _LoraLayer
-        for _module in model.modules():
-            if not (isinstance(_module, _LoraLayer) and hasattr(_module, "lora_magnitude_vector")):
-                continue
-            _base_w = _module.base_layer.weight.data  # shape (out, in)
-            _row_norms = _torch.linalg.norm(_base_w, dim=1)  # (out,)
-            _zero_rows = _row_norms == 0
-            if _zero_rows.any():
-                # Perturb zero rows with a tiny constant so weight_norm > 0
-                _base_w[_zero_rows] = 1e-6
-                # Re-derive magnitude from the corrected base weight
-                for _adapter_name, _mag_param in _module.lora_magnitude_vector.items():
-                    _new_norms = _torch.linalg.norm(_base_w, dim=1)
-                    _mag_param.data[_zero_rows] = _new_norms[_zero_rows]
-    except Exception:
-        pass  # best-effort; non-fatal if PEFT version differs
+    #
+    # In PEFT 0.19.1, lora_magnitude_vector[adapter] is a DoraLinearLayer module;
+    # the actual nn.Parameter is at DoraLinearLayer.weight (set in update_layer as
+    # `self.weight = nn.Parameter(weight_norm, ...)`).  Writing to _mag_param.data
+    # would hit an AttributeError because DoraLinearLayer has no .data attribute.
+    import torch as _torch
+    from peft.tuners.lora import LoraLayer as _LoraLayer
+    from peft.tuners.lora.dora import DoraLinearLayer as _DoraLinearLayer
+    for _name, _module in model.named_modules():
+        if not (isinstance(_module, _LoraLayer) and hasattr(_module, "lora_magnitude_vector")):
+            continue
+        _base_w = _module.base_layer.weight.data  # shape (out, in)
+        _row_norms = _torch.linalg.norm(_base_w, dim=1)  # (out,)
+        _zero_rows = _row_norms == 0
+        if not _zero_rows.any():
+            continue
+        # Perturb zero rows with a tiny constant so weight_norm > 0
+        _base_w[_zero_rows] = 1e-6
+        # Re-derive magnitude from the corrected base weight and write it back.
+        # _mag_param is a DoraLinearLayer module; its magnitude is at .weight.
+        for _adapter_name, _mag_param in _module.lora_magnitude_vector.items():
+            if not isinstance(_mag_param, _DoraLinearLayer):
+                raise RuntimeError(
+                    f"DoRA NaN fix: expected DoraLinearLayer at "
+                    f"{_name}.lora_magnitude_vector[{_adapter_name!r}], "
+                    f"got {type(_mag_param).__name__}. "
+                    "Update the fix if the PEFT version changed."
+                )
+            _new_norms = _torch.linalg.norm(_base_w, dim=1)
+            _mag_param.weight.data[_zero_rows] = _new_norms[_zero_rows]
 
     for parameter in model.parameters():
         parameter.requires_grad = False
