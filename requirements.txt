@@ -23,6 +23,7 @@ pymupdf
 ultralytics
 
 # Stage B - token recognition
+einops
 timm
 transformers
 peft
