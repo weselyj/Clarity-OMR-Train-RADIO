@@ -112,6 +112,32 @@ def main():
         "If RADIO architecture changed, update the bounds."
     )
 
+    # Assert no DoRA magnitude weights are zero (zero-row NaN fix actually worked).
+    # If this fails, the fix in src/train/train.py is broken — see Task 7 review for context.
+    from peft.tuners.lora.dora import DoraLinearLayer
+
+    zero_magnitude_rows = []
+    for name, mod in model.named_modules():
+        if not isinstance(mod, LoraLayer):
+            continue
+        if not hasattr(mod, "lora_magnitude_vector"):
+            continue
+        for adapter, mag in mod.lora_magnitude_vector.items():
+            if not isinstance(mag, DoraLinearLayer):
+                continue
+            zero_count = int((mag.weight.data == 0).sum())
+            if zero_count > 0:
+                zero_magnitude_rows.append((name, adapter, zero_count))
+
+    assert not zero_magnitude_rows, (
+        f"DoRA magnitude weights have zero entries (NaN fix in train.py is broken):\n"
+        + "\n".join(f"  {n}[{a}]: {c} zero rows" for n, a, c in zero_magnitude_rows)
+    )
+    print(
+        f"DoRA magnitude zero-row check passed "
+        f"(0 layers have zero magnitude entries after NaN fix)."
+    )
+
     print(
         "\nOK -- DoRA attached, encoder frozen, gradients flow through encoder."
     )
