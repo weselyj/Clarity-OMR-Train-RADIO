@@ -6,8 +6,9 @@ Run from the repo root:
 Expected output:
     DoRA-wrapped modules: <N>
     Encoder DoRA-wrapped: <N>
+    DoRA NaN fix: patched <N> module(s) with zero base-weight rows
     encoder DoRA params with non-None grad: <N>
-    sum of grad norms: <float>
+    sum of grad norms: <float>   (expect ~30-50 with seed=0)
     non-DoRA encoder params with requires_grad=True: 0
     trainable params: ~30.12M of ~757.37M total
     OK -- DoRA attached, encoder frozen, gradients flow through encoder.
@@ -38,6 +39,18 @@ def main():
     model, dora_applied = _prepare_model_for_dora(model, dora_config)
     assert dora_applied, "_prepare_model_for_dora returned dora_applied=False"
 
+    # Assert the NaN fix actually patched >=1 module.  For C-RADIOv4-H we know
+    # blocks.0.attn.proj has one zero-init row, so this must be >=1.
+    assert hasattr(model, "_dora_zero_row_fixes_applied"), (
+        "_prepare_model_for_dora did not set model._dora_zero_row_fixes_applied. "
+        "Update train.py to track the zero-row patch count."
+    )
+    assert model._dora_zero_row_fixes_applied >= 1, (
+        f"DoRA NaN fix patched 0 modules -- expected >=1 for C-RADIOv4-H "
+        f"(blocks.0.attn.proj has a zero-init row). "
+        f"Check that _prepare_model_for_dora in train.py still applies the fix."
+    )
+
     # Count DoRA-wrapped modules. In PEFT 0.19.1, use_dora=True wraps via LoraLayer
     # (there is no separate DoraLayer class in this version).
     from peft.tuners.lora import LoraLayer
@@ -60,6 +73,7 @@ def main():
     # Use keyword-argument form: PEFT's PeftModel wrapper intercepts positional args and
     # the RadioStageB.forward supports pixel_values/input_ids aliases for compatibility.
     print("Running forward + backward pass...")
+    torch.manual_seed(0)  # stabilise grad norm so we can use a tighter threshold
     model.train()
     img = torch.rand(1, 1, 192, 1024).cuda()
     tgt = torch.zeros(1, 32, dtype=torch.long).cuda()
@@ -86,8 +100,9 @@ def main():
         "No encoder DoRA params received gradients. "
         "Check if RADIO encoder is in eval() mode or has requires_grad=False internally."
     )
-    assert encoder_grad_norm > 0, (
-        "Encoder DoRA grad norm is zero -- gradients aren't flowing through the encoder."
+    assert encoder_grad_norm > 1.0, (
+        f"Encoder DoRA grad norm is {encoder_grad_norm:.4f} -- expected >1.0 (typically ~30-50 "
+        "with seed=0). Gradients may not be flowing through the encoder."
     )
 
     # Verify encoder base weights are frozen (DoRA freeze logic should cover them all).
@@ -113,7 +128,7 @@ def main():
     )
 
     # Assert no DoRA magnitude weights are zero (zero-row NaN fix actually worked).
-    # If this fails, the fix in src/train/train.py is broken — see Task 7 review for context.
+    # If this fails, the fix in src/train/train.py is broken -- see Task 7 review for context.
     from peft.tuners.lora.dora import DoraLinearLayer
 
     zero_magnitude_rows = []
