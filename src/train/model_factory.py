@@ -36,6 +36,42 @@ class ModelFactoryConfig:
     stage_b_encoder: str = "davit"
 
 
+def list_radio_dora_target_modules() -> list[str]:
+    """Return linear module leaf names targeted for DoRA on the RADIO encoder path.
+
+    Enumerated empirically via scripts/enumerate_radio_modules.py against
+    C-RADIOv4-H (32 ViT blocks, 128 attention+MLP linears total):
+
+      - qkv   : combined Q/K/V projection in each ViT block (32x)
+      - proj  : attention output projection in each ViT block (32x)
+      - fc1   : MLP first linear in each ViT block (32x)
+      - fc2   : MLP second linear in each ViT block (32x)
+
+    The decoder block targets (q_proj, k_proj, etc.) are also included so
+    the shared cross-attention decoder layers are adapted alongside the encoder.
+    Patch-embedding and head linears are intentionally excluded.
+    """
+    return [
+        # RADIO ViT encoder
+        "qkv",    # attn.qkv  (32 layers)
+        "proj",   # attn.proj (32 layers)
+        "fc1",    # mlp.fc1   (32 layers)
+        "fc2",    # mlp.fc2   (32 layers)
+        # Shared decoder block (same names as DaViT path)
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "out_proj",
+        "cross_attn_q",
+        "cross_attn_k",
+        "cross_attn_v",
+        "cross_attn_out",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+
+
 def build_stage_a_model(config: Optional[ModelFactoryConfig] = None) -> YoloStageA:
     cfg = config or ModelFactoryConfig()
     stage_a_config = YoloStageAConfig(
@@ -65,15 +101,23 @@ def build_stage_b_components(config: Optional[ModelFactoryConfig] = None) -> Dic
         # stage_b_config is serialised into checkpoints so the architecture
         # can be reconstructed on resume.
         stage_b_config = radio_config
-        dora_cfg = build_dora_config(cfg.stage_b_dora_rank)
-        # RADIO's linear layers are enumerated at DoRA-wrap time; return an
-        # empty list so the upstream helper builds its own target list.
-        dora_target_modules: list = []
+        # Build a RADIO-specific dora_config that targets RADIO's ViT naming
+        # (qkv/proj/fc1/fc2) plus the shared decoder block names.
+        # _prepare_model_for_dora matches via name.endswith(target), so leaf
+        # names are sufficient -- no regex needed.
+        radio_targets = list_radio_dora_target_modules()
+        dora_cfg = {
+            "adapter_type": "dora",
+            "rank": cfg.stage_b_dora_rank,
+            "target_modules": radio_targets,
+            "alpha": cfg.stage_b_dora_rank,
+            "dropout": 0.10,
+        }
         return {
             "model": model,
             "stage_b_config": stage_b_config,
             "dora_config": dora_cfg,
-            "dora_target_modules": dora_target_modules,
+            "dora_target_modules": radio_targets,
         }
 
     if encoder not in ("davit", ""):
