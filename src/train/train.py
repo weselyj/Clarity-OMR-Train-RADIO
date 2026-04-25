@@ -79,6 +79,7 @@ class StageTrainingConfig:
     grad_accumulation_steps: int
     loraplus_lr_ratio: float
     dataset_mix: Tuple[DatasetMix, ...]
+    stage_b_encoder: str = "davit"
 
 
 def load_yaml(path: Path) -> Dict[str, object]:
@@ -132,6 +133,7 @@ def load_stage_config(path: Path) -> StageTrainingConfig:
         grad_accumulation_steps=max(1, int(raw.get("grad_accumulation_steps", 1))),
         loraplus_lr_ratio=float(raw.get("loraplus_lr_ratio", 1.0)),
         dataset_mix=tuple(mix),
+        stage_b_encoder=str(raw.get("stage_b_encoder", "davit")).lower().strip(),
     )
 
 
@@ -1032,6 +1034,7 @@ def run_execute_mode(
     stage_b_decoder_layers: int = 8,
     stage_b_decoder_heads: int = 12,
     stage_b_dora_rank: Optional[int] = None,
+    stage_b_encoder: Optional[str] = None,
 ) -> Dict[str, object]:
     import torch
     import torch.nn.functional as F
@@ -1041,12 +1044,17 @@ def run_execute_mode(
 
     rng = random.Random(seed)
     vocab = build_default_vocabulary()
+    # encoder: YAML value from first stage wins; explicit CLI arg overrides.
+    resolved_encoder = stage_b_encoder if stage_b_encoder else (
+        stages[0].stage_b_encoder if stages else "davit"
+    )
     factory_cfg = ModelFactoryConfig(
         stage_b_vocab_size=vocab.size,
         stage_b_backbone=stage_b_backbone,
         stage_b_decoder_dim=stage_b_decoder_dim,
         stage_b_decoder_layers=stage_b_decoder_layers,
         stage_b_decoder_heads=stage_b_decoder_heads,
+        stage_b_encoder=resolved_encoder,
     )
     resume_payload = None
     resume_factory_cfg = None
@@ -1663,6 +1671,15 @@ def parse_args() -> argparse.Namespace:
         help="Stage-B timm backbone name.",
     )
     parser.add_argument(
+        "--stage-b-encoder",
+        type=str,
+        default=None,
+        help=(
+            "Stage-B encoder type: 'davit' (default) or 'radio_h' (C-RADIOv4-H). "
+            "Overrides the stage_b_encoder key in the stage YAML config."
+        ),
+    )
+    parser.add_argument(
         "--stage-b-decoder-dim",
         type=int,
         default=768,
@@ -1760,6 +1777,7 @@ def main() -> None:
             stage_b_dora_rank=(
                 None if args.stage_b_dora_rank is None else max(1, int(args.stage_b_dora_rank))
             ),
+            stage_b_encoder=args.stage_b_encoder,
         )
     else:
         summary = run_dry_mode(stages=stages, grouped_entries=grouped)
@@ -1771,4 +1789,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
