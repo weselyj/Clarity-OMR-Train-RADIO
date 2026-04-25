@@ -81,8 +81,16 @@ class RadioEncoder(nn.Module):
 
 @dataclass
 class RadioStageBConfig:
-    """Configuration for the RADIO Stage B model."""
+    """Configuration for the RADIO Stage B model.
 
+    The ``encoder`` field is serialised into checkpoints (via dataclasses.asdict)
+    so that model_factory_config_from_checkpoint_payload can reconstruct the
+    correct model class on resume without falling back to the DaViT default.
+    """
+
+    # Encoder discriminator — must match the ModelFactoryConfig.stage_b_encoder
+    # value that dispatches to this class.  Persisted in checkpoint metadata.
+    encoder: str = "radio_h"
     decoder_dim: int = 768
     decoder_layers: int = 8
     decoder_heads: int = 12

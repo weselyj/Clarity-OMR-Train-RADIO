@@ -44,8 +44,16 @@ torch, nn, F = _require_torch()
 
 @dataclass(frozen=True)
 class StageBModelConfig:
-    """Configuration values aligned with omr-final-plan Stage-B defaults."""
+    """Configuration values aligned with omr-final-plan Stage-B defaults.
 
+    The ``encoder`` field is serialised into checkpoints (via dataclasses.asdict)
+    so that model_factory_config_from_checkpoint_payload can reconstruct the
+    correct model class on resume without falling back to a wrong default.
+    """
+
+    # Encoder discriminator — must match the ModelFactoryConfig.stage_b_encoder
+    # value that dispatches to this class.  Persisted in checkpoint metadata.
+    encoder: str = "davit"
     vocab_size: int = 380
     encoder_dim: int = 768
     decoder_dim: int = 768
@@ -580,4 +588,3 @@ def run_stage_b_shape_smoke_test(
         "vocab_size": model.config.vocab_size,
         "logits_shape": list(logits.shape),
     }
-
