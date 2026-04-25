@@ -1,0 +1,56 @@
+# MVP Stage 2 config using C-RADIOv4-H (~700M) encoder.
+#
+# Encoder selection: stage_b_encoder is read by load_stage_config() and
+# threaded into ModelFactoryConfig.stage_b_encoder, which dispatches to
+# build_radio_stage_b() in build_stage_b_components().
+#
+# Memory budget:
+#   batch_size: 2 + grad_accumulation_steps: 8  =>  effective batch ~16
+#   RADIO patch-16 grid at 250x2500 => ~12x156 = 1872 spatial tokens
+#   (vs DaViT stride-32 ~6x78 = 468 tokens) -- 4x more cross-attn memory
+#
+# DoRA targets: left as TODO; Task 6 enumerates them empirically.
+# After Task 6 add a dora_target_modules list under this config or pass
+# --stage-b-dora-rank on the CLI.
+#
+# Run command:
+#   venv\Scripts\python src\train\train.py \
+#       --stage-configs configs/train_stage2_radio_mvp.yaml \
+#       --mode execute \
+#       --checkpoint-dir checkpoints/mvp_radio_stage2
+
+stage_name: stage2-radio-mvp
+stage_b_encoder: radio_h
+
+epochs: 3
+effective_samples_per_epoch: 800
+batch_size: 2
+grad_accumulation_steps: 8
+max_sequence_length: 384
+
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 200
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 200
+validate_every_steps: 100
+
+dataset_mix:
+  - dataset: grandstaff
+    ratio: 0.80
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.10
+    split: train
+    required: true
+  - dataset: cameraprimus
+    ratio: 0.10
+    split: train
+    required: true

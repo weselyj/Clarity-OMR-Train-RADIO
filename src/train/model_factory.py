@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -30,6 +31,9 @@ class ModelFactoryConfig:
     stage_b_decoder_layers: int = 8
     stage_b_decoder_heads: int = 12
     stage_b_dora_rank: int = 16
+    # Encoder selector: 'davit' uses the timm DaViT backbone;
+    # 'radio_h' uses C-RADIOv4-H (~700M params).
+    stage_b_encoder: str = "davit"
 
 
 def build_stage_a_model(config: Optional[ModelFactoryConfig] = None) -> YoloStageA:
@@ -44,6 +48,41 @@ def build_stage_a_model(config: Optional[ModelFactoryConfig] = None) -> YoloStag
 
 def build_stage_b_components(config: Optional[ModelFactoryConfig] = None) -> Dict[str, object]:
     cfg = config or ModelFactoryConfig()
+
+    encoder = str(cfg.stage_b_encoder).lower().strip()
+
+    if encoder == "radio_h":
+        from src.models.radio_stage_b import RadioStageBConfig, RadioStageB
+        radio_config = RadioStageBConfig(
+            decoder_dim=cfg.stage_b_decoder_dim,
+            decoder_layers=cfg.stage_b_decoder_layers,
+            decoder_heads=cfg.stage_b_decoder_heads,
+            vocab_size=cfg.stage_b_vocab_size,
+            max_decode_len=cfg.stage_b_max_decode_length,
+        )
+        model = RadioStageB(radio_config)
+        # DoRA rank is used downstream by _prepare_model_for_dora.
+        # stage_b_config is serialised into checkpoints so the architecture
+        # can be reconstructed on resume.
+        stage_b_config = radio_config
+        dora_cfg = build_dora_config(cfg.stage_b_dora_rank)
+        # RADIO's linear layers are enumerated at DoRA-wrap time; return an
+        # empty list so the upstream helper builds its own target list.
+        dora_target_modules: list = []
+        return {
+            "model": model,
+            "stage_b_config": stage_b_config,
+            "dora_config": dora_cfg,
+            "dora_target_modules": dora_target_modules,
+        }
+
+    if encoder not in ("davit", ""):
+        warnings.warn(
+            f"build_stage_b_components: unknown encoder '{encoder}'; falling back to 'davit'.",
+            stacklevel=2,
+        )
+
+    # --- DaViT path (default) ---
     stage_b_config = StageBModelConfig(
         vocab_size=cfg.stage_b_vocab_size,
         max_decode_length=cfg.stage_b_max_decode_length,
@@ -74,7 +113,7 @@ def model_factory_config_from_checkpoint_payload(
         normalized = str(name)
         for prefix in ("base_model.model.", "model."):
             if normalized.startswith(prefix):
-                normalized = normalized[len(prefix) :]
+                normalized = normalized[len(prefix):]
                 break
         # Strip PEFT/DoRA wrapper path segments so legacy checkpoints map to base names.
         for segment in (".original_module.", ".base_layer.", ".modules_to_save.default."):
@@ -119,6 +158,7 @@ def model_factory_config_from_checkpoint_payload(
             stage_b_decoder_layers=int(raw_cfg.get("decoder_layers", base.stage_b_decoder_layers)),
             stage_b_decoder_heads=int(raw_cfg.get("decoder_heads", base.stage_b_decoder_heads)),
             stage_b_dora_rank=cfg_dora_rank,
+            stage_b_encoder=str(raw_cfg.get("encoder", base.stage_b_encoder)),
         )
 
     # Legacy checkpoint fallback: infer architecture from tensor shapes when metadata is unavailable.
@@ -181,6 +221,7 @@ def model_factory_config_from_checkpoint_payload(
         stage_b_decoder_layers=max(1, int(inferred_decoder_layers)),
         stage_b_decoder_heads=max(1, int(inferred_decoder_heads)),
         stage_b_dora_rank=inferred_dora_rank,
+        stage_b_encoder=base.stage_b_encoder,
     )
 
 
