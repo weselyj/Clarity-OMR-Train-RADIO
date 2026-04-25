@@ -883,9 +883,15 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
     # the actual nn.Parameter is at DoraLinearLayer.weight (set in update_layer as
     # `self.weight = nn.Parameter(weight_norm, ...)`).  Writing to _mag_param.data
     # would hit an AttributeError because DoraLinearLayer has no .data attribute.
+    #
+    # NOTE: this writes through to the pretrained base weight tensor.  Affected rows
+    # are zero-init by construction (e.g., blocks.0.attn.proj has one such row in
+    # C-RADIOv4-H), so the model's forward output at scale is unchanged, but saved
+    # checkpoints will differ from the upstream RADIO weights by 1e-6 on those rows.
     import torch as _torch
     from peft.tuners.lora import LoraLayer as _LoraLayer
     from peft.tuners.lora.dora import DoraLinearLayer as _DoraLinearLayer
+    _zero_row_modules_patched = 0
     for _name, _module in model.named_modules():
         if not (isinstance(_module, _LoraLayer) and hasattr(_module, "lora_magnitude_vector")):
             continue
@@ -896,8 +902,8 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
             continue
         # Perturb zero rows with a tiny constant so weight_norm > 0
         _base_w[_zero_rows] = 1e-6
-        # Re-derive magnitude from the corrected base weight and write it back.
-        # _mag_param is a DoraLinearLayer module; its magnitude is at .weight.
+        # Re-derive magnitude once from the corrected base weight; it doesn't depend on the adapter.
+        _new_norms = _torch.linalg.norm(_base_w, dim=1)
         for _adapter_name, _mag_param in _module.lora_magnitude_vector.items():
             if not isinstance(_mag_param, _DoraLinearLayer):
                 raise RuntimeError(
@@ -906,8 +912,11 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
                     f"got {type(_mag_param).__name__}. "
                     "Update the fix if the PEFT version changed."
                 )
-            _new_norms = _torch.linalg.norm(_base_w, dim=1)
             _mag_param.weight.data[_zero_rows] = _new_norms[_zero_rows]
+        _zero_row_modules_patched += 1
+    if _zero_row_modules_patched > 0:
+        print(f"DoRA NaN fix: patched {_zero_row_modules_patched} module(s) with zero base-weight rows")
+    model._dora_zero_row_fixes_applied = _zero_row_modules_patched
 
     for parameter in model.parameters():
         parameter.requires_grad = False
