@@ -14,11 +14,13 @@ def main():
         version="c-radio_v4-h",
         progress=True,
         skip_validation=True,
-        force_reload=True,  # first run: re-pull source
-        trust_repo=True,
+        force_reload=True,  # re-pulls RADIO Python source on every run; remove once stable
+        trust_repo=True,  # required for non-interactive SSH execution
     )
     model.cuda().eval()
-    print(f"Model loaded. Hidden dim: {getattr(model, 'embed_dim', 'unknown')}")
+    embed_dim = model.embed_dim
+    assert embed_dim == 1280, f"Unexpected embed_dim: {embed_dim}"
+    print(f"Model loaded. Hidden dim: {embed_dim}")
 
     # Stage B input: grayscale staff crop, height 192, width up to 2048
     h, w = 192, 1024
