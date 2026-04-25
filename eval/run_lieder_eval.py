@@ -1,26 +1,23 @@
 """Run a trained Clarity-OMR-Train-RADIO checkpoint through the Lieder eval split.
 
-SKELETON STATE: the inference call (run_inference) is a stub. Fill it in once
-Task 12 (MVP) produces a checkpoint — at that point we'll know:
+Wraps src.pdf_to_musicxml (full Stage A YOLO + Stage B RADIO/DaViT + MusicXML
+export pipeline already vendored in this repo). Uses sibling Clarity-OMR's
+shipped YOLO weights for Stage A; loads our trained Stage B checkpoint via
+--stage-b-checkpoint. Our src.eval.evaluate_stage_b_checkpoint detects the
+DoRA-wrapped (PEFT base_model.model.* with lora_*) checkpoint format
+automatically and applies _prepare_model_for_dora before load_state_dict.
 
-  - exact checkpoint structure (Stage A YOLO + Stage B DaViT/RADIO);
-  - whether to call sibling repo's `src.pdf_to_musicxml.main()` with our
-    --weights / --stage-b-checkpoint pointing at our trained files, or to
-    compose Stage A detection + Stage B decode + MusicXML serialization
-    inline (no inference module exists in this repo yet);
-  - whether DoRA-wrapped Stage B layers need any unwrapping at inference.
-
-Until then this script raises NotImplementedError on the first piece.
-The surrounding harness (Lieder split iteration, work-dir per piece,
-absolute-path ground-truth resolution, resume guard, CSV writing, gate
-logic) mirrors eval/run_baseline_reproduction.py and is ready to use as
-soon as the inference stub is filled in.
+Defaults to greedy decode (beam_width=1, max_decode_steps=256) — fast enough
+for the MVP gate where the goal is just "any non-NaN F1 means inference works."
+For real eval against a Stage 3 checkpoint, override with --beam-width 5
+--max-decode-steps 512.
 
 Usage:
     venv\\Scripts\\python -m eval.run_lieder_eval \\
-        --checkpoint path\\to\\stage_b.pt \\
-        --config configs\\stage_b\\my_run.yaml \\
-        --name my_run
+        --checkpoint checkpoints/mvp_radio_stage2/stage2-radio-mvp_step_0000150.pt \\
+        --config configs/train_stage2_radio_mvp.yaml \\
+        --name mvp \\
+        --limit 3   # optional smoke cap
 """
 import argparse
 import csv
@@ -35,10 +32,20 @@ sys.path.insert(0, str(_REPO_ROOT))
 from eval.lieder_split import get_eval_pieces, split_hash
 from eval.playback import playback_f
 
-# Sibling repo holding the author's pdf->musicxml pipeline. Once Task 12 lands
-# and we know the integration shape, run_inference() will likely import
-# src.pdf_to_musicxml from this directory and call it with our weight paths.
-CLARITY_OMR_DIR = Path.home() / "Clarity-OMR"
+# Path to our venv's Python — used to invoke src.pdf_to_musicxml as a subprocess
+VENV_PYTHON = Path(__file__).resolve().parents[1] / "venv" / "Scripts" / "python.exe"
+
+# Stage A YOLO checkpoint is shipped by sibling Clarity-OMR (HuggingFace download
+# triggered on first omr.py run, lands at info/yolo.pt). We don't train Stage A
+# in this repo, so reuse it.
+STAGE_A_YOLO = Path.home() / "Clarity-OMR" / "info" / "yolo.pt"
+
+# Inference uses our own src.pdf_to_musicxml — our fork already has the full
+# pipeline (Stage A wrapper + cli helpers + decoding/* + pipeline/*), and our
+# src.eval.evaluate_stage_b_checkpoint detects DoRA-wrapped checkpoints and
+# applies _prepare_model_for_dora before load_state_dict, so our trained
+# checkpoint loads via --stage-b-checkpoint with no further conversion.
+PDF_TO_MUSICXML_TIMEOUT_SEC = 1800  # 30-min cap per piece
 
 
 def run_inference(
@@ -47,29 +54,43 @@ def run_inference(
     pdf: Path,
     out: Path,
     work_dir: Path,
+    *,
+    beam_width: int = 1,
+    max_decode_steps: int = 256,
 ) -> None:
-    """Run our trained model on `pdf`, write MusicXML to `out`.
+    """Run our trained Stage B + sibling YOLO Stage A on `pdf`, write MusicXML to `out`.
 
-    SKELETON — fill in after Task 12 produces an MVP checkpoint.
-
-    Most likely shape:
-      1. Resolve Stage A YOLO weights and Stage B checkpoint paths from
-         our checkpoint + config.
-      2. Either
-           (a) sys.path.insert(0, str(CLARITY_OMR_DIR)) and call
-               src.pdf_to_musicxml.main() with overridden argv (--weights,
-               --stage-b-checkpoint, --pdf, --output-musicxml, --work-dir,
-               --stage-b-device cuda); or
-           (b) build Stage A + Stage B via src.train.model_factory, run the
-               PDF through staves -> token decode -> MusicXML serialization
-               inline (requires inference utilities we don't have yet).
-      3. Make sure DoRA-wrapped layers are loaded correctly (merge or keep
-         adapters live — TBD per MVP results).
+    Defaults are tuned for MVP-quality models: greedy decode (beam=1) with a 256-step
+    cap is ~10x faster than the standard beam=5 / max=512 used at full-Stage-3 quality.
+    For real eval against a Stage 3 checkpoint, override via --beam-width / --max-decode-steps.
     """
-    raise NotImplementedError(
-        f"run_inference is a skeleton; fill in after Task 12. "
-        f"checkpoint={checkpoint}, pdf={pdf}, out={out}, work_dir={work_dir}"
-    )
+    import subprocess
+    if not STAGE_A_YOLO.exists():
+        raise SystemExit(
+            f"FATAL: Stage A YOLO weights not found at {STAGE_A_YOLO}. "
+            "Run sibling Clarity-OMR's omr.py once on any PDF to trigger the HF download."
+        )
+    repo_root = Path(__file__).resolve().parents[1]
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(VENV_PYTHON),
+        "-m", "src.pdf_to_musicxml",
+        "--pdf", str(pdf),
+        "--output-musicxml", str(out),
+        "--weights", str(STAGE_A_YOLO),
+        "--stage-b-checkpoint", str(checkpoint),
+        "--work-dir", str(work_dir),
+        "--project-root", str(repo_root),
+        "--stage-b-device", "cuda",
+        "--beam-width", str(beam_width),
+        "--max-decode-steps", str(max_decode_steps),
+        "--image-height", "250",
+        "--image-max-width", "2500",
+        "--length-penalty-alpha", "0.4",
+        "--pdf-dpi", "300",
+        "--quiet",
+    ]
+    subprocess.run(cmd, check=True, cwd=str(repo_root), timeout=PDF_TO_MUSICXML_TIMEOUT_SEC)
 
 
 def main() -> None:
@@ -85,6 +106,18 @@ def main() -> None:
     p.add_argument(
         "--name", required=True,
         help="run name (used for output dir + CSV filename)",
+    )
+    p.add_argument(
+        "--beam-width", type=int, default=1,
+        help="Stage-B beam width (default 1 = greedy; ~5x slower per beam at 5)",
+    )
+    p.add_argument(
+        "--max-decode-steps", type=int, default=256,
+        help="Stage-B max decode steps per staff (default 256; full quality is 512)",
+    )
+    p.add_argument(
+        "--limit", type=int, default=None,
+        help="Optional cap on number of pieces (for smoke runs)",
     )
     args = p.parse_args()
 
@@ -111,6 +144,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     eval_pieces = get_eval_pieces()
+    if args.limit is not None:
+        eval_pieces = eval_pieces[: args.limit]
+        print(f"--limit {args.limit}: running on first {len(eval_pieces)} pieces only")
     n_total = len(eval_pieces)
     rows: list[tuple[str, float | None]] = []
 
@@ -127,7 +163,11 @@ def main() -> None:
             work_dir = work_base / piece.stem
             if not pred.exists():
                 print(f"[{i}/{n_total}] inference {piece.stem} ...")
-                run_inference(args.checkpoint, args.config, pdf, pred, work_dir)
+                run_inference(
+                    args.checkpoint, args.config, pdf, pred, work_dir,
+                    beam_width=args.beam_width,
+                    max_decode_steps=args.max_decode_steps,
+                )
             else:
                 print(f"[{i}/{n_total}] cached  {piece.stem}")
             f1 = playback_f(pred=pred, gt=piece_abs)["f"]
@@ -149,7 +189,6 @@ def main() -> None:
     failed_count = sum(1 for _, f in rows if f is None)
     if not valid:
         print(f"\nNo pieces scored successfully ({failed_count}/{n_total} failed/skipped).")
-        print("(Expected while run_inference is still a skeleton.)")
         return
 
     mean_f1 = statistics.mean(valid)

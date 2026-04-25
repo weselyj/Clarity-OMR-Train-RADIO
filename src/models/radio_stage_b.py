@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -81,16 +81,8 @@ class RadioEncoder(nn.Module):
 
 @dataclass
 class RadioStageBConfig:
-    """Configuration for the RADIO Stage B model.
+    """Configuration for the RADIO Stage B model."""
 
-    The ``encoder`` field is serialised into checkpoints (via dataclasses.asdict)
-    so that model_factory_config_from_checkpoint_payload can reconstruct the
-    correct model class on resume without falling back to the DaViT default.
-    """
-
-    # Encoder discriminator — must match the ModelFactoryConfig.stage_b_encoder
-    # value that dispatches to this class.  Persisted in checkpoint metadata.
-    encoder: str = "radio_h"
     decoder_dim: int = 768
     decoder_layers: int = 8
     decoder_heads: int = 12
@@ -153,12 +145,35 @@ class RadioStageB(nn.Module):
         self,
         decoder_input_ids: torch.Tensor,
         memory: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        use_cache: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]],
+    ]:
         hidden = self.token_embedding(decoder_input_ids)
-        for block in self.decoder_blocks:
-            hidden, _ = block(hidden, memory)
+        if past_key_values is not None and len(past_key_values) != len(self.decoder_blocks):
+            raise ValueError(
+                f"past_key_values length mismatch: expected {len(self.decoder_blocks)}, got {len(past_key_values)}."
+            )
+        next_past: list[Tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_idx, block in enumerate(self.decoder_blocks):
+            layer_past = past_key_values[layer_idx] if past_key_values is not None else None
+            hidden, layer_next_past = block(
+                hidden,
+                memory,
+                past_key_value=layer_past,
+                use_cache=use_cache,
+            )
+            if use_cache:
+                if layer_next_past is None:
+                    raise RuntimeError("Decoder block returned no cache while use_cache=True.")
+                next_past.append(layer_next_past)
         hidden = self.decoder_norm(hidden)
-        return self.lm_head(hidden)
+        cache_tuple = tuple(next_past) if use_cache else None
+        return self.lm_head(hidden), hidden, cache_tuple
 
     def forward(
         self,
@@ -179,7 +194,7 @@ class RadioStageB(nn.Module):
                 "RadioStageB.forward requires an image tensor and a target/input token tensor."
             )
         memory, contour_logits = self.encode_staff(image)
-        logits = self.decode_tokens(tgt, memory)
+        logits, _, _ = self.decode_tokens(tgt, memory)
         return {"logits": logits, "contour_logits": contour_logits}
 
 

@@ -39,7 +39,7 @@ weight_decay: 0.01
 label_smoothing: 0.05
 contour_loss_weight: 0.01
 
-checkpoint_every_steps: 200
+checkpoint_every_steps: 50
 validate_every_steps: 100
 
 dataset_mix:
