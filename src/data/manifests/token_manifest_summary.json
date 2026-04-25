@@ -1,0 +1,24 @@
+{
+  "input_samples_seen": 600,
+  "converted_samples": 600,
+  "failed_samples": 0,
+  "output_manifest": "src/data/manifests/token_manifest.jsonl",
+  "converted_by_dataset": {
+    "primus": 600
+  },
+  "converted_by_source": {
+    "semantic": 600
+  },
+  "converted_by_split": {
+    "primus": {
+      "train": 505,
+      "val": 37,
+      "test": 58
+    }
+  },
+  "relaxed_validation_samples": 56,
+  "relaxed_validation_by_source": {
+    "semantic": 56
+  },
+  "failures_preview": []
+}

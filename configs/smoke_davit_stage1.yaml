@@ -1,0 +1,18 @@
+stage_name: smoke-davit-stage1
+epochs: 1
+effective_samples_per_epoch: 400
+batch_size: 4
+max_sequence_length: 256
+lr_dora: 0.003
+lr_new_modules: 0.001
+warmup_steps: 5
+schedule: cosine
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+checkpoint_every_steps: 50
+validate_every_steps: 50
+dataset_mix:
+  - dataset: primus
+    ratio: 1.0
+    split: train
+    required: true
