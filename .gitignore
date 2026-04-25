@@ -193,4 +193,5 @@ logs/*.jsonl
 
 # Generated manifests and training summaries
 src/data/manifests/*.jsonl
+src/data/manifests/*.json
 src/train/curriculum_summary.json
