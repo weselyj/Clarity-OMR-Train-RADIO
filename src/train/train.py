@@ -1000,11 +1000,16 @@ def _save_checkpoint(
     stage_step: Optional[int] = None,
     stage_steps_total: Optional[int] = None,
     stage_b_config: Optional[Dict[str, object]] = None,
+    name_suffix: Optional[str] = None,
 ) -> Path:
     import torch
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"{stage_name}_step_{global_step:07d}.pt"
+    if name_suffix is not None:
+        # Stable filename for best/final/etc. (overwrites prior).
+        checkpoint_path = checkpoint_dir / f"{stage_name}_{name_suffix}.pt"
+    else:
+        checkpoint_path = checkpoint_dir / f"{stage_name}_step_{global_step:07d}.pt"
     payload = {
         "stage_name": stage_name,
         "global_step": global_step,
@@ -1080,6 +1085,7 @@ def run_execute_mode(
     stage_b_decoder_heads: int = 12,
     stage_b_dora_rank: Optional[int] = None,
     stage_b_encoder: Optional[str] = None,
+    keep_last_checkpoints: int = 0,
 ) -> Dict[str, object]:
     import torch
     import torch.nn.functional as F
@@ -1136,6 +1142,11 @@ def run_execute_mode(
         )
     components = build_stage_b_components(factory_cfg)
     stage_b_config_dict = dataclasses.asdict(components["stage_b_config"])
+    # Persist encoder type explicitly (RadioStageBConfig vs StageBModelConfig don't carry
+    # this as a field — it's encoded in the dataclass type, which asdict() drops).
+    # Without this, model_factory_config_from_checkpoint_payload has to infer from
+    # tensor shapes; explicit metadata is cleaner.
+    stage_b_config_dict["encoder"] = factory_cfg.stage_b_encoder
     base_model = components["model"]
     model, dora_applied = _prepare_model_for_dora(base_model, components["dora_config"])
 
@@ -1417,6 +1428,8 @@ def run_execute_mode(
             losses: List[float] = []
             non_finite_events = 0
             stage_grad_alerts = 0
+            best_val_loss: Optional[float] = None
+            best_val_step: Optional[int] = None
 
             for stage_step in range(stage_start_step, stage_total_steps + 1):
                 batch = _sample_stage_batch(stage, grouped_entries=grouped_entries, rng=rng)
@@ -1533,6 +1546,26 @@ def run_execute_mode(
                                 **validation_result,
                             }
                         )
+                        # Save a stable _best.pt whenever val_loss improves.
+                        if checkpoint_dir is not None:
+                            current_val = validation_result.get("val_loss")
+                            if isinstance(current_val, (int, float)):
+                                current_val = float(current_val)
+                                if best_val_loss is None or current_val < best_val_loss:
+                                    best_val_loss = current_val
+                                    best_val_step = global_step
+                                    _save_checkpoint(
+                                        checkpoint_dir=checkpoint_dir,
+                                        model=model,
+                                        optimizer=optimizer,
+                                        scheduler=scheduler,
+                                        stage_name=stage.stage_name,
+                                        global_step=global_step,
+                                        stage_step=stage_step,
+                                        stage_steps_total=stage_total_steps,
+                                        stage_b_config=stage_b_config_dict,
+                                        name_suffix="best",
+                                    )
 
                 if checkpoint_dir is not None and global_step % stage.checkpoint_every_steps == 0:
                     checkpoint_path = _save_checkpoint(
@@ -1547,6 +1580,24 @@ def run_execute_mode(
                         stage_b_config=stage_b_config_dict,
                     )
                     checkpoints_written.append(str(checkpoint_path))
+                    # Optional: keep only the last N step-numbered checkpoints to bound
+                    # disk usage. _best.pt and _final.pt are stable filenames and are
+                    # not matched by the f"{stage_name}_step_*.pt" glob, so they are
+                    # never pruned by this rule.
+                    if keep_last_checkpoints > 0:
+                        periodic = sorted(
+                            checkpoint_dir.glob(f"{stage.stage_name}_step_*.pt")
+                        )
+                        excess = len(periodic) - int(keep_last_checkpoints)
+                        if excess > 0:
+                            for old_path in periodic[:excess]:
+                                try:
+                                    old_path.unlink()
+                                except OSError as exc:
+                                    print(
+                                        f"[train] warning: failed to prune old checkpoint {old_path}: {exc}",
+                                        file=sys.stderr,
+                                    )
 
                 if step_writer is not None:
                     record = {
@@ -1575,6 +1626,25 @@ def run_execute_mode(
                     }
                     step_writer.write(json.dumps(record) + "\n")
                     step_writer.flush()
+
+            # Save a final checkpoint at the end of the stage so the very last
+            # optimizer steps (between the last periodic checkpoint and the loop
+            # end) are not discarded. checkpoint_every_steps=1000 + a stage that
+            # ends at e.g. step 4688 would otherwise lose the last 688 steps.
+            if checkpoint_dir is not None and global_step > 0:
+                final_path = _save_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    stage_name=stage.stage_name,
+                    global_step=global_step,
+                    stage_step=stage_step,
+                    stage_steps_total=stage_total_steps,
+                    stage_b_config=stage_b_config_dict,
+                    name_suffix="final",
+                )
+                checkpoints_written.append(str(final_path))
 
             stage_metrics.append(
                 {
@@ -1769,6 +1839,16 @@ def parse_args() -> argparse.Namespace:
         default=2500,
         help="Maximum preserved width (images are aspect-preserved and right-padded, max 3000).",
     )
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=0,
+        help=(
+            "Bound disk by keeping only the most recent N step-numbered checkpoints. "
+            "0 (default) = keep all. _best.pt and _final.pt are stable filenames and "
+            "are never pruned."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1832,6 +1912,7 @@ def main() -> None:
                 None if args.stage_b_dora_rank is None else max(1, int(args.stage_b_dora_rank))
             ),
             stage_b_encoder=args.stage_b_encoder,
+            keep_last_checkpoints=max(0, int(args.keep_last_checkpoints)),
         )
     else:
         summary = run_dry_mode(stages=stages, grouped_entries=grouped)

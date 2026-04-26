@@ -178,6 +178,21 @@ def model_factory_config_from_checkpoint_payload(
         else {}
     )
 
+    # Detect encoder type from positional_bridge.proj.weight input dim.
+    # RADIO encoders project 1280-dim spatial features to 768-dim decoder; DaViT
+    # has 768-dim throughout. This works even when stage_b_config metadata omits
+    # the encoder field (saved RADIO checkpoints from train.py do not include it
+    # because it's encoded in the dataclass type, not as a field).
+    detected_encoder: Optional[str] = None
+    if normalized_state:
+        bridge_weight = normalized_state.get("positional_bridge.proj.weight")
+        if hasattr(bridge_weight, "shape") and len(bridge_weight.shape) == 2:
+            in_dim = int(bridge_weight.shape[1])
+            if in_dim == 1280:
+                detected_encoder = "radio_h"
+            elif in_dim == 768:
+                detected_encoder = "davit"
+
     # Infer dora_rank from LoRA tensor shapes in the state dict.
     inferred_dora_rank = base.stage_b_dora_rank
     if isinstance(state_dict, dict):
@@ -191,6 +206,12 @@ def model_factory_config_from_checkpoint_payload(
 
     if isinstance(raw_cfg, dict):
         cfg_dora_rank = int(raw_cfg.get("dora_rank", inferred_dora_rank))
+        # Encoder resolution priority: explicit raw_cfg["encoder"] > detected from
+        # tensor shape > base default. The detected value is more trustworthy than
+        # the default but should yield to an explicit override.
+        cfg_encoder = raw_cfg.get("encoder")
+        if cfg_encoder is None:
+            cfg_encoder = detected_encoder if detected_encoder is not None else base.stage_b_encoder
         return ModelFactoryConfig(
             stage_a_weights_path=base.stage_a_weights_path,
             stage_a_confidence_threshold=base.stage_a_confidence_threshold,
@@ -202,7 +223,7 @@ def model_factory_config_from_checkpoint_payload(
             stage_b_decoder_layers=int(raw_cfg.get("decoder_layers", base.stage_b_decoder_layers)),
             stage_b_decoder_heads=int(raw_cfg.get("decoder_heads", base.stage_b_decoder_heads)),
             stage_b_dora_rank=cfg_dora_rank,
-            stage_b_encoder=str(raw_cfg.get("encoder", base.stage_b_encoder)),
+            stage_b_encoder=str(cfg_encoder),
         )
 
     # Legacy checkpoint fallback: infer architecture from tensor shapes when metadata is unavailable.
@@ -265,7 +286,7 @@ def model_factory_config_from_checkpoint_payload(
         stage_b_decoder_layers=max(1, int(inferred_decoder_layers)),
         stage_b_decoder_heads=max(1, int(inferred_decoder_heads)),
         stage_b_dora_rank=inferred_dora_rank,
-        stage_b_encoder=base.stage_b_encoder,
+        stage_b_encoder=detected_encoder if detected_encoder is not None else base.stage_b_encoder,
     )
 
 
