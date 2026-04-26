@@ -1,0 +1,57 @@
+# Stage 1 (monophonic foundation) using C-RADIOv4-H (~700M) encoder.
+#
+# Cribbed from configs/train_stage1.yaml (DaViT baseline) and configs/train_stage2_radio_mvp.yaml
+# (RADIO-specific keys validated by the MVP run, commit ad8027c).
+#
+# Memory budget:
+#   batch_size: 2 + grad_accumulation_steps: 16  =>  effective batch 32 (matches DaViT Stage 1)
+#   RADIO at 250x2500 input + DoRA generates ~2500 spatial tokens; batch 4 OOMs at 31.6 GB
+#   peak on a 32 GB 5090 (verified 2026-04-25 dry-run). Batch 2 matches MVP's validated
+#   memory profile (MVP used seq_len 384; this stage uses 256, so margin is healthy).
+#
+# DoRA targets are defined in src/train/model_factory.py::list_radio_dora_target_modules().
+#
+# Run command:
+#   venv\Scripts\python src\train\train.py \
+#       --stage-configs configs/train_stage1_radio.yaml \
+#       --mode execute \
+#       --checkpoint-dir checkpoints/full_radio_stage1 \
+#       --token-manifest src/data/manifests/token_manifest_full.jsonl \
+#       --step-log logs/full_radio_stage1_steps.jsonl
+
+stage_name: stage1-radio-monophonic-foundation
+stage_b_encoder: radio_h
+
+# Budget reduced from plan template (epochs 15, samples 114000) because RADIO at the
+# VRAM-forced batch_size=2 takes ~0.55 sec/micro-batch -- the original budget projects
+# to ~5 days. Reduced to ~75k micro-batches (~12h on the 5090). Sees each sample
+# ~1.25x on average; can extend with --resume-checkpoint if Stage 1 gate eval falls
+# short of 0.85 onset-F1.
+epochs: 5
+effective_samples_per_epoch: 30000
+batch_size: 2
+grad_accumulation_steps: 16
+max_sequence_length: 256
+
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 1000
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 1000
+validate_every_steps: 500
+
+dataset_mix:
+  - dataset: primus
+    ratio: 0.70
+    split: train
+    required: true
+  - dataset: cameraprimus
+    ratio: 0.30
+    split: train
+    required: true

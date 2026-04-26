@@ -1,0 +1,62 @@
+# Stage 2 (polyphonic) using C-RADIOv4-H (~700M) encoder.
+#
+# Cribbed from configs/train_stage2.yaml (DaViT baseline) and configs/train_stage2_radio_mvp.yaml
+# (RADIO-specific keys validated by the MVP run, commit ad8027c).
+#
+# Memory budget:
+#   batch_size: 2 + grad_accumulation_steps: 8  =>  effective batch 16 (matches DaViT Stage 2)
+#   max_seq_len: 384 for polyphonic. Same memory profile as the MVP -- validated.
+#
+# Budget reduced from upstream (epochs 30, samples 92000) for the same reason as Stage 1:
+# RADIO at batch 2 + seq 384 takes ~0.7 sec/micro-batch -> upstream budget projects to ~67 hours.
+# Reduced to ~60k micro-batches (~12h on the 5090). Each grandstaff sample seen ~0.56x on
+# average; can extend with --resume-checkpoint if Stage 2 metrics fall short.
+#
+# DoRA targets are defined in src/train/model_factory.py::list_radio_dora_target_modules().
+#
+# Run command (resume from final Stage 1 checkpoint):
+#   $latest = (Get-ChildItem checkpoints/full_radio_stage1/*.pt | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+#   venv\Scripts\python -u src/train/train.py `
+#       --stage-configs configs/train_stage2_radio.yaml `
+#       --mode execute `
+#       --resume-checkpoint $latest `
+#       --start-stage stage2-radio-polyphonic `
+#       --checkpoint-dir checkpoints/full_radio_stage2 `
+#       --token-manifest src/data/manifests/token_manifest_full.jsonl `
+#       --step-log logs/full_radio_stage2_steps.jsonl
+
+stage_name: stage2-radio-polyphonic
+stage_b_encoder: radio_h
+
+epochs: 5
+effective_samples_per_epoch: 24000
+batch_size: 2
+grad_accumulation_steps: 8
+max_sequence_length: 384
+
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 1000
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 1000
+validate_every_steps: 500
+
+dataset_mix:
+  - dataset: grandstaff
+    ratio: 0.80
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.10
+    split: train
+    required: true
+  - dataset: cameraprimus
+    ratio: 0.10
+    split: train
+    required: true
