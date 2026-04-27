@@ -10,4 +10,7 @@ Cloned via HTTPS (not SSH git@github.com) - SSH key for GitHub not configured on
 
 ## PyTorch
 
-Installed: torch 2.11.0+cu128 / torchvision 0.26.0+cu128 (Python 3.13 wheels available from pytorch.org/whl/cu128). CUDA verified: RTX 5090 detected, torch.cuda.is_available() returns True.
+PyTorch (venv/): torch 2.11.0+cu128 / torchvision 0.26.0+cu128 — rollback only
+PyTorch (venv-cu132/): torch 2.13.0.dev20260426+cu132, cuDNN 9.21.01 — production default
+
+CUDA verified: RTX 5090 detected, torch.cuda.is_available() returns True.

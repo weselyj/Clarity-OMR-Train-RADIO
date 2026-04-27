@@ -48,5 +48,5 @@ def test_radio_dora_target_count():
     assert len(found) >= 4, f"Missing RADIO encoder targets: {radio_encoder_targets - found}"
 
     # Total target count should match the documented count (15: 4 encoder + 11 decoder).
-    # If this changes, update the comment in configs/train_stage2_radio_mvp.yaml.
+    # If this changes, update the comment in configs/archived_stage2_experiments/train_stage2_radio_mvp.yaml.
     assert len(targets) >= 4 + 7, f"Unexpectedly few DoRA targets: {len(targets)}"

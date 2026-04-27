@@ -1,6 +1,6 @@
 # Stage 1 (monophonic foundation) using C-RADIOv4-H (~700M) encoder.
 #
-# Cribbed from configs/train_stage1.yaml (DaViT baseline) and configs/train_stage2_radio_mvp.yaml
+# Cribbed from configs/train_stage1.yaml (DaViT baseline) and configs/archived_stage2_experiments/train_stage2_radio_mvp.yaml
 # (RADIO-specific keys validated by the MVP run, commit ad8027c).
 #
 # Memory budget:
