@@ -960,6 +960,7 @@ def _run_validation(
     rng: random.Random,
     bf16_enabled: bool,
     validation_batches: int,
+    channels_last: bool = False,
 ) -> Optional[Dict[str, float]]:
     import torch
     import torch.nn.functional as F
@@ -979,7 +980,10 @@ def _run_validation(
                 image_height=image_height,
                 image_width=image_width,
             )
-            images = images.to(device)
+            if channels_last:
+                images = images.to(device, memory_format=torch.channels_last)
+            else:
+                images = images.to(device)
             decoder_inputs = decoder_inputs.to(device)
             labels = labels.to(device)
             contour_targets = contour_targets.to(device)
@@ -1746,6 +1750,7 @@ def run_execute_mode(
                         rng=rng,
                         bf16_enabled=bf16_enabled,
                         validation_batches=validation_batches,
+                        channels_last=channels_last,
                     )
                     _validation_ms = (_time.perf_counter() - _val_t0) * 1000.0
                     if validation_result is not None:
