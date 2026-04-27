@@ -30,6 +30,7 @@ def _require_timm():
 
 
 def _maybe_flash_attn():
+    """Probe for flash_attn availability (called once at module init)."""
     if str(os.environ.get("OMR_DISABLE_FLASH_ATTN", "0")).strip().lower() in {"1", "true", "yes", "on"}:
         return None
     try:
@@ -40,6 +41,47 @@ def _maybe_flash_attn():
 
 
 torch, nn, F = _require_torch()
+
+# ---------------------------------------------------------------------------
+# Attention backend — resolved once at import time so that _run_attention()
+# can dispatch without re-reading env vars or probing flash_attn on every call.
+#
+# Resolution order:
+#   1. flash_attn library (if installed and OMR_DISABLE_FLASH_ATTN != 1):
+#      used when the tensor is on CUDA and dtype is fp16/bf16.
+#   2. torch SDPA with configurable sub-kernels (env-gated, CUDA only).
+#   3. Plain torch.nn.functional.scaled_dot_product_attention (CPU/fallback).
+#
+# The chosen backend is logged once here so the user can confirm which path
+# is active without having to read environment variables manually.
+# ---------------------------------------------------------------------------
+
+_FLASH_ATTN_FUNC = _maybe_flash_attn()  # None if unavailable / disabled
+
+_SDPA_DISABLE_FLASH: bool = str(
+    os.environ.get("OMR_DISABLE_TORCH_FLASH_SDP", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+_SDPA_DISABLE_MEM_EFFICIENT: bool = str(
+    os.environ.get("OMR_DISABLE_TORCH_MEM_EFFICIENT_SDP", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+_SDPA_FORCE_MATH: bool = str(
+    os.environ.get("OMR_FORCE_TORCH_MATH_SDP", "0")
+).strip().lower() in {"1", "true", "yes", "on"}
+
+if _FLASH_ATTN_FUNC is not None:
+    print(
+        "[davit_stage_b] attention backend = flash_attn (library); "
+        "SDPA env overrides ignored for fp16/bf16 CUDA tensors."
+    )
+elif _SDPA_FORCE_MATH:
+    print("[davit_stage_b] attention backend = torch SDPA (math kernel forced).")
+elif _SDPA_DISABLE_FLASH and _SDPA_DISABLE_MEM_EFFICIENT:
+    print("[davit_stage_b] attention backend = torch SDPA (math only; flash+mem-efficient disabled).")
+else:
+    print(
+        f"[davit_stage_b] attention backend = torch SDPA "
+        f"(flash={not _SDPA_DISABLE_FLASH}, mem_efficient={not _SDPA_DISABLE_MEM_EFFICIENT})."
+    )
 
 
 @dataclass(frozen=True)
@@ -203,38 +245,32 @@ def _reshape_from_heads(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _run_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool) -> torch.Tensor:
-    flash_attn_func = _maybe_flash_attn()
-    if flash_attn_func is not None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+    """Run scaled dot-product attention, dispatching on the backend cached at import time.
+
+    The backend (flash_attn / torch SDPA with configurable sub-kernels / plain SDPA)
+    is resolved once in _FLASH_ATTN_FUNC / _SDPA_* module-level constants so that
+    this function performs zero env-var reads and zero module probes per call.
+    """
+    # Path 1: flash_attn library — only valid for CUDA fp16/bf16.
+    if _FLASH_ATTN_FUNC is not None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
         q_fa = q.transpose(1, 2).contiguous()
         k_fa = k.transpose(1, 2).contiguous()
         v_fa = v.transpose(1, 2).contiguous()
-        out = flash_attn_func(q_fa, k_fa, v_fa, causal=causal)
+        out = _FLASH_ATTN_FUNC(q_fa, k_fa, v_fa, causal=causal)
         return out.transpose(1, 2).contiguous()
 
+    # Path 2: torch SDPA with env-configured sub-kernels (CUDA only).
     if q.is_cuda:
-        disable_torch_flash = str(os.environ.get("OMR_DISABLE_TORCH_FLASH_SDP", "0")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        disable_torch_mem_efficient = str(
-            os.environ.get("OMR_DISABLE_TORCH_MEM_EFFICIENT_SDP", "0")
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        force_torch_math_only = str(os.environ.get("OMR_FORCE_TORCH_MATH_SDP", "0")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        enable_flash = (not disable_torch_flash) and (not force_torch_math_only)
-        enable_mem_efficient = (not disable_torch_mem_efficient) and (not force_torch_math_only)
+        enable_flash = (not _SDPA_DISABLE_FLASH) and (not _SDPA_FORCE_MATH)
+        enable_mem_efficient = (not _SDPA_DISABLE_MEM_EFFICIENT) and (not _SDPA_FORCE_MATH)
         with torch.backends.cuda.sdp_kernel(
             enable_flash=enable_flash,
             enable_math=True,
             enable_mem_efficient=enable_mem_efficient,
         ):
             return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+
+    # Path 3: CPU / generic fallback.
     return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
 
 
