@@ -38,7 +38,7 @@ def main() -> None:
 
     metrics = {m.strip() for m in args.metrics.split(",") if m.strip()}
 
-    result: dict = {"onset_f1": None, "tedn": None, "linearized_ser": None}
+    result: dict = {}
 
     if "onset_f1" in metrics:
         from eval.playback import playback_f
