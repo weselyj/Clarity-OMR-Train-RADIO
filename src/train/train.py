@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import torch
+import torch.utils.data
 import yaml
 
 if __package__ in {None, ""}:
@@ -645,6 +647,227 @@ def _apply_online_augmentations(images, rng: random.Random):
             image = torch.from_numpy(array).unsqueeze(0).to(device=image.device, dtype=image.dtype)
         augmented[idx] = image.clamp(0.0, 1.0)
     return augmented
+
+
+class StageBDataset(torch.utils.data.Dataset):
+    """torch.utils.data.Dataset wrapping a grouped_entries manifest for Stage-B.
+
+    Each __getitem__ call:
+      1. Loads + resizes the image (via _load_entry_image_tensor).
+      2. Encodes the token sequence (vocab encode + truncate + pad).
+      3. Optionally applies online augmentations per-sample.
+      4. Returns a per-sample dict compatible with the training loop's
+         expected tensor shapes.
+
+    Collation: call ``dataset.collate_fn`` as the DataLoader's collate_fn.
+    """
+
+    def __init__(
+        self,
+        stage: "StageTrainingConfig",
+        grouped_entries: "Dict[Tuple[str, str], List[Dict[str, object]]]",
+        *,
+        project_root: "Path",
+        image_height: int = 250,
+        image_width: int = 2500,
+        max_sequence_length: int = 512,
+        vocab=None,
+        augment: bool = True,
+        rng_seed: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.stage = stage
+        self.project_root = project_root
+        self.image_height = image_height
+        self.image_width = image_width
+        self.max_sequence_length = max_sequence_length
+        self.augment = augment
+
+        # Build vocab once here; avoids repeated rebuild in __getitem__.
+        if vocab is not None:
+            self._vocab = vocab
+        else:
+            self._vocab = build_default_vocabulary()
+
+        # Flatten grouped_entries for all (dataset, split) pairs referenced by
+        # this stage's dataset_mix into a single self.entries list.
+        # Each entry dict is kept as-is; the flat index is what the sampler uses.
+        self.entries: List[Dict[str, object]] = []
+        for mix_item in stage.dataset_mix:
+            key = (mix_item.dataset, mix_item.split)
+            rows = grouped_entries.get(key, [])
+            self.entries.extend(rows)
+
+        # Per-sample RNG for augmentations; seeded to rng_seed when given.
+        # Worker-safe: each worker process gets a copy of the dataset object;
+        # the RNG state is independent per process when Python forks/spawns.
+        self._rng = random.Random(rng_seed)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> "Dict[str, torch.Tensor]":
+        import torch
+
+        entry = self.entries[idx]
+        vocab = self._vocab
+        pad_id = vocab.token_to_id["<pad>"]
+        bos_id = vocab.token_to_id["<bos>"]
+        eos_id = vocab.token_to_id["<eos>"]
+        measure_end_id = vocab.token_to_id.get("<measure_end>")
+
+        # 1. Load + resize image
+        sample_id = str(entry.get("sample_id", f"<idx:{idx}>"))
+        try:
+            image_tensor, content_width = _load_entry_image_tensor(
+                entry,
+                project_root=self.project_root,
+                height=self.image_height,
+                max_width=self.image_width,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            # Return a blank image + minimal token sequence so the batch stays
+            # consistent in shape even when a single file is missing.
+            import torch as _torch
+            print(f"[StageBDataset] skipping {sample_id}: {exc}", file=sys.stderr)
+            image_tensor = _torch.zeros(1, self.image_height, self.image_width, dtype=_torch.float32)
+            content_width = self.image_width
+
+        # 2. Token encode
+        sequence = entry.get("token_sequence", [])
+        if not isinstance(sequence, list) or not sequence:
+            sequence = ["<bos>", "<eos>"]
+        try:
+            token_ids = vocab.encode(sequence, strict=True)
+        except KeyError:
+            token_ids = [bos_id, eos_id]
+        if len(token_ids) < 2:
+            token_ids = [bos_id, eos_id]
+        if len(token_ids) > self.max_sequence_length:
+            truncated = token_ids[: self.max_sequence_length - 1]
+            if measure_end_id is not None:
+                last_me = -1
+                for i in range(len(truncated) - 1, -1, -1):
+                    if truncated[i] == measure_end_id:
+                        last_me = i
+                        break
+                if last_me > 0:
+                    token_ids = truncated[: last_me + 1] + [eos_id]
+                else:
+                    token_ids = truncated + [eos_id]
+            else:
+                token_ids = truncated + [eos_id]
+
+        # 3. Apply online augmentations (per-sample)
+        if self.augment:
+            image_tensor = _apply_online_augmentations(image_tensor.unsqueeze(0), self._rng).squeeze(0)
+
+        # 4. Derive contour target
+        contour_target = _derive_pitch_contour(sequence)
+
+        # 5. Build decoder inputs / labels via teacher-forcing shift
+        input_ids = token_ids[:-1]
+        label_ids = token_ids[1:]
+        if not input_ids:
+            input_ids = [bos_id]
+            label_ids = [eos_id]
+        seq_len = self.max_sequence_length - 1
+        input_pad = [pad_id] * max(0, seq_len - len(input_ids))
+        label_pad = [-100] * max(0, seq_len - len(label_ids))
+        decoder_inputs = (input_ids + input_pad)[:seq_len]
+        labels = (label_ids + label_pad)[:seq_len]
+
+        return {
+            "images": image_tensor,
+            "decoder_inputs": torch.tensor(decoder_inputs, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "contour_targets": torch.tensor(contour_target, dtype=torch.long),
+            "content_widths": torch.tensor(int(content_width), dtype=torch.long),
+        }
+
+    @staticmethod
+    def collate_fn(samples: "List[Dict[str, torch.Tensor]]") -> "Dict[str, torch.Tensor]":
+        """Stack a list of per-sample dicts into a batched dict of tensors."""
+        import torch
+
+        images = torch.stack([s["images"] for s in samples], dim=0)
+        decoder_inputs = torch.stack([s["decoder_inputs"] for s in samples], dim=0)
+        labels = torch.stack([s["labels"] for s in samples], dim=0)
+        contour_targets = torch.stack([s["contour_targets"] for s in samples], dim=0)
+        content_widths = torch.stack([s["content_widths"] for s in samples], dim=0)
+        return {
+            "images": images,
+            "decoder_inputs": decoder_inputs,
+            "labels": labels,
+            "contour_targets": contour_targets,
+            "content_widths": content_widths,
+        }
+
+
+def build_stage_b_sampler(
+    stage: "StageTrainingConfig",
+    dataset: "StageBDataset",
+    *,
+    total_samples: int,
+    seed: int = 0,
+) -> "torch.utils.data.WeightedRandomSampler":
+    """Build a WeightedRandomSampler that reproduces the stage dataset_mix ratios.
+
+    Each sample in the dataset is weighted by:
+        weight_i = mix_ratio(dataset_i) / len(group_i)
+
+    This yields the correct long-term proportions for each dataset without
+    enforcing exact per-batch counts (unlike the legacy _sample_stage_batch
+    which did floor+remainder allocation per batch).
+
+    Args:
+        stage: StageTrainingConfig carrying the dataset_mix.
+        dataset: The StageBDataset instance whose .entries list we weight.
+        total_samples: Total number of indices the sampler will yield (with
+            replacement). Equivalent to one epoch's sample budget.
+        seed: Generator seed for reproducibility.
+
+    Returns:
+        A WeightedRandomSampler that yields ``total_samples`` indices.
+    """
+    import torch
+
+    # Build a weight-per-entry list aligned with dataset.entries.
+    # Weights are computed as: ratio / len(group) for each entry.
+    # If a dataset has ratio=0 its entries get weight 0 and are never drawn.
+    ratio_map: Dict[Tuple[str, str], float] = {
+        (mix_item.dataset, mix_item.split): mix_item.ratio
+        for mix_item in stage.dataset_mix
+    }
+    group_size_map: Dict[Tuple[str, str], int] = {}
+    for mix_item in stage.dataset_mix:
+        key = (mix_item.dataset, mix_item.split)
+        group_size_map[key] = sum(
+            1 for e in dataset.entries
+            if e.get("dataset") == mix_item.dataset and e.get("split", "train") == mix_item.split
+        )
+
+    weights: List[float] = []
+    for entry in dataset.entries:
+        ds_name = str(entry.get("dataset", ""))
+        split = str(entry.get("split", "train"))
+        key = (ds_name, split)
+        ratio = ratio_map.get(key, 0.0)
+        group_sz = group_size_map.get(key, 1)
+        if ratio <= 0.0 or group_sz <= 0:
+            weights.append(0.0)
+        else:
+            weights.append(ratio / group_sz)
+
+    weights_tensor = torch.tensor(weights, dtype=torch.double)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        weights=weights_tensor,
+        num_samples=total_samples,
+        replacement=True,
+        generator=generator,
+    )
 
 
 def _build_optimizer(model, stage: StageTrainingConfig):
