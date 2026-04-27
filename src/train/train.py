@@ -838,6 +838,38 @@ def _should_run_diagnostics(optimizer_step: int, cadence: int) -> bool:
     return optimizer_step == 1 or (optimizer_step % cadence == 0)
 
 
+def _maybe_compile_decoder_and_bridge(model, *, enabled: bool):
+    """Apply torch.compile to the Stage-B decoder + positional_bridge submodules.
+
+    Deliberately skips the RADIO encoder: trust_remote_code with pinned
+    transformers_version=4.51.3 is a known compile hazard (graph breaks +
+    cache misses on every step). Decoder and bridge are stable custom code
+    that benefit cleanly from compilation.
+
+    First 50-100 opt-steps after compile are slower (cache warm-up); profile
+    with --profile-step-timing on a sufficiently long run to measure the
+    steady-state win.
+
+    Args:
+        model: Stage-B model with .decoder, .positional_bridge attrs (and
+            optionally .encoder which is left untouched).
+        enabled: When False, returns model unchanged. When True, replaces
+            the .decoder and .positional_bridge attrs with torch.compile()'d
+            versions.
+
+    Returns:
+        The same model object (mutated in place when enabled).
+    """
+    if not enabled:
+        return model
+    import torch
+    if hasattr(model, "decoder"):
+        model.decoder = torch.compile(model.decoder, dynamic=False, fullgraph=False)
+    if hasattr(model, "positional_bridge"):
+        model.positional_bridge = torch.compile(model.positional_bridge, dynamic=False, fullgraph=False)
+    return model
+
+
 def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
     new_module_keywords = (
         "token_embedding",
@@ -1247,6 +1279,7 @@ def run_execute_mode(
     stage_b_radio_pool_to_stride32: bool = False,
     diag_cadence: int = 25,
     channels_last: bool = False,
+    torch_compile: bool = False,
 ) -> Dict[str, object]:
     import torch
     import torch.nn.functional as F
@@ -1326,6 +1359,7 @@ def run_execute_mode(
         model = model.to(device, memory_format=torch.channels_last)
     else:
         model = model.to(device)
+    model = _maybe_compile_decoder_and_bridge(model, enabled=torch_compile)
     model.train()
 
     resume_stage_name: Optional[str] = None
@@ -2148,6 +2182,17 @@ def parse_args() -> argparse.Namespace:
             "A/B test with --profile-step-timing before committing to this flag."
         ),
     )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply torch.compile to the Stage-B decoder + positional_bridge "
+            "submodules (NOT the RADIO encoder — trust_remote_code makes that "
+            "fragile). Default off; first 50-100 opt-steps will be slow due to "
+            "compilation. Profile WITH and WITHOUT before adopting."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2221,6 +2266,7 @@ def main() -> None:
             stage_b_radio_pool_to_stride32=bool(args.stage_b_radio_pool_to_stride32),
             diag_cadence=max(1, int(args.diag_cadence)),
             channels_last=bool(args.channels_last),
+            torch_compile=bool(args.torch_compile),
         )
     else:
         summary = run_dry_mode(stages=stages, grouped_entries=grouped)
