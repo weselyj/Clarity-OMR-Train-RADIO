@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import torch
+import torch.utils.data
 import yaml
 
 if __package__ in {None, ""}:
@@ -647,6 +649,254 @@ def _apply_online_augmentations(images, rng: random.Random):
     return augmented
 
 
+class StageBDataset(torch.utils.data.Dataset):
+    """torch.utils.data.Dataset wrapping a grouped_entries manifest for Stage-B.
+
+    Each __getitem__ call:
+      1. Loads + resizes the image (via _load_entry_image_tensor).
+      2. Encodes the token sequence (vocab encode + truncate + pad).
+      3. Optionally applies online augmentations per-sample.
+      4. Returns a per-sample dict compatible with the training loop's
+         expected tensor shapes.
+
+    Collation: call ``dataset.collate_fn`` as the DataLoader's collate_fn.
+    """
+
+    def __init__(
+        self,
+        stage: "StageTrainingConfig",
+        grouped_entries: "Dict[Tuple[str, str], List[Dict[str, object]]]",
+        *,
+        project_root: "Path",
+        image_height: int = 250,
+        image_width: int = 2500,
+        max_sequence_length: int = 512,
+        vocab=None,
+        augment: bool = True,
+        rng_seed: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.stage = stage
+        self.project_root = project_root
+        self.image_height = image_height
+        self.image_width = image_width
+        self.max_sequence_length = max_sequence_length
+        self.augment = augment
+
+        # Build vocab once here; avoids repeated rebuild in __getitem__.
+        if vocab is not None:
+            self._vocab = vocab
+        else:
+            self._vocab = build_default_vocabulary()
+
+        # Flatten grouped_entries for all (dataset, split) pairs referenced by
+        # this stage's dataset_mix into a single self.entries list.
+        # Each entry dict is kept as-is; the flat index is what the sampler uses.
+        self.entries: List[Dict[str, object]] = []
+        for mix_item in stage.dataset_mix:
+            key = (mix_item.dataset, mix_item.split)
+            rows = grouped_entries.get(key, [])
+            self.entries.extend(rows)
+
+        # Per-sample RNG for augmentations; seeded to rng_seed when given.
+        # Worker-safe: stage_b_worker_init_fn re-seeds _rng per worker so each
+        # worker draws from a distinct RNG stream (avoids augmentation collapse
+        # when num_workers > 0).
+        self._rng_base_seed = rng_seed
+        self._rng = random.Random(rng_seed)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> "Dict[str, torch.Tensor]":
+        import torch
+
+        entry = self.entries[idx]
+        vocab = self._vocab
+        pad_id = vocab.token_to_id["<pad>"]
+        bos_id = vocab.token_to_id["<bos>"]
+        eos_id = vocab.token_to_id["<eos>"]
+        measure_end_id = vocab.token_to_id.get("<measure_end>")
+
+        # 1. Load + resize image
+        sample_id = str(entry.get("sample_id", f"<idx:{idx}>"))
+        try:
+            image_tensor, content_width = _load_entry_image_tensor(
+                entry,
+                project_root=self.project_root,
+                height=self.image_height,
+                max_width=self.image_width,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            # Return a blank image + minimal token sequence so the batch stays
+            # consistent in shape even when a single file is missing.
+            import torch as _torch
+            print(f"[StageBDataset] skipping {sample_id}: {exc}", file=sys.stderr)
+            image_tensor = _torch.zeros(1, self.image_height, self.image_width, dtype=_torch.float32)
+            content_width = self.image_width
+
+        # 2. Token encode
+        sequence = entry.get("token_sequence", [])
+        if not isinstance(sequence, list) or not sequence:
+            sequence = ["<bos>", "<eos>"]
+        try:
+            token_ids = vocab.encode(sequence, strict=True)
+        except KeyError:
+            token_ids = [bos_id, eos_id]
+        if len(token_ids) < 2:
+            token_ids = [bos_id, eos_id]
+        if len(token_ids) > self.max_sequence_length:
+            truncated = token_ids[: self.max_sequence_length - 1]
+            if measure_end_id is not None:
+                last_me = -1
+                for i in range(len(truncated) - 1, -1, -1):
+                    if truncated[i] == measure_end_id:
+                        last_me = i
+                        break
+                if last_me > 0:
+                    token_ids = truncated[: last_me + 1] + [eos_id]
+                else:
+                    token_ids = truncated + [eos_id]
+            else:
+                token_ids = truncated + [eos_id]
+
+        # 3. Apply online augmentations (per-sample)
+        if self.augment:
+            image_tensor = _apply_online_augmentations(image_tensor.unsqueeze(0), self._rng).squeeze(0)
+
+        # 4. Derive contour target
+        contour_target = _derive_pitch_contour(sequence)
+
+        # 5. Build decoder inputs / labels via teacher-forcing shift
+        input_ids = token_ids[:-1]
+        label_ids = token_ids[1:]
+        if not input_ids:
+            input_ids = [bos_id]
+            label_ids = [eos_id]
+        seq_len = self.max_sequence_length - 1
+        input_pad = [pad_id] * max(0, seq_len - len(input_ids))
+        label_pad = [-100] * max(0, seq_len - len(label_ids))
+        decoder_inputs = (input_ids + input_pad)[:seq_len]
+        labels = (label_ids + label_pad)[:seq_len]
+
+        return {
+            "images": image_tensor,
+            "decoder_inputs": torch.tensor(decoder_inputs, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "contour_targets": torch.tensor(contour_target, dtype=torch.long),
+            "content_widths": torch.tensor(int(content_width), dtype=torch.long),
+        }
+
+    @staticmethod
+    def collate_fn(samples: "List[Dict[str, torch.Tensor]]") -> "Dict[str, torch.Tensor]":
+        """Stack a list of per-sample dicts into a batched dict of tensors."""
+        import torch
+
+        images = torch.stack([s["images"] for s in samples], dim=0)
+        decoder_inputs = torch.stack([s["decoder_inputs"] for s in samples], dim=0)
+        labels = torch.stack([s["labels"] for s in samples], dim=0)
+        contour_targets = torch.stack([s["contour_targets"] for s in samples], dim=0)
+        content_widths = torch.stack([s["content_widths"] for s in samples], dim=0)
+        return {
+            "images": images,
+            "decoder_inputs": decoder_inputs,
+            "labels": labels,
+            "contour_targets": contour_targets,
+            "content_widths": content_widths,
+        }
+
+
+def build_stage_b_sampler(
+    stage: "StageTrainingConfig",
+    dataset: "StageBDataset",
+    *,
+    total_samples: int,
+    seed: int = 0,
+) -> "torch.utils.data.WeightedRandomSampler":
+    """Build a WeightedRandomSampler that reproduces the stage dataset_mix ratios.
+
+    Each sample in the dataset is weighted by:
+        weight_i = mix_ratio(dataset_i) / len(group_i)
+
+    This yields the correct long-term proportions for each dataset without
+    enforcing exact per-batch counts (unlike the legacy _sample_stage_batch
+    which did floor+remainder allocation per batch).
+
+    Args:
+        stage: StageTrainingConfig carrying the dataset_mix.
+        dataset: The StageBDataset instance whose .entries list we weight.
+        total_samples: Total number of indices the sampler will yield (with
+            replacement). Equivalent to one epoch's sample budget.
+        seed: Generator seed for reproducibility.
+
+    Returns:
+        A WeightedRandomSampler that yields ``total_samples`` indices.
+    """
+    import torch
+
+    # Build a weight-per-entry list aligned with dataset.entries.
+    # Weights are computed as: ratio / len(group) for each entry.
+    # If a dataset has ratio=0 its entries get weight 0 and are never drawn.
+    ratio_map: Dict[Tuple[str, str], float] = {
+        (mix_item.dataset, mix_item.split): mix_item.ratio
+        for mix_item in stage.dataset_mix
+    }
+    group_size_map: Dict[Tuple[str, str], int] = {}
+    for mix_item in stage.dataset_mix:
+        key = (mix_item.dataset, mix_item.split)
+        group_size_map[key] = sum(
+            1 for e in dataset.entries
+            if e.get("dataset") == mix_item.dataset and e.get("split", "train") == mix_item.split
+        )
+
+    weights: List[float] = []
+    for entry in dataset.entries:
+        ds_name = str(entry.get("dataset", ""))
+        split = str(entry.get("split", "train"))
+        key = (ds_name, split)
+        ratio = ratio_map.get(key, 0.0)
+        group_sz = group_size_map.get(key, 1)
+        if ratio <= 0.0 or group_sz <= 0:
+            weights.append(0.0)
+        else:
+            weights.append(ratio / group_sz)
+
+    weights_tensor = torch.tensor(weights, dtype=torch.double)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        weights=weights_tensor,
+        num_samples=total_samples,
+        replacement=True,
+        generator=generator,
+    )
+
+
+def stage_b_worker_init_fn(worker_id: int) -> None:
+    """Re-seed each DataLoader worker's dataset RNG to avoid augmentation collisions.
+
+    With num_workers > 0, all workers share the same initial dataset state
+    (fork: same RNG object; spawn: re-imported with same seed). This function
+    is passed as ``worker_init_fn`` to the DataLoader so each worker gets a
+    distinct seed derived from the base seed plus its worker id.
+
+    Args:
+        worker_id: The integer worker id supplied by the DataLoader (0-indexed).
+    """
+    import torch.utils.data
+
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return  # called in main process — no-op
+    dataset = info.dataset
+    base_seed = getattr(dataset, "_rng_base_seed", None)
+    if base_seed is None:
+        # Dataset was constructed without a seed; derive one from worker id only.
+        dataset._rng = random.Random(worker_id)
+    else:
+        dataset._rng = random.Random(base_seed + worker_id)
+
+
 def _build_optimizer(model, stage: StageTrainingConfig):
     import torch
 
@@ -838,6 +1088,38 @@ def _should_run_diagnostics(optimizer_step: int, cadence: int) -> bool:
     return optimizer_step == 1 or (optimizer_step % cadence == 0)
 
 
+def _maybe_compile_decoder_and_bridge(model, *, enabled: bool):
+    """Apply torch.compile to the Stage-B decoder + positional_bridge submodules.
+
+    Deliberately skips the RADIO encoder: trust_remote_code with pinned
+    transformers_version=4.51.3 is a known compile hazard (graph breaks +
+    cache misses on every step). Decoder and bridge are stable custom code
+    that benefit cleanly from compilation.
+
+    First 50-100 opt-steps after compile are slower (cache warm-up); profile
+    with --profile-step-timing on a sufficiently long run to measure the
+    steady-state win.
+
+    Args:
+        model: Stage-B model with .decoder, .positional_bridge attrs (and
+            optionally .encoder which is left untouched).
+        enabled: When False, returns model unchanged. When True, replaces
+            the .decoder and .positional_bridge attrs with torch.compile()'d
+            versions.
+
+    Returns:
+        The same model object (mutated in place when enabled).
+    """
+    if not enabled:
+        return model
+    import torch
+    if hasattr(model, "decoder"):
+        model.decoder = torch.compile(model.decoder, dynamic=False, fullgraph=False)
+    if hasattr(model, "positional_bridge"):
+        model.positional_bridge = torch.compile(model.positional_bridge, dynamic=False, fullgraph=False)
+    return model
+
+
 def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
     new_module_keywords = (
         "token_embedding",
@@ -981,12 +1263,12 @@ def _run_validation(
                 image_width=image_width,
             )
             if channels_last:
-                images = images.to(device, memory_format=torch.channels_last)
+                images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
             else:
-                images = images.to(device)
-            decoder_inputs = decoder_inputs.to(device)
-            labels = labels.to(device)
-            contour_targets = contour_targets.to(device)
+                images = images.to(device, non_blocking=True)
+            decoder_inputs = decoder_inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            contour_targets = contour_targets.to(device, non_blocking=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
@@ -1247,6 +1529,9 @@ def run_execute_mode(
     stage_b_radio_pool_to_stride32: bool = False,
     diag_cadence: int = 25,
     channels_last: bool = False,
+    torch_compile: bool = False,
+    num_workers: int = 4,
+    prefetch_factor: int = 4,
 ) -> Dict[str, object]:
     import torch
     import torch.nn.functional as F
@@ -1326,6 +1611,10 @@ def run_execute_mode(
         model = model.to(device, memory_format=torch.channels_last)
     else:
         model = model.to(device)
+    # NOTE: torch.compile is applied AFTER the resume-checkpoint load below.
+    # Compiling first wraps decoder + positional_bridge in OptimizedModule, which
+    # adds an `._orig_mod.` prefix to state_dict keys; load_state_dict then sees
+    # an architecture mismatch and raises. See cu132 plan Phase 4.2 bug fix.
     model.train()
 
     resume_stage_name: Optional[str] = None
@@ -1394,6 +1683,10 @@ def run_execute_mode(
             f"(global_step={global_step}, stage='{resume_stage_name}')",
             file=sys.stderr,
         )
+
+    # Apply torch.compile AFTER the resume-checkpoint load so the wrap doesn't
+    # change state-dict key prefixes during the load. (See cu132 plan Phase 4.2.)
+    model = _maybe_compile_decoder_and_bridge(model, enabled=torch_compile)
 
     bf16_enabled = False
     if device.type == "cuda":
@@ -1604,35 +1897,89 @@ def run_execute_mode(
             best_val_loss: Optional[float] = None
             best_val_step: Optional[int] = None
 
+            # Build a DataLoader for this stage's training set.
+            # Each epoch is defined by effective_samples_per_epoch samples drawn
+            # via the WeightedRandomSampler (which preserves dataset_mix ratios).
+            # persistent_workers=True avoids per-epoch worker respawn overhead.
+            # pin_memory=True enables async H2D transfers via non_blocking=True.
+            _stage_ds = StageBDataset(
+                stage,
+                grouped_entries,
+                project_root=project_root,
+                image_height=image_height,
+                image_width=image_width,
+                max_sequence_length=stage.max_sequence_length,
+                augment=True,
+                rng_seed=seed,
+            )
+            # Compute total micro-batch draws needed for the full stage.
+            # stage_total_steps is OPT-steps; each OPT-step consumes
+            # grad_accumulation_steps micro-batches.  Sizing the sampler to
+            # cover the full count guarantees the iterator never exhausts
+            # mid-accumulation-window (the StopIteration handler below is
+            # purely defensive against bugs / checkpoint restarts).
+            _stage_total_train_samples = (
+                stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
+            )
+            _train_sampler = build_stage_b_sampler(
+                stage, _stage_ds,
+                total_samples=_stage_total_train_samples,
+                seed=seed,
+            )
+            _pin_memory = device.type == "cuda"
+            _effective_prefetch = prefetch_factor if num_workers > 0 else None
+            _train_loader = torch.utils.data.DataLoader(
+                _stage_ds,
+                batch_size=stage.batch_size,
+                sampler=_train_sampler,
+                num_workers=num_workers,
+                pin_memory=_pin_memory,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=_effective_prefetch,
+                collate_fn=StageBDataset.collate_fn,
+                worker_init_fn=stage_b_worker_init_fn,
+            )
+            _train_iter = iter(_train_loader)
+            # vocab size is constant; grab from the dataset's vocab object.
+            vocab_size = _stage_ds._vocab.size
+
             timer.reset_step()
 
             for stage_step in range(stage_start_step, stage_total_steps + 1):
                 if (stage_step - 1) % stage.grad_accumulation_steps == 0:
                     timer.reset_step()
                 with timer.cpu("sample"):
-                    batch = _sample_stage_batch(stage, grouped_entries=grouped_entries, rng=rng)
-                if not batch:
+                    try:
+                        _batch_dict = next(_train_iter)
+                    except StopIteration:
+                        # Defensive rebuild: iterator exhausted (correct
+                        # total_samples sizing should prevent this, but guard
+                        # against checkpoint restarts / sampler edge cases).
+                        _mid_window = (stage_step - 1) % stage.grad_accumulation_steps != 0
+                        if _mid_window:
+                            # Partial accumulation window: accumulated gradients
+                            # represent fewer micro-batches than expected.
+                            # Discard them to avoid a mis-scaled optimizer step.
+                            optimizer.zero_grad(set_to_none=True)
+                            print(
+                                "[train] DataLoader iterator exhausted mid-accumulation"
+                                " window — gradient discarded",
+                                flush=True,
+                            )
+                        _train_iter = iter(_train_loader)
+                        _batch_dict = next(_train_iter)
+                if _batch_dict is None:
                     break
                 epoch_index = ((stage_step - 1) // stage_steps_per_epoch) + 1
                 epoch_step = ((stage_step - 1) % stage_steps_per_epoch) + 1
-                with timer.cpu("encode"):
-                    images, decoder_inputs, labels, contour_targets, _content_widths, vocab_size = _encode_batch(
-                        batch=batch,
-                        max_sequence_length=stage.max_sequence_length,
-                        project_root=project_root,
-                        image_height=image_height,
-                        image_width=image_width,
-                    )
-                with timer.cpu("augment"):
-                    images = _apply_online_augmentations(images, rng)
                 with timer.cpu("h2d"):
                     if channels_last:
-                        images = images.to(device, memory_format=torch.channels_last)
+                        images = _batch_dict["images"].to(device, non_blocking=True, memory_format=torch.channels_last)
                     else:
-                        images = images.to(device)
-                    decoder_inputs = decoder_inputs.to(device)
-                    labels = labels.to(device)
-                    contour_targets = contour_targets.to(device)
+                        images = _batch_dict["images"].to(device, non_blocking=True)
+                    decoder_inputs = _batch_dict["decoder_inputs"].to(device, non_blocking=True)
+                    labels = _batch_dict["labels"].to(device, non_blocking=True)
+                    contour_targets = _batch_dict["contour_targets"].to(device, non_blocking=True)
 
                 accum_steps = stage.grad_accumulation_steps
                 is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
@@ -1843,7 +2190,7 @@ def run_execute_mode(
                             "grad_norm": grad_norm_value,
                             "grad_norm_groups": grad_norms,
                             "grad_alerts": grad_alert_messages,
-                            "batch_size": len(batch),
+                            "batch_size": int(images.shape[0]),
                             "max_sequence_length": stage.max_sequence_length,
                             "non_finite_loss": non_finite_loss,
                             "non_finite_grad": non_finite_grad,
@@ -2148,6 +2495,36 @@ def parse_args() -> argparse.Namespace:
             "A/B test with --profile-step-timing before committing to this flag."
         ),
     )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply torch.compile to the Stage-B decoder + positional_bridge "
+            "submodules (NOT the RADIO encoder — trust_remote_code makes that "
+            "fragile). Default off; first 50-100 opt-steps will be slow due to "
+            "compilation. Profile WITH and WITHOUT before adopting."
+        ),
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help=(
+            "DataLoader worker count for parallel sample loading. Default 4. "
+            "Use 0 for the single-threaded fallback (required on Windows due to "
+            "multiprocessing fork/spawn limitations)."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=4,
+        help=(
+            "DataLoader prefetch factor (number of batches loaded in advance per "
+            "worker). Only effective when --num-workers > 0. Default 4."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2221,6 +2598,9 @@ def main() -> None:
             stage_b_radio_pool_to_stride32=bool(args.stage_b_radio_pool_to_stride32),
             diag_cadence=max(1, int(args.diag_cadence)),
             channels_last=bool(args.channels_last),
+            torch_compile=bool(args.torch_compile),
+            num_workers=max(0, int(args.num_workers)),
+            prefetch_factor=max(1, int(args.prefetch_factor)),
         )
     else:
         summary = run_dry_mode(stages=stages, grouped_entries=grouped)
