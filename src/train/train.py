@@ -699,8 +699,10 @@ class StageBDataset(torch.utils.data.Dataset):
             self.entries.extend(rows)
 
         # Per-sample RNG for augmentations; seeded to rng_seed when given.
-        # Worker-safe: each worker process gets a copy of the dataset object;
-        # the RNG state is independent per process when Python forks/spawns.
+        # Worker-safe: stage_b_worker_init_fn re-seeds _rng per worker so each
+        # worker draws from a distinct RNG stream (avoids augmentation collapse
+        # when num_workers > 0).
+        self._rng_base_seed = rng_seed
         self._rng = random.Random(rng_seed)
 
     def __len__(self) -> int:
@@ -868,6 +870,31 @@ def build_stage_b_sampler(
         replacement=True,
         generator=generator,
     )
+
+
+def stage_b_worker_init_fn(worker_id: int) -> None:
+    """Re-seed each DataLoader worker's dataset RNG to avoid augmentation collisions.
+
+    With num_workers > 0, all workers share the same initial dataset state
+    (fork: same RNG object; spawn: re-imported with same seed). This function
+    is passed as ``worker_init_fn`` to the DataLoader so each worker gets a
+    distinct seed derived from the base seed plus its worker id.
+
+    Args:
+        worker_id: The integer worker id supplied by the DataLoader (0-indexed).
+    """
+    import torch.utils.data
+
+    info = torch.utils.data.get_worker_info()
+    if info is None:
+        return  # called in main process — no-op
+    dataset = info.dataset
+    base_seed = getattr(dataset, "_rng_base_seed", None)
+    if base_seed is None:
+        # Dataset was constructed without a seed; derive one from worker id only.
+        dataset._rng = random.Random(worker_id)
+    else:
+        dataset._rng = random.Random(base_seed + worker_id)
 
 
 def _build_optimizer(model, stage: StageTrainingConfig):
@@ -1885,7 +1912,15 @@ def run_execute_mode(
                 augment=True,
                 rng_seed=seed,
             )
-            _stage_total_train_samples = stage_total_steps * stage.batch_size
+            # Compute total micro-batch draws needed for the full stage.
+            # stage_total_steps is OPT-steps; each OPT-step consumes
+            # grad_accumulation_steps micro-batches.  Sizing the sampler to
+            # cover the full count guarantees the iterator never exhausts
+            # mid-accumulation-window (the StopIteration handler below is
+            # purely defensive against bugs / checkpoint restarts).
+            _stage_total_train_samples = (
+                stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
+            )
             _train_sampler = build_stage_b_sampler(
                 stage, _stage_ds,
                 total_samples=_stage_total_train_samples,
@@ -1902,6 +1937,7 @@ def run_execute_mode(
                 persistent_workers=(num_workers > 0),
                 prefetch_factor=_effective_prefetch,
                 collate_fn=StageBDataset.collate_fn,
+                worker_init_fn=stage_b_worker_init_fn,
             )
             _train_iter = iter(_train_loader)
             # vocab size is constant; grab from the dataset's vocab object.
@@ -1916,8 +1952,20 @@ def run_execute_mode(
                     try:
                         _batch_dict = next(_train_iter)
                     except StopIteration:
-                        # Rebuild iterator if the sampler runs out (shouldn't happen
-                        # with correct total_samples, but be safe for edge cases).
+                        # Defensive rebuild: iterator exhausted (correct
+                        # total_samples sizing should prevent this, but guard
+                        # against checkpoint restarts / sampler edge cases).
+                        _mid_window = (stage_step - 1) % stage.grad_accumulation_steps != 0
+                        if _mid_window:
+                            # Partial accumulation window: accumulated gradients
+                            # represent fewer micro-batches than expected.
+                            # Discard them to avoid a mis-scaled optimizer step.
+                            optimizer.zero_grad(set_to_none=True)
+                            print(
+                                "[train] DataLoader iterator exhausted mid-accumulation"
+                                " window — gradient discarded",
+                                flush=True,
+                            )
                         _train_iter = iter(_train_loader)
                         _batch_dict = next(_train_iter)
                 if _batch_dict is None:

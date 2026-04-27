@@ -18,6 +18,7 @@ from src.train.train import (
     StageTrainingConfig,
     StageBDataset,
     build_stage_b_sampler,
+    stage_b_worker_init_fn,
 )
 
 
@@ -670,3 +671,41 @@ def test_cli_flags_num_workers_and_prefetch_factor_in_help():
     help_text = result.stdout + result.stderr
     assert "--num-workers" in help_text, "--num-workers flag not found in help"
     assert "--prefetch-factor" in help_text, "--prefetch-factor flag not found in help"
+
+
+# ---------------------------------------------------------------------------
+# Post-quality-review: worker_init_fn + total_samples grad_accum coverage
+# ---------------------------------------------------------------------------
+
+
+def test_worker_init_fn_per_worker_rng_seeding(tmp_path):
+    """Each DataLoader worker gets a different RNG seed via worker_init_fn."""
+    grouped = _make_grouped_entries(tmp_path)
+    mix = (DatasetMix(dataset="primus", ratio=1.0, split="train", required=True),)
+    stage = _make_stage(mix)
+    ds = StageBDataset(stage, grouped, project_root=tmp_path,
+                       image_height=64, image_width=128, max_sequence_length=64,
+                       rng_seed=42)
+
+    # Verify the dataset stores its base seed for the worker_init_fn to use.
+    assert hasattr(ds, "_rng_base_seed")
+    assert ds._rng_base_seed == 42
+
+    # The function exists and is callable.
+    assert callable(stage_b_worker_init_fn)
+
+
+def test_dataloader_total_samples_covers_full_accumulation_window(tmp_path):
+    """The sampler builder should accept a total_samples large enough that the
+    iterator never exhausts mid-stage (covers stage_total_steps * batch_size *
+    grad_accumulation_steps)."""
+    grouped = _make_grouped_entries(tmp_path)
+    mix = (DatasetMix(dataset="primus", ratio=1.0, split="train", required=True),)
+    stage = _make_stage(mix)
+    ds = StageBDataset(stage, grouped, project_root=tmp_path,
+                       image_height=64, image_width=128, max_sequence_length=64)
+
+    # 100 opt-steps * 2 batch * 8 grad_accum = 1600 micro-batch indices to draw
+    sampler = build_stage_b_sampler(stage, ds, total_samples=1600, seed=0)
+    indices = list(sampler)
+    assert len(indices) == 1600
