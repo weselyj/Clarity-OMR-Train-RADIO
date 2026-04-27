@@ -38,9 +38,13 @@ $pyArgs = @(
     "--checkpoint-dir", $bench,
     "--token-manifest", $manifest,
     "--step-log", "$bench\steps.jsonl",
-    "--max-steps-per-stage", "700",
+    # 2800 stage-steps with grad_accum=8 -> 350 opt-steps (100 warm + 250 measured),
+    # matching the cu128 reference profile in issue #2's pinned 2026-04-27 comment.
+    "--max-steps-per-stage", "2800",
     "--validation-batches", "1",
-    "--diag-cadence", "50",
+    # cadence=1 (every-step) matches the cu128 reference methodology so the
+    # comparison is pure-toolchain, not toolchain + diagnostic gating.
+    "--diag-cadence", "1",
     "--profile-step-timing",
     "--profile-output", "$bench\profile.jsonl"
 )

@@ -33,9 +33,11 @@ $pyArgs = @(
     "--checkpoint-dir", $bench,
     "--token-manifest", $manifest,
     "--step-log", "$bench\steps.jsonl",
-    "--max-steps-per-stage", "700",
+    # Match the Phase 3 bench: 2800 stage-steps -> 350 opt-steps so the A/B
+    # is direct (same opt-step count, same diag cadence).
+    "--max-steps-per-stage", "2800",
     "--validation-batches", "1",
-    "--diag-cadence", "50",
+    "--diag-cadence", "1",
     "--profile-step-timing",
     "--profile-output", "$bench\profile.jsonl",
     "--torch-compile"
