@@ -78,25 +78,6 @@ def run_stage_a(args: argparse.Namespace) -> Dict[str, object]:
     }
 
 
-def _load_stage_b_state_dict(checkpoint_path: Path, device) -> Dict[str, object]:
-    import torch
-
-    payload = torch.load(str(checkpoint_path), map_location=device)
-    state_dict = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
-    if not isinstance(state_dict, dict):
-        raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
-
-    normalized: Dict[str, object] = {}
-    for name, tensor in state_dict.items():
-        key = str(name)
-        for prefix in ("base_model.model.", "model."):
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
-                break
-        normalized[key] = tensor
-    return normalized
-
-
 def _load_stage_b_crop_tensor(
     crop_path: Path,
     *,

@@ -1677,10 +1677,10 @@ def run_execute_mode(
                     loss.backward()
 
                 if not is_accum_step:
-                    # Cache a lightweight scalar for the per-step JSONL record
-                    # (single detach; no .item() sync on non-accumulation steps).
-                    _loss_scalar_cache = loss.detach().float()
-                    losses.append(float(_loss_scalar_cache.item()) * accum_steps)
+                    # Single CPU sync per micro-batch; cache the python float so any
+                    # downstream consumer reads from CPU memory rather than re-syncing.
+                    _loss_scalar_cache = loss.detach().item() * accum_steps
+                    losses.append(_loss_scalar_cache)
                     timer.micro_batch_done()
                     continue
 
@@ -1728,9 +1728,10 @@ def run_execute_mode(
                 with timer.gpu("optimizer"):
                     optimizer.step()
                     scheduler.step()
-                # Cache the loss scalar once to avoid multiple .item() syncs below.
-                _loss_scalar_cache = loss.detach().float()
-                losses.append(float(_loss_scalar_cache.item()) * accum_steps)
+                # Single CPU sync per optimizer step; the python float is reused
+                # below by the JSONL record without re-syncing.
+                _loss_scalar_cache = loss.detach().item() * accum_steps
+                losses.append(_loss_scalar_cache)
                 global_step += 1
 
                 lr_map = {group.get("group_name", f"group_{idx}"): group["lr"] for idx, group in enumerate(optimizer.param_groups)}
@@ -1820,8 +1821,9 @@ def run_execute_mode(
 
                 if step_writer is not None:
                     with timer.cpu("log_io"):
-                        # Use the cached float scalar — avoids extra .item() syncs.
-                        _loss_float = float(_loss_scalar_cache.item()) * accum_steps
+                        # _loss_scalar_cache is already a python float (synced once
+                        # per opt-step above); reusing it costs nothing.
+                        _loss_float = _loss_scalar_cache
                         record = {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                             "global_step": global_step,
