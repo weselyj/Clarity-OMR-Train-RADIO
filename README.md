@@ -312,8 +312,14 @@ Applied online during training (not pre-generated).
 git clone https://github.com/clquwu/Clarity-OMR-Train.git
 cd Clarity-OMR-Train
 
-# Install PyTorch with your CUDA version first
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Production setup (Windows): run scripts/setup_venv_cu132.ps1 — pulls torch nightly cu132,
+# cuDNN 9.21.01, project deps, and drops the sitecustomize for DLL path resolution.
+
+# Manual cu132 install (if not on Windows or scripting fails):
+pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu132
+
+# Rollback / reproducibility (cu128, kept on disk as venv/):
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # Install dependencies
 pip install -r requirements.txt

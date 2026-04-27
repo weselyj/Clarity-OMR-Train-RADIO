@@ -6,10 +6,13 @@ This document is the practical runbook for training and checking the pipeline in
 
 ```powershell
 Set-Location C:\Users\clq\Documents\GitHub\omr
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+# Production setup: run the cu132 venv creation script.
+# This installs torch nightly cu132, cuDNN 9.21.01, project deps,
+# and writes sitecustomize.py for DLL path resolution.
+.\scripts\setup_venv_cu132.ps1
+
+# Activate after creation (or on subsequent sessions):
+.\venv-cu132\Scripts\Activate.ps1
 ```
 
 ## 1) Build canonical dataset manifest
@@ -334,25 +337,11 @@ Each run writes:
 - `*_comparison.png` (if reference image exists)
 - `*_summary.json` (includes MSE/SSIM)
 
-Find 10 likely samples where the token fragment is one measure too long (trimming the last measure improves crop match):
-
-```powershell
-python src\eval\find_extra_measure_samples.py `
-  --token-manifest data\processed\synthetic\manifests\synthetic_token_manifest.jsonl `
-  --page-manifest data\processed\synthetic\manifests\synthetic_pages.jsonl `
-  --scan-limit 400 `
-  --top-k 10 `
-  --min-ssim-gain 0.03 `
-  --output-json src\eval\reconstruct_debug\extra_measure_candidates.json
-```
-
 ## 10) Compliance check against `omr-final-plan.md`
 
-Audit file generated during implementation:
-
-```powershell
-Get-Content src\eval\compliance_audit.json
-```
+The compliance audit JSON (`src\eval\compliance_audit.json`) was generated during the initial
+implementation phase. It is kept as a historical reference but the compliance-audit workflow
+is no longer actively run. See `docs/omr-final-plan.md` for the authoritative design record.
 
 Expected summary:
 - `pass: 15`
