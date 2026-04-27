@@ -748,3 +748,68 @@ def test_dataset_split_val_filters_entries(tmp_path):
     assert all(e["split"] == "val" for e in val_ds.entries)
     assert len(train_ds) == 10  # only the train rows for primus
     assert len(val_ds) == 10   # only the val rows for primus
+
+
+def test_sampler_split_override_weights_val_entries(tmp_path):
+    """build_stage_b_sampler(split_override='val') yields non-zero weights
+    for val entries even though dataset_mix items declare split='train'."""
+    from PIL import Image
+
+    grouped = {}
+    for split in ("train", "val"):
+        rows = []
+        for i in range(10):
+            img_path = tmp_path / f"primus_{split}_{i}.png"
+            Image.new("L", (250, 250), color=128).save(img_path)
+            rows.append({
+                "sample_id": f"primus:{split}:{i}",
+                "dataset": "primus",
+                "split": split,
+                "image_path": str(img_path),
+                "token_sequence": ["<bos>", "<staff_start>", "clef-G2", "<staff_end>", "<eos>"],
+            })
+        grouped[("primus", split)] = rows
+
+    mix = (DatasetMix(dataset="primus", ratio=1.0, split="train", required=True),)
+    stage = _make_stage(mix)
+    val_ds = StageBDataset(stage, grouped, split="val", project_root=tmp_path,
+                           image_height=64, image_width=128, max_sequence_length=64)
+
+    sampler = build_stage_b_sampler(stage, val_ds, total_samples=100, seed=0,
+                                    split_override="val")
+    indices = list(sampler)
+    # All drawn indices must point at val entries — confirms weights weren't 0.
+    drawn_splits = {val_ds.entries[idx]["split"] for idx in indices}
+    assert drawn_splits == {"val"}, f"expected only val entries, got splits {drawn_splits}"
+
+
+def test_sampler_raises_on_zero_weight_input(tmp_path):
+    """build_stage_b_sampler with no matching entries (zero-weight vector)
+    raises a clear ValueError instead of letting WeightedRandomSampler crash."""
+    from PIL import Image
+
+    # Manifest has only train entries; we ask for a val sampler.
+    grouped = {}
+    rows = []
+    for i in range(5):
+        img_path = tmp_path / f"primus_train_{i}.png"
+        Image.new("L", (250, 250), color=128).save(img_path)
+        rows.append({
+            "sample_id": f"primus:train:{i}",
+            "dataset": "primus",
+            "split": "train",
+            "image_path": str(img_path),
+            "token_sequence": ["<bos>", "<eos>"],
+        })
+    grouped[("primus", "train")] = rows
+
+    mix = (DatasetMix(dataset="primus", ratio=1.0, split="train", required=True),)
+    stage = _make_stage(mix)
+    # Build a val dataset — it'll have zero entries because no val rows in manifest.
+    val_ds = StageBDataset(stage, grouped, split="val", project_root=tmp_path,
+                           image_height=64, image_width=128, max_sequence_length=64)
+    assert len(val_ds) == 0  # confirms the precondition
+
+    with pytest.raises(ValueError, match="no samples have non-zero weight"):
+        build_stage_b_sampler(stage, val_ds, total_samples=100, seed=0,
+                              split_override="val")

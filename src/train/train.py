@@ -731,17 +731,19 @@ def build_stage_b_sampler(
     # When split_override is given, substitute it for mix_item.split so that
     # val-split entries (which differ from the mix definition's "train" split)
     # are still weighted by the correct dataset ratio.
-    effective_split = lambda mix_item: split_override if split_override is not None else mix_item.split  # noqa: E731
+    def _effective_split(mix_item: "DatasetMix") -> str:
+        return split_override if split_override is not None else mix_item.split
+
     ratio_map: Dict[Tuple[str, str], float] = {
-        (mix_item.dataset, effective_split(mix_item)): mix_item.ratio
+        (mix_item.dataset, _effective_split(mix_item)): mix_item.ratio
         for mix_item in stage.dataset_mix
     }
     group_size_map: Dict[Tuple[str, str], int] = {}
     for mix_item in stage.dataset_mix:
-        key = (mix_item.dataset, effective_split(mix_item))
+        key = (mix_item.dataset, _effective_split(mix_item))
         group_size_map[key] = sum(
             1 for e in dataset.entries
-            if e.get("dataset") == mix_item.dataset and e.get("split", "train") == effective_split(mix_item)
+            if e.get("dataset") == mix_item.dataset and e.get("split", "train") == _effective_split(mix_item)
         )
 
     weights: List[float] = []
@@ -755,6 +757,27 @@ def build_stage_b_sampler(
             weights.append(0.0)
         else:
             weights.append(ratio / group_sz)
+
+    # Robustness guard: an all-zero weight vector (or empty dataset) crashes
+    # WeightedRandomSampler with an opaque torch error. Raise early with a
+    # diagnostic message naming the split + dataset_mix so the call site can
+    # see what's wrong (e.g. dataset_mix references a split that has no
+    # samples in the manifest).
+    if not weights or sum(weights) <= 0.0:
+        split_for_msg = split_override if split_override is not None else "<per-mix-item>"
+        mix_summary = ", ".join(
+            f"{m.dataset}@{_effective_split(m)}={ratio_map.get((m.dataset, _effective_split(m)), 0.0):.3f}"
+            for m in stage.dataset_mix
+        )
+        raise ValueError(
+            "build_stage_b_sampler: no samples have non-zero weight. "
+            f"split_override={split_for_msg!r}, dataset_size={len(dataset.entries)}, "
+            f"ratios=[{mix_summary}]. "
+            "Likely cause: dataset_mix references datasets/splits with no entries "
+            "in the manifest (common for split='val' if the manifest hasn't been "
+            "regenerated with val splits). Fix: add entries for the requested "
+            "(dataset, split) combinations or adjust dataset_mix."
+        )
 
     weights_tensor = torch.tensor(weights, dtype=torch.double)
     generator = torch.Generator()
