@@ -709,3 +709,42 @@ def test_dataloader_total_samples_covers_full_accumulation_window(tmp_path):
     sampler = build_stage_b_sampler(stage, ds, total_samples=1600, seed=0)
     indices = list(sampler)
     assert len(indices) == 1600
+
+
+# ---------------------------------------------------------------------------
+# Val-side split filtering
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_split_val_filters_entries(tmp_path):
+    """StageBDataset(split='val') only includes entries with split='val'."""
+    from PIL import Image
+
+    grouped = {}
+    for split in ("train", "val"):
+        for ds_name in ("primus",):
+            rows = []
+            for i in range(10):
+                img_path = tmp_path / f"{ds_name}_{split}_{i}.png"
+                Image.new("L", (250, 250), color=128).save(img_path)
+                rows.append({
+                    "sample_id": f"{ds_name}:{split}:{i}",
+                    "dataset": ds_name,
+                    "split": split,
+                    "image_path": str(img_path),
+                    "token_sequence": ["<bos>", "<staff_start>", "clef-G2", "<staff_end>", "<eos>"],
+                })
+            grouped[(ds_name, split)] = rows
+
+    mix = (DatasetMix(dataset="primus", ratio=1.0, split="train", required=True),)
+    stage = _make_stage(mix)
+
+    train_ds = StageBDataset(stage, grouped, split="train", project_root=tmp_path,
+                             image_height=64, image_width=128, max_sequence_length=64)
+    val_ds = StageBDataset(stage, grouped, split="val", project_root=tmp_path,
+                           image_height=64, image_width=128, max_sequence_length=64)
+
+    assert all(e["split"] == "train" for e in train_ds.entries)
+    assert all(e["split"] == "val" for e in val_ds.entries)
+    assert len(train_ds) == 10  # only the train rows for primus
+    assert len(val_ds) == 10   # only the val rows for primus
