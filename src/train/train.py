@@ -2462,13 +2462,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--torch-compile",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Apply torch.compile to the Stage-B decoder + positional_bridge "
-            "submodules (NOT the RADIO encoder — trust_remote_code makes that "
-            "fragile). Default off; first 50-100 opt-steps will be slow due to "
-            "compilation. Profile WITH and WITHOUT before adopting."
+            "Compile decoder + bridge modules with torch.compile. Default ON. "
+            "Pass --no-torch-compile to disable (e.g., for debugging or environments "
+            "that fail to compile). Encoder is excluded (RADIO uses trust_remote_code). "
+            "Bench: -0.7% wall on cu132 nightly + RTX 5090 (Phase 4.2 of cu132 rollout)."
         ),
     )
     parser.add_argument(
