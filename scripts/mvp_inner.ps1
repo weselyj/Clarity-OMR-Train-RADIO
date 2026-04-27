@@ -5,7 +5,7 @@ Set-Location $repo
 $py = Join-Path $repo "venv\Scripts\python.exe"
 $pyArgs = @(
     "-u", "src/train/train.py",
-    "--stage-configs", "configs/archived_stage2_experiments/train_stage2_radio_mvp.yaml",
+    "--stage-configs", "configs/train_stage2_radio_mvp.yaml",
     "--mode", "execute",
     "--checkpoint-dir", "checkpoints/mvp_radio_stage2",
     "--token-manifest", "src/data/manifests/token_manifest_full.jsonl",

@@ -15,7 +15,7 @@ For real eval against a Stage 3 checkpoint, override with --beam-width 5
 Usage:
     venv\\Scripts\\python -m eval.run_lieder_eval \\
         --checkpoint checkpoints/mvp_radio_stage2/stage2-radio-mvp_step_0000150.pt \\
-        --config configs/archived_stage2_experiments/train_stage2_radio_mvp.yaml \\
+        --config configs/train_stage2_radio_mvp.yaml \\
         --name mvp \\
         --limit 3   # optional smoke cap
 """
