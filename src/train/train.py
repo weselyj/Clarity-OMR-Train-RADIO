@@ -306,39 +306,6 @@ def build_stage_plan(
     }
 
 
-def _sample_stage_batch(
-    stage: StageTrainingConfig,
-    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
-    rng: random.Random,
-    *,
-    split_override: Optional[str] = None,
-) -> List[Dict[str, object]]:
-    split = split_override.lower() if split_override else None
-    targets = _compute_sample_targets(stage.batch_size, stage.dataset_mix)
-    batch: List[Dict[str, object]] = []
-    for source in stage.dataset_mix:
-        source_split = split if split is not None else source.split
-        candidates = grouped_entries.get((source.dataset, source_split), [])
-        target_count = targets[source.dataset]
-        if not candidates or target_count == 0:
-            continue
-        for _ in range(target_count):
-            batch.append(candidates[rng.randrange(0, len(candidates))])
-    while len(batch) < stage.batch_size:
-        fallback_sources = [
-            item
-            for item in stage.dataset_mix
-            if grouped_entries.get((item.dataset, split if split is not None else item.split))
-        ]
-        if not fallback_sources:
-            break
-        source = fallback_sources[rng.randrange(0, len(fallback_sources))]
-        source_split = split if split is not None else source.split
-        candidates = grouped_entries[(source.dataset, source_split)]
-        batch.append(candidates[rng.randrange(0, len(candidates))])
-    rng.shuffle(batch)
-    return batch[: stage.batch_size]
-
 
 def _parse_note_token_to_midi(token: str) -> Optional[int]:
     if not token.startswith("note-"):
@@ -500,91 +467,6 @@ def _load_entry_image_tensor(
     )
 
 
-def _encode_batch(
-    batch: Sequence[Dict[str, object]],
-    max_sequence_length: int,
-    *,
-    project_root: Path,
-    image_height: int = 250,
-    image_width: int = 2500,
-):
-    import torch
-
-    vocab = build_default_vocabulary()
-    pad_id = vocab.token_to_id["<pad>"]
-    bos_id = vocab.token_to_id["<bos>"]
-    eos_id = vocab.token_to_id["<eos>"]
-    measure_end_id = vocab.token_to_id.get("<measure_end>")
-
-    decoder_inputs: List[List[int]] = []
-    labels: List[List[int]] = []
-    contour_targets: List[int] = []
-    images: List[torch.Tensor] = []
-    content_widths: List[int] = []
-    for entry in batch:
-        sample_id = str(entry.get("sample_id", "<unknown>"))
-        try:
-            image_tensor, content_width = _load_entry_image_tensor(
-                entry,
-                project_root=project_root,
-                height=image_height,
-                max_width=image_width,
-            )
-        except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            print(f"[train] skipping sample {sample_id}: {exc}", file=sys.stderr)
-            continue
-
-        sequence = entry.get("token_sequence", [])
-        if not isinstance(sequence, list) or not sequence:
-            sequence = ["<bos>", "<eos>"]
-        try:
-            token_ids = vocab.encode(sequence, strict=True)
-        except KeyError as exc:
-            print(f"[train] skipping sample {sample_id}: {exc}", file=sys.stderr)
-            continue
-        if len(token_ids) < 2:
-            token_ids = [bos_id, eos_id]
-        if len(token_ids) > max_sequence_length:
-            # Smart truncation: cut at last <measure_end> before limit, then append <eos>
-            # Reserve one slot so the final sequence (with <eos>) fits max_sequence_length.
-            truncated = token_ids[: max_sequence_length - 1]
-            if measure_end_id is not None:
-                last_me = -1
-                for i in range(len(truncated) - 1, -1, -1):
-                    if truncated[i] == measure_end_id:
-                        last_me = i
-                        break
-                if last_me > 0:
-                    token_ids = truncated[: last_me + 1] + [eos_id]
-                else:
-                    token_ids = truncated + [eos_id]
-            else:
-                token_ids = truncated + [eos_id]
-
-        contour_targets.append(_derive_pitch_contour(sequence))
-        images.append(image_tensor)
-        content_widths.append(int(content_width))
-
-        input_ids = token_ids[:-1]
-        label_ids = token_ids[1:]
-        if not input_ids:
-            input_ids = [bos_id]
-            label_ids = [eos_id]
-
-        input_pad = [pad_id] * max(0, max_sequence_length - 1 - len(input_ids))
-        label_pad = [-100] * max(0, max_sequence_length - 1 - len(label_ids))
-        decoder_inputs.append((input_ids + input_pad)[: max_sequence_length - 1])
-        labels.append((label_ids + label_pad)[: max_sequence_length - 1])
-
-    if not images:
-        raise RuntimeError("No loadable samples in batch after image resolution.")
-    images_tensor = torch.stack(images, dim=0)
-    decoder_tensor = torch.tensor(decoder_inputs, dtype=torch.long)
-    labels_tensor = torch.tensor(labels, dtype=torch.long)
-    contour_tensor = torch.tensor(contour_targets, dtype=torch.long)
-    widths_tensor = torch.tensor(content_widths, dtype=torch.long)
-    return images_tensor, decoder_tensor, labels_tensor, contour_tensor, widths_tensor, vocab.size
-
 
 def _apply_online_augmentations(images, rng: random.Random):
     from io import BytesIO
@@ -667,6 +549,7 @@ class StageBDataset(torch.utils.data.Dataset):
         stage: "StageTrainingConfig",
         grouped_entries: "Dict[Tuple[str, str], List[Dict[str, object]]]",
         *,
+        split: str = "train",
         project_root: "Path",
         image_height: int = 250,
         image_width: int = 2500,
@@ -677,6 +560,7 @@ class StageBDataset(torch.utils.data.Dataset):
     ) -> None:
         super().__init__()
         self.stage = stage
+        self.split = split
         self.project_root = project_root
         self.image_height = image_height
         self.image_width = image_width
@@ -691,10 +575,12 @@ class StageBDataset(torch.utils.data.Dataset):
 
         # Flatten grouped_entries for all (dataset, split) pairs referenced by
         # this stage's dataset_mix into a single self.entries list.
+        # The ``split`` arg overrides the per-mix-item split so that the same
+        # dataset_mix definition can be reused to build a val-side dataset.
         # Each entry dict is kept as-is; the flat index is what the sampler uses.
         self.entries: List[Dict[str, object]] = []
         for mix_item in stage.dataset_mix:
-            key = (mix_item.dataset, mix_item.split)
+            key = (mix_item.dataset, split)
             rows = grouped_entries.get(key, [])
             self.entries.extend(rows)
 
@@ -812,6 +698,7 @@ def build_stage_b_sampler(
     *,
     total_samples: int,
     seed: int = 0,
+    split_override: Optional[str] = None,
 ) -> "torch.utils.data.WeightedRandomSampler":
     """Build a WeightedRandomSampler that reproduces the stage dataset_mix ratios.
 
@@ -819,8 +706,8 @@ def build_stage_b_sampler(
         weight_i = mix_ratio(dataset_i) / len(group_i)
 
     This yields the correct long-term proportions for each dataset without
-    enforcing exact per-batch counts (unlike the legacy _sample_stage_batch
-    which did floor+remainder allocation per batch).
+    enforcing exact per-batch counts (the legacy floor+remainder allocation
+    per batch has been removed in favour of this sampler).
 
     Args:
         stage: StageTrainingConfig carrying the dataset_mix.
@@ -828,6 +715,10 @@ def build_stage_b_sampler(
         total_samples: Total number of indices the sampler will yield (with
             replacement). Equivalent to one epoch's sample budget.
         seed: Generator seed for reproducibility.
+        split_override: When set (e.g. ``"val"``), use this split string in
+            place of ``mix_item.split`` when building ratio and group-size
+            maps.  Pass the same value used to construct the StageBDataset so
+            that the ratio lookup correctly matches val-split entries.
 
     Returns:
         A WeightedRandomSampler that yields ``total_samples`` indices.
@@ -837,16 +728,22 @@ def build_stage_b_sampler(
     # Build a weight-per-entry list aligned with dataset.entries.
     # Weights are computed as: ratio / len(group) for each entry.
     # If a dataset has ratio=0 its entries get weight 0 and are never drawn.
+    # When split_override is given, substitute it for mix_item.split so that
+    # val-split entries (which differ from the mix definition's "train" split)
+    # are still weighted by the correct dataset ratio.
+    def _effective_split(mix_item: "DatasetMix") -> str:
+        return split_override if split_override is not None else mix_item.split
+
     ratio_map: Dict[Tuple[str, str], float] = {
-        (mix_item.dataset, mix_item.split): mix_item.ratio
+        (mix_item.dataset, _effective_split(mix_item)): mix_item.ratio
         for mix_item in stage.dataset_mix
     }
     group_size_map: Dict[Tuple[str, str], int] = {}
     for mix_item in stage.dataset_mix:
-        key = (mix_item.dataset, mix_item.split)
+        key = (mix_item.dataset, _effective_split(mix_item))
         group_size_map[key] = sum(
             1 for e in dataset.entries
-            if e.get("dataset") == mix_item.dataset and e.get("split", "train") == mix_item.split
+            if e.get("dataset") == mix_item.dataset and e.get("split", "train") == _effective_split(mix_item)
         )
 
     weights: List[float] = []
@@ -860,6 +757,27 @@ def build_stage_b_sampler(
             weights.append(0.0)
         else:
             weights.append(ratio / group_sz)
+
+    # Robustness guard: an all-zero weight vector (or empty dataset) crashes
+    # WeightedRandomSampler with an opaque torch error. Raise early with a
+    # diagnostic message naming the split + dataset_mix so the call site can
+    # see what's wrong (e.g. dataset_mix references a split that has no
+    # samples in the manifest).
+    if not weights or sum(weights) <= 0.0:
+        split_for_msg = split_override if split_override is not None else "<per-mix-item>"
+        mix_summary = ", ".join(
+            f"{m.dataset}@{_effective_split(m)}={ratio_map.get((m.dataset, _effective_split(m)), 0.0):.3f}"
+            for m in stage.dataset_mix
+        )
+        raise ValueError(
+            "build_stage_b_sampler: no samples have non-zero weight. "
+            f"split_override={split_for_msg!r}, dataset_size={len(dataset.entries)}, "
+            f"ratios=[{mix_summary}]. "
+            "Likely cause: dataset_mix references datasets/splits with no entries "
+            "in the manifest (common for split='val' if the manifest hasn't been "
+            "regenerated with val splits). Fix: add entries for the requested "
+            "(dataset, split) combinations or adjust dataset_mix."
+        )
 
     weights_tensor = torch.tensor(weights, dtype=torch.double)
     generator = torch.Generator()
@@ -1234,16 +1152,30 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
 def _run_validation(
     model,
     stage: StageTrainingConfig,
-    grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
-    project_root: Path,
-    image_height: int,
-    image_width: int,
+    val_loader,
     device,
-    rng: random.Random,
     bf16_enabled: bool,
     validation_batches: int,
+    vocab_size: int,
     channels_last: bool = False,
 ) -> Optional[Dict[str, float]]:
+    """Run validation over ``validation_batches`` batches from ``val_loader``.
+
+    Args:
+        model: The model to evaluate.
+        stage: StageTrainingConfig (used for label_smoothing and contour_loss_weight).
+        val_loader: A DataLoader yielding batched dicts from StageBDataset with
+            split="val".  Iterated fresh each call (iter() called internally).
+        device: torch.device to move tensors onto.
+        bf16_enabled: Whether to enable bfloat16 autocast.
+        validation_batches: Maximum number of batches to evaluate.
+        vocab_size: Vocabulary size for cross-entropy logits reshape.
+        channels_last: When True, move images with channels_last memory format.
+
+    Returns:
+        Dict with ``val_loss`` and ``val_contour_loss`` (mean over evaluated
+        batches), or None if the DataLoader yields no batches.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -1251,17 +1183,16 @@ def _run_validation(
     contour_losses: List[float] = []
     model.eval()
     with torch.no_grad():
+        val_iter = iter(val_loader)
         for _ in range(validation_batches):
-            batch = _sample_stage_batch(stage, grouped_entries, rng, split_override="val")
-            if not batch:
+            try:
+                batch_dict = next(val_iter)
+            except StopIteration:
                 break
-            images, decoder_inputs, labels, contour_targets, _content_widths, vocab_size = _encode_batch(
-                batch=batch,
-                max_sequence_length=stage.max_sequence_length,
-                project_root=project_root,
-                image_height=image_height,
-                image_width=image_width,
-            )
+            images = batch_dict["images"]
+            decoder_inputs = batch_dict["decoder_inputs"]
+            labels = batch_dict["labels"]
+            contour_targets = batch_dict["contour_targets"]
             if channels_last:
                 images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
             else:
@@ -1943,6 +1874,43 @@ def run_execute_mode(
             # vocab size is constant; grab from the dataset's vocab object.
             vocab_size = _stage_ds._vocab.size
 
+            # Build a val-side DataLoader for _run_validation.
+            # Uses the same dataset_mix ratios as training but fetches from
+            # split="val" entries.  augment=False: no augmentation during eval.
+            # The sampler is sized to cover validation_batches * batch_size draws
+            # (with replacement) so the iterator never exhausts during a single
+            # validation cycle.  A fresh iter() is called inside _run_validation.
+            _val_dataset = StageBDataset(
+                stage,
+                grouped_entries,
+                split="val",
+                project_root=project_root,
+                image_height=image_height,
+                image_width=image_width,
+                max_sequence_length=stage.max_sequence_length,
+                augment=False,
+                rng_seed=seed,
+            )
+            _val_total_samples = validation_batches * stage.batch_size
+            _val_sampler = build_stage_b_sampler(
+                stage,
+                _val_dataset,
+                total_samples=_val_total_samples,
+                seed=seed,
+                split_override="val",
+            )
+            _val_loader = torch.utils.data.DataLoader(
+                _val_dataset,
+                batch_size=stage.batch_size,
+                sampler=_val_sampler,
+                num_workers=num_workers,
+                pin_memory=_pin_memory,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=_effective_prefetch,
+                collate_fn=StageBDataset.collate_fn,
+                worker_init_fn=stage_b_worker_init_fn,
+            )
+
             timer.reset_step()
 
             for stage_step in range(stage_start_step, stage_total_steps + 1):
@@ -2090,14 +2058,11 @@ def run_execute_mode(
                     validation_result = _run_validation(
                         model=model,
                         stage=stage,
-                        grouped_entries=grouped_entries,
-                        project_root=project_root,
-                        image_height=image_height,
-                        image_width=image_width,
+                        val_loader=_val_loader,
                         device=device,
-                        rng=rng,
                         bf16_enabled=bf16_enabled,
                         validation_batches=validation_batches,
+                        vocab_size=vocab_size,
                         channels_last=channels_last,
                     )
                     _validation_ms = (_time.perf_counter() - _val_t0) * 1000.0
