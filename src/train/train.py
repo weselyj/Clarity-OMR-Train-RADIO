@@ -1584,7 +1584,10 @@ def run_execute_mode(
         model = model.to(device, memory_format=torch.channels_last)
     else:
         model = model.to(device)
-    model = _maybe_compile_decoder_and_bridge(model, enabled=torch_compile)
+    # NOTE: torch.compile is applied AFTER the resume-checkpoint load below.
+    # Compiling first wraps decoder + positional_bridge in OptimizedModule, which
+    # adds an `._orig_mod.` prefix to state_dict keys; load_state_dict then sees
+    # an architecture mismatch and raises. See cu132 plan Phase 4.2 bug fix.
     model.train()
 
     resume_stage_name: Optional[str] = None
@@ -1653,6 +1656,10 @@ def run_execute_mode(
             f"(global_step={global_step}, stage='{resume_stage_name}')",
             file=sys.stderr,
         )
+
+    # Apply torch.compile AFTER the resume-checkpoint load so the wrap doesn't
+    # change state-dict key prefixes during the load. (See cu132 plan Phase 4.2.)
+    model = _maybe_compile_decoder_and_bridge(model, enabled=torch_compile)
 
     bf16_enabled = False
     if device.type == "cuda":
