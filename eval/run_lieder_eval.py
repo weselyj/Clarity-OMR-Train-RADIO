@@ -55,6 +55,41 @@ PDF_TO_MUSICXML_TIMEOUT_SEC = 1800  # 30-min cap per piece
 # take 15+ minutes on large polyphonic scores). Set to 0 to disable.
 TEDN_DEFAULT_TIMEOUT_SEC = 120
 
+# Default wall-clock cap for playback_f (music21.converter.parse() can hang on
+# malformed or very large MusicXML). Set to 0 to disable.
+PLAYBACK_DEFAULT_TIMEOUT_SEC = 120
+
+
+def _playback_f_with_timeout(
+    pred: Path,
+    gt: Path,
+    timeout_sec: int,
+) -> dict | None:
+    """Run playback_f in a daemon thread; return None if it exceeds timeout_sec.
+
+    Uses threading.Thread (not multiprocessing) to avoid Windows spawn re-run.
+    """
+    if timeout_sec <= 0:
+        return playback_f(pred=pred, gt=gt)
+
+    result: list = [None]
+    exc: list = [None]
+
+    def _worker():
+        try:
+            result[0] = playback_f(pred=pred, gt=gt)
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        return None
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
 
 def _compute_tedn_with_timeout(
     reference_path: Path,
@@ -178,6 +213,14 @@ def main() -> None:
             "take many minutes on large polyphonic scores. Set to 0 to disable."
         ),
     )
+    p.add_argument(
+        "--playback-timeout", type=int, default=PLAYBACK_DEFAULT_TIMEOUT_SEC,
+        help=(
+            f"Wall-clock timeout in seconds for playback_f per piece "
+            f"(default {PLAYBACK_DEFAULT_TIMEOUT_SEC}s). music21 parse can hang on "
+            "malformed or very large MusicXML. Set to 0 to disable."
+        ),
+    )
     args = p.parse_args()
 
     if not args.checkpoint.exists():
@@ -198,6 +241,10 @@ def main() -> None:
         print(f"TEDn timeout: {args.tedn_timeout}s per piece")
     else:
         print("TEDn timeout: disabled (unbounded)")
+    if args.playback_timeout > 0:
+        print(f"Playback timeout: {args.playback_timeout}s per piece")
+    else:
+        print("Playback timeout: disabled (unbounded)")
     print()
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -268,7 +315,15 @@ def main() -> None:
                 print(f"[{i}/{n_total}] cached  {piece.stem}")
             # Read Stage D diagnostics sidecar (written by src.pdf_to_musicxml).
             stage_d_cols = _read_stage_d_diag(pred)
-            f1 = playback_f(pred=pred, gt=piece_abs)["f"]
+            pb_result = _playback_f_with_timeout(pred=pred, gt=piece_abs, timeout_sec=args.playback_timeout)
+            if pb_result is None:
+                print(
+                    f"[{i}/{n_total}]   playback TIMEOUT {piece.stem} "
+                    f"(>{args.playback_timeout}s), recording None"
+                )
+                rows.append((piece.stem, None, None, None) + stage_d_cols)
+                continue
+            f1 = pb_result["f"]
             try:
                 tedn = _compute_tedn_with_timeout(
                     piece_abs, pred, timeout_sec=args.tedn_timeout
