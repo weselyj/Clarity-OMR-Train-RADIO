@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -28,6 +28,49 @@ DURATION_QUARTER_LENGTH = {
 }
 
 TUPLET_NORMAL = {3: 2.0, 5: 4.0, 6: 5.0, 7: 6.0}
+
+
+@dataclass
+class StageDExportDiagnostics:
+    """Structured counters for Stage D (MusicXML export) silent-skip paths.
+
+    Pass an instance to ``append_tokens_to_part_with_diagnostics`` or
+    ``assembled_score_to_music21_with_diagnostics``.  The instance is mutated
+    in place; read back the counters after the call to inspect failure modes.
+
+    Fields
+    ------
+    skipped_notes:
+        Individual ``note-*`` tokens whose duration decode failed (skipped silently).
+    skipped_chords:
+        ``<chord_start>`` spans whose duration decode failed after a valid
+        ``<chord_end>`` (the whole chord was dropped).
+    missing_durations:
+        Number of times ``_decode_duration`` returned None (covers both notes
+        and rests).
+    malformed_spans:
+        ``<chord_start>`` spans that ended without a matching ``<chord_end>``
+        (the token stream ran to end-of-measure or end-of-tokens without
+        closing the span).
+    unknown_tokens:
+        Tokens that did not match any known token type and were silently skipped.
+    fallback_rests:
+        ``<chord_start>`` spans with a valid ``<chord_end>`` but zero pitch
+        tokens inside — these are emitted as rests rather than chords.
+    raised_during_part_append:
+        List of dicts recorded when an exception is caught during part
+        append (strict=False path).  Each dict has keys:
+        ``part_id``, ``span``, ``error_type``, ``error_message``.
+    """
+
+    skipped_notes: int = 0
+    skipped_chords: int = 0
+    missing_durations: int = 0
+    malformed_spans: int = 0
+    unknown_tokens: int = 0
+    fallback_rests: int = 0
+    raised_during_part_append: List[Dict[str, object]] = field(default_factory=list)
+
 
 _XML_NAMESPACE_SCHEMA = """<?xml version="1.0" encoding="UTF-8"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
@@ -239,6 +282,59 @@ def _append_event_to_voice(voice, event) -> None:
 
 
 def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
+    """Append token stream to a music21 Part (original public API, no diagnostics)."""
+    _append_tokens_to_part_impl(part, tokens, diagnostics=None, strict=False)
+
+
+def append_tokens_to_part_with_diagnostics(
+    part,
+    tokens: Sequence[str],
+    diagnostics: Optional[StageDExportDiagnostics],
+    *,
+    strict: bool = False,
+) -> None:
+    """Append token stream to a music21 Part, recording skip events to *diagnostics*.
+
+    Parameters
+    ----------
+    part:
+        music21 Part object to append into.
+    tokens:
+        Sequence of token strings from Stage B.
+    diagnostics:
+        Accumulator object.  When None, behaviour is identical to
+        ``append_tokens_to_part`` (no diagnostics collected).
+    strict:
+        When True, re-raise any ValueError that would otherwise be silently
+        skipped (used by tests and ``--strict`` CLI mode).
+    """
+    _append_tokens_to_part_impl(part, tokens, diagnostics=diagnostics, strict=strict)
+
+
+def _append_tokens_to_part_impl(
+    part,
+    tokens: Sequence[str],
+    diagnostics: Optional[StageDExportDiagnostics],
+    *,
+    strict: bool = False,
+) -> None:
+    """Core implementation shared by the public variants.
+
+    Silent-skip paths that are instrumented (all increment the corresponding
+    counter on *diagnostics* when it is not None):
+
+    1. ``rest`` with missing/bad duration       → ``missing_durations``
+    2. ``<chord_start>`` without ``<chord_end>``→ ``malformed_spans``; raises
+       ValueError in strict mode.
+    3. ``<chord_start>/<chord_end>`` with bad duration → ``missing_durations``
+       + ``skipped_chords``
+    4. ``<chord_start>/<chord_end>`` with zero pitch tokens → ``fallback_rests``
+    5. ``note-*`` with missing/bad duration     → ``missing_durations``
+       + ``skipped_notes``
+    6. ``gracenote-*`` with missing/bad duration → ``missing_durations``
+       + ``skipped_notes``
+    7. Unrecognised token at bottom of dispatch → ``unknown_tokens``
+    """
     chord, _, _, _, _, note, stream = _require_music21()
     articulations, dynamics, expressions, spanner, tie = _require_music21_notation()
     try:
@@ -485,6 +581,9 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
         if token == "rest":
             duration_result = _decode_duration_or_skip(idx + 1)
             if duration_result is None:
+                # Silent-skip path 1: rest with missing/bad duration
+                if diagnostics is not None:
+                    diagnostics.missing_durations += 1
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
@@ -493,6 +592,7 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
             continue
 
         if token == "<chord_start>":
+            chord_start_idx = idx
             chord_pitches: List[str] = []
             idx += 1
             while idx < len(tokens) and tokens[idx] != "<chord_end>":
@@ -500,11 +600,23 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
                     chord_pitches.append(_parse_pitch_token(tokens[idx]))
                 idx += 1
             if idx >= len(tokens) or tokens[idx] != "<chord_end>":
-                # Skip malformed chord spans instead of aborting full export.
+                # Silent-skip path 2: malformed chord span (no closing tag)
+                if diagnostics is not None:
+                    diagnostics.malformed_spans += 1
+                if strict:
+                    span_preview = list(tokens[chord_start_idx: chord_start_idx + 6])
+                    raise ValueError(
+                        f"Malformed chord span at token index {chord_start_idx}: "
+                        f"no <chord_end> found. Span starts with: {span_preview}"
+                    )
                 idx += 1
                 continue
             duration_result = _decode_duration_or_skip(idx + 1)
             if duration_result is None:
+                # Silent-skip path 3: chord with valid span but bad duration
+                if diagnostics is not None:
+                    diagnostics.missing_durations += 1
+                    diagnostics.skipped_chords += 1
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
@@ -515,7 +627,9 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
                 _apply_slur_links(chord_event)
                 _append_event_to_voice(current_voice, chord_event)
             else:
-                # Fallback for invalid chord content (for example, rest inside chord span).
+                # Silent-skip path 4: fallback rest for empty chord span
+                if diagnostics is not None:
+                    diagnostics.fallback_rests += 1
                 rest_event = note.Rest(quarterLength=duration_q)
                 _apply_tie(rest_event)
                 _append_event_to_voice(current_voice, rest_event)
@@ -526,6 +640,10 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
             pitch = _parse_pitch_token(token)
             duration_result = _decode_duration_or_skip(idx + 1)
             if duration_result is None:
+                # Silent-skip path 5: note with missing/bad duration
+                if diagnostics is not None:
+                    diagnostics.missing_durations += 1
+                    diagnostics.skipped_notes += 1
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
@@ -541,6 +659,10 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
             pitch = _parse_grace_pitch_token(token)
             duration_result = _decode_duration_or_skip(idx + 1)
             if duration_result is None:
+                # Silent-skip path 6: gracenote with missing/bad duration
+                if diagnostics is not None:
+                    diagnostics.missing_durations += 1
+                    diagnostics.skipped_notes += 1
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
@@ -552,6 +674,9 @@ def append_tokens_to_part(part, tokens: Sequence[str]) -> None:
             idx = next_idx
             continue
 
+        # Silent-skip path 7: unrecognised token
+        if diagnostics is not None:
+            diagnostics.unknown_tokens += 1
         idx += 1
 
     for slur in created_spanners:
@@ -568,6 +693,61 @@ def assembled_score_to_music21(score: AssembledScore):
         for staff in system.staves:
             part = parts.setdefault(staff.part_label, stream.Part(id=staff.part_label))
             append_tokens_to_part(part, staff.tokens)
+
+    for label in score.part_order:
+        music_score.append(parts[label])
+    return music_score
+
+
+def assembled_score_to_music21_with_diagnostics(
+    score: AssembledScore,
+    diagnostics: StageDExportDiagnostics,
+    *,
+    strict: bool = False,
+):
+    """Convert AssembledScore to a music21 Score, populating *diagnostics*.
+
+    Parameters
+    ----------
+    score:
+        The assembled token-stream score from Stage C.
+    diagnostics:
+        Mutable accumulator for all silent-skip counters and error records.
+        Mutated in place.
+    strict:
+        When True, re-raise the first ValueError encountered in any staff
+        (useful for tests and ``--strict`` CLI mode).
+
+    Returns
+    -------
+    music21.stream.Score
+        The constructed score object.  May be partial if errors were caught in
+        lenient mode.
+    """
+    _, _, _, _, _, _, stream = _require_music21()
+    music_score = stream.Score(id="omr_score")
+    parts = {label: stream.Part(id=label) for label in score.part_order}
+
+    systems = sorted(score.systems, key=lambda item: (item.page_index, item.system_index))
+    for system in systems:
+        for staff in system.staves:
+            part = parts.setdefault(staff.part_label, stream.Part(id=staff.part_label))
+            try:
+                append_tokens_to_part_with_diagnostics(
+                    part, staff.tokens, diagnostics, strict=strict
+                )
+            except ValueError as exc:
+                if strict:
+                    raise
+                # Lenient mode: record the error and continue with the next staff.
+                diagnostics.raised_during_part_append.append(
+                    {
+                        "part_id": staff.part_label,
+                        "span": staff.sample_id,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                )
 
     for label in score.part_order:
         music_score.append(parts[label])

@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import csv
+import json
 import statistics
 import sys
 from pathlib import Path
@@ -150,7 +151,36 @@ def main() -> None:
         eval_pieces = eval_pieces[: args.limit]
         print(f"--limit {args.limit}: running on first {len(eval_pieces)} pieces only")
     n_total = len(eval_pieces)
-    rows: list[tuple[str, float | None, float | None, float | None]] = []
+    # Each row: (piece, onset_f1, tedn, lin_ser,
+    #            stage_d_skipped_notes, stage_d_skipped_chords,
+    #            stage_d_missing_durations, stage_d_malformed_spans,
+    #            stage_d_unknown_tokens, stage_d_fallback_rests,
+    #            stage_d_raised_count, stage_d_first_error)
+    rows: list[tuple] = []
+
+    def _read_stage_d_diag(pred_path: Path) -> tuple:
+        """Return the 8 Stage-D diagnostic CSV values for *pred_path*.
+
+        Looks for <pred_path>.diagnostics.json alongside the MusicXML output.
+        Returns a tuple of 8 values (all None if the sidecar is absent or unreadable).
+        """
+        diag_path = pred_path.with_suffix(pred_path.suffix + ".diagnostics.json")
+        try:
+            raw = json.loads(diag_path.read_text(encoding="utf-8"))
+            raised = raw.get("raised_during_part_append", [])
+            first_error = raised[0].get("error_message", "") if raised else ""
+            return (
+                raw.get("skipped_notes"),
+                raw.get("skipped_chords"),
+                raw.get("missing_durations"),
+                raw.get("malformed_spans"),
+                raw.get("unknown_tokens"),
+                raw.get("fallback_rests"),
+                len(raised),
+                first_error,
+            )
+        except Exception:
+            return (None, None, None, None, None, None, None, None)
 
     for i, piece in enumerate(eval_pieces, 1):
         # piece from get_eval_pieces() is relative to cwd; resolve to absolute
@@ -158,7 +188,7 @@ def main() -> None:
         pdf = pdf_dir / f"{piece.stem}.pdf"
         if not pdf.exists():
             print(f"[{i}/{n_total}] SKIP {piece.stem}: no rendered PDF")
-            rows.append((piece.stem, None, None, None))
+            rows.append((piece.stem, None, None, None) + (None,) * 8)
             continue
         try:
             pred = out_dir / f"{piece.stem}.musicxml"
@@ -172,6 +202,8 @@ def main() -> None:
                 )
             else:
                 print(f"[{i}/{n_total}] cached  {piece.stem}")
+            # Read Stage D diagnostics sidecar (written by src.pdf_to_musicxml).
+            stage_d_cols = _read_stage_d_diag(pred)
             f1 = playback_f(pred=pred, gt=piece_abs)["f"]
             try:
                 tedn = compute_tedn(piece_abs, pred)
@@ -183,24 +215,30 @@ def main() -> None:
             except Exception as le:
                 print(f"[{i}/{n_total}]   lin_ser WARN {piece.stem}: {le}")
                 lin_ser = None
-            rows.append((piece.stem, f1, tedn, lin_ser))
+            rows.append((piece.stem, f1, tedn, lin_ser) + stage_d_cols)
             tedn_str = f"{tedn:.4f}" if tedn is not None else "N/A"
             lin_str = f"{lin_ser:.4f}" if lin_ser is not None else "N/A"
             print(f"[{i}/{n_total}] {piece.stem}: onset_f1={f1:.4f}  tedn={tedn_str}  lin_ser={lin_str}")
         except Exception as e:
             print(f"[{i}/{n_total}] FAIL {piece.stem}: {type(e).__name__}: {e}")
-            rows.append((piece.stem, None, None, None))
+            rows.append((piece.stem, None, None, None) + (None,) * 8)
 
     csv_path = (repo_root / "eval/results" / f"lieder_{args.name}.csv").resolve()
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["piece", "onset_f1", "tedn", "linearized_ser"])
+        w.writerow([
+            "piece", "onset_f1", "tedn", "linearized_ser",
+            "stage_d_skipped_notes", "stage_d_skipped_chords",
+            "stage_d_missing_durations", "stage_d_malformed_spans",
+            "stage_d_unknown_tokens", "stage_d_fallback_rests",
+            "stage_d_raised_count", "stage_d_first_error",
+        ])
         w.writerows(rows)
     print(f"\nResults written to {csv_path}")
 
-    valid = [f for _, f in rows if f is not None]
-    failed_count = sum(1 for _, f in rows if f is None)
+    valid = [row[1] for row in rows if row[1] is not None]
+    failed_count = sum(1 for row in rows if row[1] is None)
     if not valid:
         print(f"\nNo pieces scored successfully ({failed_count}/{n_total} failed/skipped).")
         return
