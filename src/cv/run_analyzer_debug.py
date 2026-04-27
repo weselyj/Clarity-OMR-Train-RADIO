@@ -3,13 +3,13 @@
 
 Usage:
     # Single image:
-    python src/cv/test_analyzer.py --image path/to/crop.png
+    python src/cv/run_analyzer_debug.py --image path/to/crop.png
 
     # Batch from eval crops manifest:
-    python src/cv/test_analyzer.py --manifest src/eval/checkpoint_eval_stage2_prev_71000/stageb_eval_crops_manifest.jsonl --limit 20
+    python src/cv/run_analyzer_debug.py --manifest src/eval/checkpoint_eval_stage2_prev_71000/stageb_eval_crops_manifest.jsonl --limit 20
 
     # With known clef:
-    python src/cv/test_analyzer.py --image crop.png --clef clef-G2
+    python src/cv/run_analyzer_debug.py --image crop.png --clef clef-G2
 """
 
 from __future__ import annotations
