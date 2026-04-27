@@ -44,3 +44,4 @@ PyYAML
 # mir_eval
 # verovio
 # cairosvg
+zss  # Zhang-Shasha tree edit distance (used by eval/tedn.py)
