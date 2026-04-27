@@ -37,6 +37,27 @@ from typing import Dict, List, Sequence
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
+# TEDn / linearized-SER are only available when the caller supplies --musicxml-dir
+# pointing to a directory of reference MusicXML files named <sample_id>.musicxml
+# alongside a directory of predicted MusicXML files (--pred-musicxml-dir).
+# When either directory is absent the two columns are emitted as empty strings.
+def _try_compute_tedn(ref_xml: Path, hyp_xml: Path) -> "str | float":
+    """Return TEDn float or empty string on any error."""
+    try:
+        from eval.tedn import compute_tedn
+        return compute_tedn(ref_xml, hyp_xml)
+    except Exception:
+        return ""
+
+
+def _try_compute_lin_ser(ref_xml: Path, hyp_xml: Path) -> "str | float":
+    """Return linearized_ser float or empty string on any error."""
+    try:
+        from eval.linearized_musicxml import compute_linearized_ser
+        return compute_linearized_ser(ref_xml, hyp_xml)
+    except Exception:
+        return ""
+
 
 def _edit_distance(a: Sequence[str], b: Sequence[str]) -> int:
     """Standard Levenshtein distance over token sequences."""
@@ -125,6 +146,26 @@ def main() -> None:
         default=_REPO_ROOT / "eval" / "results",
         help="directory for results CSV (default: eval/results)",
     )
+    p.add_argument(
+        "--musicxml-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional: directory containing reference MusicXML files named "
+            "<sample_id>.musicxml. When provided together with --pred-musicxml-dir, "
+            "tedn and linearized_ser columns are populated."
+        ),
+    )
+    p.add_argument(
+        "--pred-musicxml-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional: directory containing predicted MusicXML files named "
+            "<sample_id>.musicxml. Required alongside --musicxml-dir to enable "
+            "TEDn / linearized_ser metrics."
+        ),
+    )
     args = p.parse_args()
 
     limit = None if args.limit <= 0 else int(args.limit)
@@ -183,6 +224,16 @@ def main() -> None:
             pred = json.loads(line)
             pred_by_id[str(pred["sample_id"])] = list(pred.get("tokens", []))
 
+    # Determine whether MusicXML-based metrics are available.
+    musicxml_enabled = (
+        args.musicxml_dir is not None and args.pred_musicxml_dir is not None
+    )
+    if musicxml_enabled:
+        print(
+            f"MusicXML metrics enabled: ref={args.musicxml_dir}  pred={args.pred_musicxml_dir}",
+            file=sys.stderr,
+        )
+
     # Compute metrics.
     args.out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.out_dir / f"primus_{args.name}.csv"
@@ -201,15 +252,28 @@ def main() -> None:
                 "ser",
                 "token_accuracy",
                 "exact_match",
+                "tedn",
+                "linearized_ser",
             ]
         )
         for entry in entries:
             sid = str(entry["sample_id"])
             gt_full = list(entry.get("token_sequence", []))
             pred_full = pred_by_id.get(sid)
+
+            # Compute MusicXML-based metrics if dirs are available.
+            tedn_val: "str | float" = ""
+            lin_ser_val: "str | float" = ""
+            if musicxml_enabled:
+                ref_xml = args.musicxml_dir / f"{sid}.musicxml"
+                hyp_xml = args.pred_musicxml_dir / f"{sid}.musicxml"
+                if ref_xml.exists() and hyp_xml.exists():
+                    tedn_val = _try_compute_tedn(ref_xml, hyp_xml)
+                    lin_ser_val = _try_compute_lin_ser(ref_xml, hyp_xml)
+
             if pred_full is None:
                 missing_predictions += 1
-                writer.writerow([sid, len(gt_full), 0, len(gt_full), 1.0, 0.0, False])
+                writer.writerow([sid, len(gt_full), 0, len(gt_full), 1.0, 0.0, False, tedn_val, lin_ser_val])
                 continue
             gt = _strip_special(gt_full)
             pred = _strip_special(pred_full)
@@ -223,8 +287,10 @@ def main() -> None:
                 exact_matches += 1
             sers.append(ser)
             token_accs.append(token_acc)
+            tedn_fmt = f"{tedn_val:.4f}" if isinstance(tedn_val, float) else tedn_val
+            lin_ser_fmt = f"{lin_ser_val:.4f}" if isinstance(lin_ser_val, float) else lin_ser_val
             writer.writerow(
-                [sid, len(gt), len(pred), edit, f"{ser:.4f}", f"{token_acc:.4f}", exact]
+                [sid, len(gt), len(pred), edit, f"{ser:.4f}", f"{token_acc:.4f}", exact, tedn_fmt, lin_ser_fmt]
             )
 
     print()

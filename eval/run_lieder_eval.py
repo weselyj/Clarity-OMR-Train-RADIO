@@ -31,6 +31,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from eval.lieder_split import get_eval_pieces, split_hash
 from eval.playback import playback_f
+from eval.tedn import compute_tedn
+from eval.linearized_musicxml import compute_linearized_ser
 
 # Path to our venv's Python — used to invoke src.pdf_to_musicxml as a subprocess
 VENV_PYTHON = Path(__file__).resolve().parents[1] / "venv" / "Scripts" / "python.exe"
@@ -148,7 +150,7 @@ def main() -> None:
         eval_pieces = eval_pieces[: args.limit]
         print(f"--limit {args.limit}: running on first {len(eval_pieces)} pieces only")
     n_total = len(eval_pieces)
-    rows: list[tuple[str, float | None]] = []
+    rows: list[tuple[str, float | None, float | None, float | None]] = []
 
     for i, piece in enumerate(eval_pieces, 1):
         # piece from get_eval_pieces() is relative to cwd; resolve to absolute
@@ -156,7 +158,7 @@ def main() -> None:
         pdf = pdf_dir / f"{piece.stem}.pdf"
         if not pdf.exists():
             print(f"[{i}/{n_total}] SKIP {piece.stem}: no rendered PDF")
-            rows.append((piece.stem, None))
+            rows.append((piece.stem, None, None, None))
             continue
         try:
             pred = out_dir / f"{piece.stem}.musicxml"
@@ -171,17 +173,29 @@ def main() -> None:
             else:
                 print(f"[{i}/{n_total}] cached  {piece.stem}")
             f1 = playback_f(pred=pred, gt=piece_abs)["f"]
-            rows.append((piece.stem, f1))
-            print(f"[{i}/{n_total}] {piece.stem}: onset_f1={f1:.4f}")
+            try:
+                tedn = compute_tedn(piece_abs, pred)
+            except Exception as te:
+                print(f"[{i}/{n_total}]   tedn WARN {piece.stem}: {te}")
+                tedn = None
+            try:
+                lin_ser = compute_linearized_ser(piece_abs, pred)
+            except Exception as le:
+                print(f"[{i}/{n_total}]   lin_ser WARN {piece.stem}: {le}")
+                lin_ser = None
+            rows.append((piece.stem, f1, tedn, lin_ser))
+            tedn_str = f"{tedn:.4f}" if tedn is not None else "N/A"
+            lin_str = f"{lin_ser:.4f}" if lin_ser is not None else "N/A"
+            print(f"[{i}/{n_total}] {piece.stem}: onset_f1={f1:.4f}  tedn={tedn_str}  lin_ser={lin_str}")
         except Exception as e:
             print(f"[{i}/{n_total}] FAIL {piece.stem}: {type(e).__name__}: {e}")
-            rows.append((piece.stem, None))
+            rows.append((piece.stem, None, None, None))
 
     csv_path = (repo_root / "eval/results" / f"lieder_{args.name}.csv").resolve()
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["piece", "onset_f1"])
+        w.writerow(["piece", "onset_f1", "tedn", "linearized_ser"])
         w.writerows(rows)
     print(f"\nResults written to {csv_path}")
 
