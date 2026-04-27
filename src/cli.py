@@ -334,12 +334,15 @@ def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
         fallback=fallback_factory_cfg,
     )
     components = build_stage_b_components(factory_cfg)
-    model = components["model"].to(device)
-    state_dict = _load_stage_b_state_dict(args.checkpoint, device)
-    load_result = model.load_state_dict(state_dict, strict=False)
-    loaded_keys = max(0, len(state_dict) - len(load_result.unexpected_keys))
-    if loaded_keys == 0:
-        raise RuntimeError(f"Checkpoint did not load any compatible Stage-B parameters: {args.checkpoint}")
+    model = components["model"]
+    from src.checkpoint_io import load_stage_b_checkpoint
+    ckpt_result = load_stage_b_checkpoint(
+        checkpoint_path=args.checkpoint,
+        model=model,
+        device=device,
+        dora_config=components.get("dora_config"),
+    )
+    model = ckpt_result["_model"]
     model.eval()
 
     # Prepare model once for all crops
@@ -396,9 +399,13 @@ def run_stage_b(args: argparse.Namespace) -> Dict[str, object]:
         "predictions_written": len(prediction_rows),
         "output_predictions": str(args.output_predictions),
         "checkpoint": str(args.checkpoint),
+        "checkpoint_format": ckpt_result["checkpoint_format"],
         "device": str(device),
-        "missing_keys": len(load_result.missing_keys),
-        "unexpected_keys": len(load_result.unexpected_keys),
+        "missing_keys": ckpt_result["missing_keys"],
+        "unexpected_keys": ckpt_result["unexpected_keys"],
+        "missing_key_sample": ckpt_result["missing_key_sample"],
+        "unexpected_key_sample": ckpt_result["unexpected_key_sample"],
+        "load_ratio": ckpt_result["load_ratio"],
     }
 
 
@@ -446,19 +453,44 @@ def run_export(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def _load_prediction_lookup(path: Path) -> Dict[str, List[str]]:
+    """Build a token-prediction lookup from a predictions JSONL file.
+
+    Each row is registered under *all* of the following keys so that
+    look-ups succeed regardless of whether the caller has a full filename,
+    a bare stem, or a sample_id:
+
+    * crop filename  (``staff_001.png``)  — when ``crop_path`` is present
+    * crop stem      (``staff_001``)      — always (derived from filename or sample_id)
+    * sample_id      (``staff_001``)      — when present and differs from the stem
+
+    Entries later in the file silently overwrite earlier ones for the same key.
+    """
     rows = _read_jsonl(path)
     lookup: Dict[str, List[str]] = {}
     for row in rows:
         tokens = row.get("tokens")
         if not isinstance(tokens, list):
             raise ValueError(f"Prediction row missing tokens list: {row}")
+        token_list = [str(token) for token in tokens]
+
         if "crop_path" in row:
-            key = Path(str(row["crop_path"])).name
+            filename = Path(str(row["crop_path"])).name
+            stem = Path(filename).stem
+            lookup[filename] = token_list
+            lookup[stem] = token_list
         elif "sample_id" in row:
-            key = str(row["sample_id"])
+            sample_id = str(row["sample_id"])
+            stem = Path(sample_id).stem  # handles IDs like "staff_001.png" too
+            lookup[sample_id] = token_list
+            if stem != sample_id:
+                lookup[stem] = token_list
         else:
             raise ValueError(f"Prediction row missing crop_path/sample_id: {row}")
-        lookup[key] = [str(token) for token in tokens]
+
+        # Also register by sample_id when it co-exists with crop_path
+        if "sample_id" in row and "crop_path" in row:
+            lookup[str(row["sample_id"])] = token_list
+
     return lookup
 
 
@@ -510,9 +542,19 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
     assembled_rows = []
     for row in crop_rows:
         crop_name = Path(str(row["crop_path"])).name
-        tokens = prediction_lookup.get(crop_name)
+        crop_stem = Path(crop_name).stem
+        sample_id = str(row.get("sample_id", ""))
+        # Try crop filename first, then stem, then sample_id for broadest compatibility.
+        tokens = (
+            prediction_lookup.get(crop_name)
+            or prediction_lookup.get(crop_stem)
+            or (prediction_lookup.get(sample_id) if sample_id else None)
+        )
         if tokens is None:
-            raise ValueError(f"No token prediction found for crop '{crop_name}'.")
+            raise ValueError(
+                f"No token prediction found for crop '{crop_name}' "
+                f"(also tried stem='{crop_stem}', sample_id='{sample_id}')."
+            )
         row_with_tokens = dict(row)
         row_with_tokens["tokens"] = tokens
         assembled_rows.append(row_with_tokens)

@@ -177,11 +177,10 @@ def _run_stage_b_inference_with_progress(
         _decode_stage_b_tokens,
         _encode_staff_image,
         _load_stage_b_crop_tensor,
-        _load_stage_b_state_dict,
         _prepare_model_for_inference,
     )
+    from src.checkpoint_io import load_stage_b_checkpoint
     from src.tokenizer.vocab import build_default_vocabulary
-    from src.train.train import _prepare_model_for_dora
     from src.train.model_factory import (
         ModelFactoryConfig,
         build_stage_b_components,
@@ -205,31 +204,17 @@ def _run_stage_b_inference_with_progress(
     )
     components = build_stage_b_components(factory_cfg)
     model = components["model"]
-    state_dict_raw = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
-    if not isinstance(state_dict_raw, dict):
-        raise RuntimeError(f"Unsupported checkpoint format: {checkpoint}")
-
-    raw_keys = [str(key) for key in state_dict_raw.keys()]
-    looks_like_dora = any("lora_" in key for key in raw_keys) or any("modules_to_save" in key for key in raw_keys)
-    checkpoint_format = "dora_peft" if looks_like_dora else "plain"
-    if looks_like_dora:
-        model, _ = _prepare_model_for_dora(model, components["dora_config"])
-        state_dict = state_dict_raw
-    else:
-        state_dict = _load_stage_b_state_dict(checkpoint, device)
-
-    model = model.to(device)
-    load_result = model.load_state_dict(state_dict, strict=False)
-    loaded_keys = max(0, len(state_dict) - len(load_result.unexpected_keys))
-    load_ratio = float(loaded_keys) / float(max(1, len(state_dict)))
-    if loaded_keys == 0:
-        raise RuntimeError(f"Checkpoint did not load any compatible Stage-B parameters: {checkpoint}")
-    if load_ratio < 0.50:
-        raise RuntimeError(
-            "Checkpoint load coverage is too low for reliable evaluation. "
-            f"loaded={loaded_keys}/{len(state_dict)} ({load_ratio:.1%}), "
-            f"missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}."
-        )
+    ckpt_result = load_stage_b_checkpoint(
+        checkpoint_path=checkpoint,
+        model=model,
+        device=device,
+        dora_config=components.get("dora_config"),
+        min_coverage=0.50,
+    )
+    model = ckpt_result["_model"]
+    checkpoint_format = ckpt_result["checkpoint_format"]
+    loaded_keys = ckpt_result["loaded_keys"]
+    load_ratio = ckpt_result["load_ratio"]
     model.eval()
 
     # Prepare model once for all crops
@@ -318,8 +303,10 @@ def _run_stage_b_inference_with_progress(
         "checkpoint": str(checkpoint),
         "checkpoint_format": checkpoint_format,
         "device": str(device),
-        "missing_keys": len(load_result.missing_keys),
-        "unexpected_keys": len(load_result.unexpected_keys),
+        "missing_keys": ckpt_result["missing_keys"],
+        "unexpected_keys": ckpt_result["unexpected_keys"],
+        "missing_key_sample": ckpt_result["missing_key_sample"],
+        "unexpected_key_sample": ckpt_result["unexpected_key_sample"],
         "loaded_keys": loaded_keys,
         "load_ratio": load_ratio,
         "inference_seconds": float(total_seconds),

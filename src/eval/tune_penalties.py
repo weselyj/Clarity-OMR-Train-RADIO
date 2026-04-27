@@ -346,7 +346,7 @@ def tune(
         build_stage_b_components,
         model_factory_config_from_checkpoint_payload,
     )
-    from src.cli import _load_stage_b_state_dict
+    from src.checkpoint_io import load_stage_b_checkpoint
 
     # --- Load model ---
     device_str = str(device_name).strip() if device_name else ""
@@ -357,19 +357,13 @@ def tune(
     factory_cfg = model_factory_config_from_checkpoint_payload(payload, vocab_size=vocab.size, fallback=fallback_cfg)
     components = build_stage_b_components(factory_cfg)
     model = components["model"]
-
-    state_dict_raw = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
-    raw_keys = [str(k) for k in state_dict_raw.keys()]
-    looks_like_dora = any("lora_" in k for k in raw_keys) or any("modules_to_save" in k for k in raw_keys)
-    if looks_like_dora:
-        from src.train.train import _prepare_model_for_dora
-        model, _ = _prepare_model_for_dora(model, components["dora_config"])
-        state_dict = state_dict_raw
-    else:
-        state_dict = _load_stage_b_state_dict(checkpoint, device)
-
-    model = model.to(device)
-    model.load_state_dict(state_dict, strict=False)
+    ckpt_result = load_stage_b_checkpoint(
+        checkpoint_path=checkpoint,
+        model=model,
+        device=device,
+        dora_config=components.get("dora_config"),
+    )
+    model = ckpt_result["_model"]
     model.eval()
 
     if not quiet:
