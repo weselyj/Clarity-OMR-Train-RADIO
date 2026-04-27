@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
-
-_logger = logging.getLogger(__name__)
 
 
 def _require_torch():
@@ -72,20 +69,18 @@ _SDPA_FORCE_MATH: bool = str(
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 if _FLASH_ATTN_FUNC is not None:
-    _logger.info(
-        "davit_stage_b: attention backend = flash_attn (library); "
+    print(
+        "[davit_stage_b] attention backend = flash_attn (library); "
         "SDPA env overrides ignored for fp16/bf16 CUDA tensors."
     )
 elif _SDPA_FORCE_MATH:
-    _logger.info("davit_stage_b: attention backend = torch SDPA (math kernel forced).")
+    print("[davit_stage_b] attention backend = torch SDPA (math kernel forced).")
 elif _SDPA_DISABLE_FLASH and _SDPA_DISABLE_MEM_EFFICIENT:
-    _logger.info("davit_stage_b: attention backend = torch SDPA (math only; flash+mem-efficient disabled).")
+    print("[davit_stage_b] attention backend = torch SDPA (math only; flash+mem-efficient disabled).")
 else:
-    _logger.info(
-        "davit_stage_b: attention backend = torch SDPA "
-        "(flash=%s, mem_efficient=%s).",
-        not _SDPA_DISABLE_FLASH,
-        not _SDPA_DISABLE_MEM_EFFICIENT,
+    print(
+        f"[davit_stage_b] attention backend = torch SDPA "
+        f"(flash={not _SDPA_DISABLE_FLASH}, mem_efficient={not _SDPA_DISABLE_MEM_EFFICIENT})."
     )
 
 
