@@ -9,6 +9,7 @@ import json
 import math
 import random
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1025,6 +1026,139 @@ def _save_checkpoint(
     return checkpoint_path
 
 
+class _CpuPhase:
+    """Inner context manager for CPU phase timing. See _StepTimer."""
+    __slots__ = ("_parent", "_name", "_t0")
+
+    def __init__(self, parent: "_StepTimer", name: str) -> None:
+        self._parent = parent
+        self._name = name
+        self._t0 = 0.0
+
+    def __enter__(self):
+        import time as _time
+        self._t0 = _time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import time as _time
+        dt_ms = (_time.perf_counter() - self._t0) * 1000.0
+        self._parent._cpu_ms[self._name] = self._parent._cpu_ms.get(self._name, 0.0) + dt_ms
+        return False
+
+
+class _GpuPhase:
+    """Inner context manager for GPU phase timing via cuda.Event. See _StepTimer."""
+    __slots__ = ("_parent", "_name", "_start", "_end")
+
+    def __init__(self, parent: "_StepTimer", name: str) -> None:
+        self._parent = parent
+        self._name = name
+        self._start = None
+        self._end = None
+
+    def __enter__(self):
+        import torch as _torch
+        self._start = _torch.cuda.Event(enable_timing=True)
+        self._end = _torch.cuda.Event(enable_timing=True)
+        self._start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._end.record()
+        self._parent._gpu_events.append((self._name, self._start, self._end))
+        return False
+
+
+class _StepTimer:
+    """Per-optimizer-step phase timing for --profile-step-timing.
+
+    Buckets:
+      cpu_*  measured with time.perf_counter() (sample/encode/augment/h2d/log_io)
+      gpu_*  measured with torch.cuda.Event (forward/backward/grad_diag/optimizer)
+
+    Per-optimizer-step rollup: micro-batch buckets accumulate; flush() resolves
+    cuda.Events with a single cuda.synchronize(), writes one JSONL row, and the
+    caller resets via reset_step() at the start of each accumulation window.
+
+    All methods are no-ops when ``enabled`` is False, so wrapping the loop has
+    near-zero overhead in normal runs.
+    """
+
+    def __init__(self, enabled: bool, output_path: Optional[Path] = None) -> None:
+        self.enabled = bool(enabled)
+        self._fh = None
+        if self.enabled and output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = output_path.open("w", buffering=1, encoding="utf-8")
+        self._cpu_ms: Dict[str, float] = {}
+        self._gpu_events: List[Tuple[str, object, object]] = []
+        self._micro_batch_count = 0
+        self._step_wall_start: Optional[float] = None
+
+    def reset_step(self) -> None:
+        if not self.enabled:
+            return
+        import time as _time
+        self._cpu_ms.clear()
+        self._gpu_events.clear()
+        self._micro_batch_count = 0
+        self._step_wall_start = _time.perf_counter()
+
+    def cpu(self, name: str):
+        return _CpuPhase(self, name) if self.enabled else nullcontext()
+
+    def gpu(self, name: str):
+        return _GpuPhase(self, name) if self.enabled else nullcontext()
+
+    def micro_batch_done(self) -> None:
+        if self.enabled:
+            self._micro_batch_count += 1
+
+    def flush(
+        self,
+        *,
+        global_step: int,
+        stage_name: str,
+        validation_ms: Optional[float] = None,
+        checkpoint_ms: Optional[float] = None,
+    ) -> None:
+        if not self.enabled or self._fh is None:
+            return
+        import time as _time
+        import torch as _torch
+        wall_total_ms = (
+            (_time.perf_counter() - self._step_wall_start) * 1000.0
+            if self._step_wall_start is not None
+            else 0.0
+        )
+        gpu_ms: Dict[str, float] = {}
+        if self._gpu_events:
+            _torch.cuda.synchronize()
+            for name, start_evt, end_evt in self._gpu_events:
+                gpu_ms[name] = gpu_ms.get(name, 0.0) + start_evt.elapsed_time(end_evt)
+        record: Dict[str, object] = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "global_step": global_step,
+            "stage_name": stage_name,
+            "micro_batches": self._micro_batch_count,
+            "wall_total_ms": round(wall_total_ms, 2),
+            "validation_ms": (round(validation_ms, 2) if validation_ms is not None else None),
+            "checkpoint_ms": (round(checkpoint_ms, 2) if checkpoint_ms is not None else None),
+        }
+        for k, v in self._cpu_ms.items():
+            record[f"cpu_{k}_ms"] = round(v, 2)
+        for k, v in gpu_ms.items():
+            record[f"gpu_{k}_ms"] = round(v, 2)
+        self._fh.write(json.dumps(record) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
 def _expand_lora_rank_tensors_for_resume(
     state_dict: Dict[str, object],
     model_state: Dict[str, object],
@@ -1086,6 +1220,9 @@ def run_execute_mode(
     stage_b_dora_rank: Optional[int] = None,
     stage_b_encoder: Optional[str] = None,
     keep_last_checkpoints: int = 0,
+    profile_step_timing: bool = False,
+    profile_output_path: Optional[Path] = None,
+    stage_b_radio_pool_to_stride32: bool = False,
 ) -> Dict[str, object]:
     import torch
     import torch.nn.functional as F
@@ -1115,6 +1252,7 @@ def run_execute_mode(
         stage_b_decoder_layers=stage_b_decoder_layers,
         stage_b_decoder_heads=stage_b_decoder_heads,
         stage_b_encoder=resolved_encoder,
+        stage_b_radio_pool_to_stride32=bool(stage_b_radio_pool_to_stride32),
     )
     resume_payload = None
     resume_factory_cfg = None
@@ -1143,7 +1281,7 @@ def run_execute_mode(
     components = build_stage_b_components(factory_cfg)
     stage_b_config_dict = dataclasses.asdict(components["stage_b_config"])
     # Persist encoder type explicitly (RadioStageBConfig vs StageBModelConfig don't carry
-    # this as a field — it's encoded in the dataclass type, which asdict() drops).
+    # this as a field - it's encoded in the dataclass type, which asdict() drops).
     # Without this, model_factory_config_from_checkpoint_payload has to infer from
     # tensor shapes; explicit metadata is cleaner.
     stage_b_config_dict["encoder"] = factory_cfg.stage_b_encoder
@@ -1340,6 +1478,8 @@ def run_execute_mode(
         step_log_mode = "a" if (resume_checkpoint is not None) else "w"
         step_writer = step_log_path.open(step_log_mode, encoding="utf-8")
 
+    timer = _StepTimer(enabled=profile_step_timing, output_path=profile_output_path)
+
     try:
         for stage_index, stage in enumerate(stages):
             runtime = stage_runtime[stage_index]
@@ -1431,52 +1571,62 @@ def run_execute_mode(
             best_val_loss: Optional[float] = None
             best_val_step: Optional[int] = None
 
+            timer.reset_step()
+
             for stage_step in range(stage_start_step, stage_total_steps + 1):
-                batch = _sample_stage_batch(stage, grouped_entries=grouped_entries, rng=rng)
+                if (stage_step - 1) % stage.grad_accumulation_steps == 0:
+                    timer.reset_step()
+                with timer.cpu("sample"):
+                    batch = _sample_stage_batch(stage, grouped_entries=grouped_entries, rng=rng)
                 if not batch:
                     break
                 epoch_index = ((stage_step - 1) // stage_steps_per_epoch) + 1
                 epoch_step = ((stage_step - 1) % stage_steps_per_epoch) + 1
-                images, decoder_inputs, labels, contour_targets, _content_widths, vocab_size = _encode_batch(
-                    batch=batch,
-                    max_sequence_length=stage.max_sequence_length,
-                    project_root=project_root,
-                    image_height=image_height,
-                    image_width=image_width,
-                )
-                images = _apply_online_augmentations(images, rng)
-                images = images.to(device)
-                decoder_inputs = decoder_inputs.to(device)
-                labels = labels.to(device)
-                contour_targets = contour_targets.to(device)
+                with timer.cpu("encode"):
+                    images, decoder_inputs, labels, contour_targets, _content_widths, vocab_size = _encode_batch(
+                        batch=batch,
+                        max_sequence_length=stage.max_sequence_length,
+                        project_root=project_root,
+                        image_height=image_height,
+                        image_width=image_width,
+                    )
+                with timer.cpu("augment"):
+                    images = _apply_online_augmentations(images, rng)
+                with timer.cpu("h2d"):
+                    images = images.to(device)
+                    decoder_inputs = decoder_inputs.to(device)
+                    labels = labels.to(device)
+                    contour_targets = contour_targets.to(device)
 
                 accum_steps = stage.grad_accumulation_steps
                 is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
                 if (stage_step - 1) % accum_steps == 0:
                     optimizer.zero_grad(set_to_none=True)
                     accum_window_corrupted = False
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=bf16_enabled,
-                ):
-                    outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
-                    token_loss = F.cross_entropy(
-                        outputs["logits"].reshape(-1, vocab_size),
-                        labels.reshape(-1),
-                        ignore_index=-100,
-                        label_smoothing=stage.label_smoothing,
-                    )
-                    contour_loss = F.cross_entropy(outputs["contour_logits"], contour_targets)
-                    loss = token_loss + (stage.contour_loss_weight * contour_loss)
-                    if accum_steps > 1:
-                        loss = loss / accum_steps
+                with timer.gpu("forward"):
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=bf16_enabled,
+                    ):
+                        outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+                        token_loss = F.cross_entropy(
+                            outputs["logits"].reshape(-1, vocab_size),
+                            labels.reshape(-1),
+                            ignore_index=-100,
+                            label_smoothing=stage.label_smoothing,
+                        )
+                        contour_loss = F.cross_entropy(outputs["contour_logits"], contour_targets)
+                        loss = token_loss + (stage.contour_loss_weight * contour_loss)
+                        if accum_steps > 1:
+                            loss = loss / accum_steps
 
                 non_finite_loss = not bool(torch.isfinite(loss).item())
                 if non_finite_loss:
                     non_finite_events += 1
                     optimizer.zero_grad(set_to_none=True)
                     accum_window_corrupted = True
+                    timer.micro_batch_done()
                     continue
 
                 if accum_window_corrupted:
@@ -1484,48 +1634,57 @@ def run_execute_mode(
                     # skip remaining backward passes to avoid wrong gradient scale.
                     if is_accum_step:
                         optimizer.zero_grad(set_to_none=True)
+                    timer.micro_batch_done()
                     continue
 
-                loss.backward()
+                with timer.gpu("backward"):
+                    loss.backward()
 
                 if not is_accum_step:
                     losses.append(float(loss.item()) * accum_steps)
+                    timer.micro_batch_done()
                     continue
 
-                grad_norm_value = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item())
-                grad_norms = _compute_per_group_grad_norms(model)
-                grad_alert_messages = _detect_grad_anomalies(grad_norms, grad_running_average)
-                if grad_alert_messages:
-                    stage_grad_alerts += len(grad_alert_messages)
-                    grad_alerts.append(
-                        {
-                            "global_step": global_step + 1,
-                            "stage_name": stage.stage_name,
-                            "alerts": grad_alert_messages,
-                        }
-                    )
+                with timer.gpu("grad_diagnostics"):
+                    grad_norm_value = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item())
+                    grad_norms = _compute_per_group_grad_norms(model)
+                    grad_alert_messages = _detect_grad_anomalies(grad_norms, grad_running_average)
+                    if grad_alert_messages:
+                        stage_grad_alerts += len(grad_alert_messages)
+                        grad_alerts.append(
+                            {
+                                "global_step": global_step + 1,
+                                "stage_name": stage.stage_name,
+                                "alerts": grad_alert_messages,
+                            }
+                        )
 
-                non_finite_grad = False
-                for parameter in model.parameters():
-                    if parameter.grad is None:
-                        continue
-                    if not torch.isfinite(parameter.grad).all():
-                        non_finite_grad = True
-                        break
+                    non_finite_grad = False
+                    for parameter in model.parameters():
+                        if parameter.grad is None:
+                            continue
+                        if not torch.isfinite(parameter.grad).all():
+                            non_finite_grad = True
+                            break
 
                 if non_finite_grad:
                     non_finite_events += 1
                     optimizer.zero_grad(set_to_none=True)
+                    timer.micro_batch_done()
                     continue
 
-                optimizer.step()
-                scheduler.step()
+                with timer.gpu("optimizer"):
+                    optimizer.step()
+                    scheduler.step()
                 losses.append(float(loss.item()) * accum_steps)
                 global_step += 1
 
                 lr_map = {group.get("group_name", f"group_{idx}"): group["lr"] for idx, group in enumerate(optimizer.param_groups)}
                 validation_result = None
+                _validation_ms: Optional[float] = None
                 if global_step % stage.validate_every_steps == 0:
+                    import time as _time
+                    _val_t0 = _time.perf_counter()
                     validation_result = _run_validation(
                         model=model,
                         stage=stage,
@@ -1538,6 +1697,7 @@ def run_execute_mode(
                         bf16_enabled=bf16_enabled,
                         validation_batches=validation_batches,
                     )
+                    _validation_ms = (_time.perf_counter() - _val_t0) * 1000.0
                     if validation_result is not None:
                         validation_events.append(
                             {
@@ -1567,7 +1727,10 @@ def run_execute_mode(
                                         name_suffix="best",
                                     )
 
+                _checkpoint_ms: Optional[float] = None
                 if checkpoint_dir is not None and global_step % stage.checkpoint_every_steps == 0:
+                    import time as _time
+                    _ckpt_t0 = _time.perf_counter()
                     checkpoint_path = _save_checkpoint(
                         checkpoint_dir=checkpoint_dir,
                         model=model,
@@ -1580,6 +1743,7 @@ def run_execute_mode(
                         stage_b_config=stage_b_config_dict,
                     )
                     checkpoints_written.append(str(checkpoint_path))
+                    _checkpoint_ms = (_time.perf_counter() - _ckpt_t0) * 1000.0
                     # Optional: keep only the last N step-numbered checkpoints to bound
                     # disk usage. _best.pt and _final.pt are stable filenames and are
                     # not matched by the f"{stage_name}_step_*.pt" glob, so they are
@@ -1600,32 +1764,41 @@ def run_execute_mode(
                                     )
 
                 if step_writer is not None:
-                    record = {
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                        "global_step": global_step,
-                        "stage_step": stage_step,
-                        "stage_steps_total": stage_total_steps,
-                        "epoch_index": epoch_index,
-                        "epoch_step": epoch_step,
-                        "epoch_steps_total": stage_steps_per_epoch,
-                        "stage_name": stage.stage_name,
-                        "loss": float(loss.item()),
-                        "token_loss": float(token_loss.item()),
-                        "contour_loss": float(contour_loss.item()),
-                        "lr_dora": float(lr_map.get("dora", stage.lr_dora)),
-                        "lr_new_modules": float(lr_map.get("new_modules", stage.lr_new_modules)),
-                        "grad_norm": grad_norm_value,
-                        "grad_norm_groups": grad_norms,
-                        "grad_alerts": grad_alert_messages,
-                        "batch_size": len(batch),
-                        "max_sequence_length": stage.max_sequence_length,
-                        "non_finite_loss": non_finite_loss,
-                        "non_finite_grad": non_finite_grad,
-                        "bf16_enabled": bf16_enabled,
-                        "validation": validation_result,
-                    }
-                    step_writer.write(json.dumps(record) + "\n")
-                    step_writer.flush()
+                    with timer.cpu("log_io"):
+                        record = {
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                            "global_step": global_step,
+                            "stage_step": stage_step,
+                            "stage_steps_total": stage_total_steps,
+                            "epoch_index": epoch_index,
+                            "epoch_step": epoch_step,
+                            "epoch_steps_total": stage_steps_per_epoch,
+                            "stage_name": stage.stage_name,
+                            "loss": float(loss.item()),
+                            "token_loss": float(token_loss.item()),
+                            "contour_loss": float(contour_loss.item()),
+                            "lr_dora": float(lr_map.get("dora", stage.lr_dora)),
+                            "lr_new_modules": float(lr_map.get("new_modules", stage.lr_new_modules)),
+                            "grad_norm": grad_norm_value,
+                            "grad_norm_groups": grad_norms,
+                            "grad_alerts": grad_alert_messages,
+                            "batch_size": len(batch),
+                            "max_sequence_length": stage.max_sequence_length,
+                            "non_finite_loss": non_finite_loss,
+                            "non_finite_grad": non_finite_grad,
+                            "bf16_enabled": bf16_enabled,
+                            "validation": validation_result,
+                        }
+                        step_writer.write(json.dumps(record) + "\n")
+                        step_writer.flush()
+
+                timer.micro_batch_done()
+                timer.flush(
+                    global_step=global_step,
+                    stage_name=stage.stage_name,
+                    validation_ms=_validation_ms,
+                    checkpoint_ms=_checkpoint_ms,
+                )
 
             # Save a final checkpoint at the end of the stage so the very last
             # optimizer steps (between the last periodic checkpoint and the loop
@@ -1671,6 +1844,7 @@ def run_execute_mode(
     finally:
         if step_writer is not None:
             step_writer.close()
+        timer.close()
 
     return {
         "mode": "execute",
@@ -1849,6 +2023,26 @@ def parse_args() -> argparse.Namespace:
             "are never pruned."
         ),
     )
+    parser.add_argument(
+        "--profile-step-timing",
+        action="store_true",
+        help="Emit per-optimizer-step phase timings (CPU sample/encode/augment/h2d/log_io + GPU forward/backward/grad_diag/optimizer) to a JSONL.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        default=None,
+        help="Path for the per-step profile JSONL (default: logs/profile_step_timing.jsonl). Only used when --profile-step-timing is set.",
+    )
+    parser.add_argument(
+        "--stage-b-radio-pool-to-stride32",
+        action="store_true",
+        help=(
+            "When using stage_b_encoder=radio_h, apply 2x2 average pooling on the "
+            "encoder output to emulate stride-32 grids (4x fewer spatial tokens). "
+            "Cuts decoder cross-attention cost; trades some dense-feature precision."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1913,6 +2107,13 @@ def main() -> None:
             ),
             stage_b_encoder=args.stage_b_encoder,
             keep_last_checkpoints=max(0, int(args.keep_last_checkpoints)),
+            profile_step_timing=bool(args.profile_step_timing),
+            profile_output_path=(
+                args.profile_output
+                if args.profile_output is not None
+                else (project_root / "logs" / "profile_step_timing.jsonl")
+            ),
+            stage_b_radio_pool_to_stride32=bool(args.stage_b_radio_pool_to_stride32),
         )
     else:
         summary = run_dry_mode(stages=stages, grouped_entries=grouped)
@@ -1924,3 +2125,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

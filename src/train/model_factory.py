@@ -34,6 +34,11 @@ class ModelFactoryConfig:
     # Encoder selector: 'davit' uses the timm DaViT backbone;
     # 'radio_h' uses C-RADIOv4-H (~700M params).
     stage_b_encoder: str = "davit"
+    # Optional 2x2 avg-pool on the RADIO encoder output (/16 -> /32 grid).
+    # Only consulted when stage_b_encoder == 'radio_h'. Cuts cross-attention
+    # cost ~4x; trades dense-feature precision for throughput. False = full
+    # /16 grid (current default).
+    stage_b_radio_pool_to_stride32: bool = False
 
 
 def list_radio_dora_target_modules() -> list[str]:
@@ -95,6 +100,7 @@ def build_stage_b_components(config: Optional[ModelFactoryConfig] = None) -> Dic
             decoder_heads=cfg.stage_b_decoder_heads,
             vocab_size=cfg.stage_b_vocab_size,
             max_decode_len=cfg.stage_b_max_decode_length,
+            pool_to_stride32=bool(cfg.stage_b_radio_pool_to_stride32),
         )
         model = RadioStageB(radio_config)
         # DoRA rank is used downstream by _prepare_model_for_dora.
@@ -212,6 +218,10 @@ def model_factory_config_from_checkpoint_payload(
         cfg_encoder = raw_cfg.get("encoder")
         if cfg_encoder is None:
             cfg_encoder = detected_encoder if detected_encoder is not None else base.stage_b_encoder
+        # RADIO /32-pool flag is recorded in the saved RadioStageBConfig dict
+        # (since the dataclass has a pool_to_stride32 field, asdict() captures it).
+        # If the checkpoint doesn't carry it, fall back to the base default.
+        cfg_radio_pool = bool(raw_cfg.get("pool_to_stride32", base.stage_b_radio_pool_to_stride32))
         return ModelFactoryConfig(
             stage_a_weights_path=base.stage_a_weights_path,
             stage_a_confidence_threshold=base.stage_a_confidence_threshold,
@@ -224,6 +234,7 @@ def model_factory_config_from_checkpoint_payload(
             stage_b_decoder_heads=int(raw_cfg.get("decoder_heads", base.stage_b_decoder_heads)),
             stage_b_dora_rank=cfg_dora_rank,
             stage_b_encoder=str(cfg_encoder),
+            stage_b_radio_pool_to_stride32=cfg_radio_pool,
         )
 
     # Legacy checkpoint fallback: infer architecture from tensor shapes when metadata is unavailable.
@@ -287,6 +298,7 @@ def model_factory_config_from_checkpoint_payload(
         stage_b_decoder_heads=max(1, int(inferred_decoder_heads)),
         stage_b_dora_rank=inferred_dora_rank,
         stage_b_encoder=detected_encoder if detected_encoder is not None else base.stage_b_encoder,
+        stage_b_radio_pool_to_stride32=base.stage_b_radio_pool_to_stride32,
     )
 
 
@@ -304,3 +316,4 @@ def run_stage_b_forward_smoke(
         image_height=image_height,
         image_width=image_width,
     )
+

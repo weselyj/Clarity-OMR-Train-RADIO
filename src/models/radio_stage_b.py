@@ -91,6 +91,13 @@ class RadioStageBConfig:
     # informational; actual dropout is hardcoded in DecoderBlock upstream
     dropout: float = 0.1
     contour_classes: int = 3
+    # Optional 2x2 average pool on the encoder output (/16 -> /32 grid).
+    # Cuts spatial tokens 4x; reduces decoder cross-attention cost. RADIO
+    # produces /16 features by default; DaViT was /32. Pool=True emulates
+    # DaViT's grid resolution. Trades dense-feature precision (thin staff
+    # lines, accidentals) for throughput. Default False preserves
+    # max-quality behavior; turn on for memory-constrained runs.
+    pool_to_stride32: bool = False
 
 
 class RadioStageB(nn.Module):
@@ -133,6 +140,10 @@ class RadioStageB(nn.Module):
         if images.size(1) == 1:
             images = images.repeat(1, 3, 1, 1)
         feature_map = self.encoder(images)  # (B, 1280, H/16, W/16)
+        if self.config.pool_to_stride32:
+            # /16 -> /32 grid: 4x fewer spatial tokens for the deformable
+            # block + bridge + decoder cross-attention.
+            feature_map = F.avg_pool2d(feature_map, kernel_size=2, stride=2)
         batch, channels, height, width = feature_map.shape
         sequence = feature_map.flatten(2).transpose(1, 2)
         sequence = self.deformable_attention(sequence, height, width)
@@ -206,6 +217,7 @@ def build_radio_stage_b(
     max_decode_len: int = 512,
     dropout: float = 0.1,
     contour_classes: int = 3,
+    pool_to_stride32: bool = False,
     **kwargs: object,
 ) -> RadioStageB:
     """Construct ``RadioStageB`` with the plan-aligned default dimensions.
@@ -228,5 +240,7 @@ def build_radio_stage_b(
         max_decode_len=max_decode_len,
         dropout=dropout,
         contour_classes=contour_classes,
+        pool_to_stride32=pool_to_stride32,
     )
     return RadioStageB(config)
+
