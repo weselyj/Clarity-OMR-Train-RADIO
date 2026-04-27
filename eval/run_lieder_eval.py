@@ -24,6 +24,7 @@ import csv
 import json
 import statistics
 import sys
+import threading
 from pathlib import Path
 
 # Insert repo root so imports work regardless of cwd
@@ -49,6 +50,45 @@ STAGE_A_YOLO = Path.home() / "Clarity-OMR" / "info" / "yolo.pt"
 # applies _prepare_model_for_dora before load_state_dict, so our trained
 # checkpoint loads via --stage-b-checkpoint with no further conversion.
 PDF_TO_MUSICXML_TIMEOUT_SEC = 1800  # 30-min cap per piece
+
+# Default wall-clock cap for compute_tedn (Zhang-Shasha TED is O(n^3) and can
+# take 15+ minutes on large polyphonic scores). Set to 0 to disable.
+TEDN_DEFAULT_TIMEOUT_SEC = 120
+
+
+def _compute_tedn_with_timeout(
+    reference_path: Path,
+    hypothesis_path: Path,
+    timeout_sec: int,
+) -> float | None:
+    """Run compute_tedn in a daemon thread; return None if it exceeds timeout_sec.
+
+    Uses a threading.Thread (not multiprocessing) to avoid the Windows spawn
+    issue where multiprocessing re-runs __main__ with the same argv.
+    The thread is daemonized so it will be reaped when the main process exits
+    even if it hasn't finished (no process leak).
+    """
+    if timeout_sec <= 0:
+        return compute_tedn(reference_path, hypothesis_path)
+
+    result: list = [None]   # mutable container
+    exc: list = [None]
+
+    def _worker():
+        try:
+            result[0] = compute_tedn(reference_path, hypothesis_path)
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        # Thread is still running — abandon it (daemon thread is reaped on exit)
+        return None
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
 
 
 def run_inference(
@@ -130,6 +170,14 @@ def main() -> None:
             "the full 146-piece corpus."
         ),
     )
+    p.add_argument(
+        "--tedn-timeout", type=int, default=TEDN_DEFAULT_TIMEOUT_SEC,
+        help=(
+            f"Wall-clock timeout in seconds for compute_tedn per piece "
+            f"(default {TEDN_DEFAULT_TIMEOUT_SEC}s). Zhang-Shasha TED is O(n^3) and can "
+            "take many minutes on large polyphonic scores. Set to 0 to disable."
+        ),
+    )
     args = p.parse_args()
 
     if not args.checkpoint.exists():
@@ -146,6 +194,10 @@ def main() -> None:
     print(f"Run name: {args.name}")
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Config: {args.config}")
+    if args.tedn_timeout > 0:
+        print(f"TEDn timeout: {args.tedn_timeout}s per piece")
+    else:
+        print("TEDn timeout: disabled (unbounded)")
     print()
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -218,7 +270,14 @@ def main() -> None:
             stage_d_cols = _read_stage_d_diag(pred)
             f1 = playback_f(pred=pred, gt=piece_abs)["f"]
             try:
-                tedn = compute_tedn(piece_abs, pred)
+                tedn = _compute_tedn_with_timeout(
+                    piece_abs, pred, timeout_sec=args.tedn_timeout
+                )
+                if tedn is None and args.tedn_timeout > 0:
+                    print(
+                        f"[{i}/{n_total}]   tedn TIMEOUT {piece.stem} "
+                        f"(>{args.tedn_timeout}s), recording None"
+                    )
             except Exception as te:
                 print(f"[{i}/{n_total}]   tedn WARN {piece.stem}: {te}")
                 tedn = None
@@ -259,7 +318,7 @@ def main() -> None:
     med_f1 = statistics.median(valid)
     min_f1 = min(valid)
     max_f1 = max(valid)
-    print(f"\n=== Lieder Eval Results ({args.name}) ===")
+    print(f"\n=== Lieder Eval Results ({args.name}) ====")
     print(f"Pieces evaluated: {len(valid)} / {n_total} (failed/skipped: {failed_count})")
     print(f"Mean onset-F1:   {mean_f1:.4f}")
     print(f"Median onset-F1: {med_f1:.4f}")
