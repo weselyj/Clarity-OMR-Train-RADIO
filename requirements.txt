@@ -33,7 +33,12 @@ music21
 lxml
 
 # Image processing
-Pillow
+# Pillow pinned to 12.1 — 12.2.0 introduces a ~2x cpu_encode regression
+# (image decode/resize) measured during the cu132 bench (Phase 3). The
+# regression is hidden by the DataLoader's worker prefetch on the default
+# --num-workers 4 path, but resurfaces with --num-workers 0 (Windows fallback).
+# See docs/perf/2026-04-27-cu132-rollout.md "follow-ups" section.
+Pillow~=12.1.0
 numpy
 scikit-image
 
