@@ -5,6 +5,7 @@ import torch
 import pytest
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_radio_module_loads():
     from src.models.radio_stage_b import build_radio_stage_b
     model = build_radio_stage_b(
@@ -17,6 +18,7 @@ def test_radio_module_loads():
     assert model is not None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_radio_forward_shapes():
     from src.models.radio_stage_b import build_radio_stage_b
     model = build_radio_stage_b(
