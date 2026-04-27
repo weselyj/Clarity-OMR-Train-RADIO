@@ -18,11 +18,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List
 
 
-def _load_loss_series(path: Path) -> List[float]:
-    losses: List[float] = []
+def _load_loss_series(path: Path) -> list[float]:
+    losses: list[float] = []
     text = path.read_text(encoding="utf-8")
     for line in text.splitlines():
         line = line.strip()
@@ -42,32 +41,40 @@ def compare_loss_trajectories(
     baseline_path: Path,
     candidate_path: Path,
     rel_tol: float = 0.05,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     """Compute the max step-wise relative difference between two loss series.
 
     Returns a dict with:
-        max_relative_diff:  max |c - b| / |b| over all step pairs (skipping b == 0)
-        regressed:          True when max_relative_diff > rel_tol
-        compared_steps:     number of step pairs actually compared
-        rel_tol:            the threshold used
-        reason:             only present when comparison was skipped (e.g., empty input)
+        max_relative_diff:        max |c - b| / |b| over evaluated pairs
+        regressed:                True when max_relative_diff > rel_tol
+        compared_steps:           number of step pairs actually evaluated
+                                  (excludes pairs skipped for b == 0.0)
+        skipped_zero_baseline:    pairs dropped because the baseline loss was 0.0
+        rel_tol:                  the threshold used
+        reason:                   None on success; a string describing why the
+                                  comparison was skipped (always present)
     """
     base = _load_loss_series(Path(baseline_path))
     cand = _load_loss_series(Path(candidate_path))
-    n = min(len(base), len(cand))
-    if n == 0:
+    n_paired = min(len(base), len(cand))
+    if n_paired == 0:
         return {
             "max_relative_diff": 0.0,
             "regressed": False,
             "compared_steps": 0,
+            "skipped_zero_baseline": 0,
             "rel_tol": rel_tol,
             "reason": "empty baseline or candidate",
         }
 
     max_rel = 0.0
-    for b, c in zip(base[:n], cand[:n]):
+    evaluated = 0
+    skipped_zero = 0
+    for b, c in zip(base[:n_paired], cand[:n_paired]):
         if b == 0.0:
-            continue  # division-by-zero guard
+            skipped_zero += 1
+            continue
+        evaluated += 1
         rel = abs(c - b) / abs(b)
         if rel > max_rel:
             max_rel = rel
@@ -75,8 +82,10 @@ def compare_loss_trajectories(
     return {
         "max_relative_diff": max_rel,
         "regressed": max_rel > rel_tol,
-        "compared_steps": n,
+        "compared_steps": evaluated,
+        "skipped_zero_baseline": skipped_zero,
         "rel_tol": rel_tol,
+        "reason": None,
     }
 
 

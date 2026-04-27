@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -97,11 +98,26 @@ def test_handles_zero_baseline_loss_safely(tmp_path: Path):
     # Step 1's baseline 0.0 is skipped; step 2 gives rel=0.05 which is within tol
     assert result["max_relative_diff"] == pytest.approx(0.05, abs=1e-9)
     assert result["regressed"] is False
+    # compared_steps reflects pairs actually evaluated (excludes the b==0 skip)
+    assert result["compared_steps"] == 1
+    assert result["skipped_zero_baseline"] == 1
+
+
+def test_reason_key_always_present(tmp_path: Path):
+    """The 'reason' key is in the result dict on both success and skipped paths."""
+    log_a = tmp_path / "a.jsonl"
+    log_b = tmp_path / "b.jsonl"
+    rows = [{"global_step": i, "loss": 1.0} for i in range(1, 6)]
+    log_a.write_text("\n".join(json.dumps(r) for r in rows))
+    log_b.write_text("\n".join(json.dumps(r) for r in rows))
+
+    result = compare_loss_trajectories(log_a, log_b, rel_tol=0.05)
+    assert "reason" in result
+    assert result["reason"] is None  # success-path sentinel
 
 
 def test_cli_returns_exit_one_on_regression(tmp_path: Path):
     """Invoking the CLI with --baseline/--candidate that diverge exits non-zero."""
-    import subprocess
     log_a = tmp_path / "a.jsonl"
     log_b = tmp_path / "b.jsonl"
     log_a.write_text(json.dumps({"global_step": 1, "loss": 1.0}) + "\n")
@@ -118,7 +134,7 @@ def test_cli_returns_exit_one_on_regression(tmp_path: Path):
 
 
 def test_cli_returns_exit_zero_on_no_regression(tmp_path: Path):
-    import subprocess
+    """Invoking the CLI on identical step-logs exits zero."""
     log_a = tmp_path / "a.jsonl"
     log_b = tmp_path / "b.jsonl"
     rows = [{"global_step": i, "loss": 1.0} for i in range(1, 11)]
