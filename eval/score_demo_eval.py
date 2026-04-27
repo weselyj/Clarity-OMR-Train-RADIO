@@ -7,10 +7,16 @@ Two-pass design:
   computation so each piece's music21/zss memory is fully reclaimed after the
   subprocess exits. The parent process stays small throughout.
 
-Each piece is scored in a fresh child process (eval._score_one_piece) that
-reads the predicted XML + reference MXL, computes the requested metrics, and
-prints a JSON line to stdout. The parent collects those lines into the final
-CSV.
+Each piece is scored in up to TWO fresh child processes (eval._score_one_piece):
+
+  1. Cheap pair (onset_f1 + linearized_ser): 60 s timeout. These metrics finish
+     in <2 s even for large scores (<=43 MB data) and are always attempted first.
+  2. Tedn-only: 300 s timeout.  May time out for very large scores (Clair de
+     Lune peaks >37 GB); when it does the cheap metrics are still recovered.
+
+If only cheap metrics were requested (or only tedn), a single subprocess is
+used.  The split only activates when the requested set includes both tedn and
+at least one cheap metric.
 
 Usage:
     venv-cu132\\Scripts\\python -m eval.score_demo_eval \\
@@ -31,13 +37,22 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
-# Path to our venv's Python — same one that ran inference
+# Path to our venv's Python -- same one that ran inference
 VENV_PYTHON = Path(__file__).resolve().parents[1] / "venv-cu132" / "Scripts" / "python.exe"
 
-# Per-piece subprocess timeout: 5 minutes is generous even for large scores
-SCORE_TIMEOUT_SEC = 300
+# Timeout for the cheap-pair subprocess (onset_f1 + linearized_ser)
+CHEAP_TIMEOUT_SEC = 60
 
-# Canonical demo stems — must match run_clarity_demo_eval.py
+# Timeout for tedn (may OOM/hang on very large scores like Clair de Lune)
+TEDN_TIMEOUT_SEC = 300
+
+# Backward-compat alias
+SCORE_TIMEOUT_SEC = TEDN_TIMEOUT_SEC
+
+# Metrics considered "cheap" -- fast and low-memory
+CHEAP_METRICS = frozenset({"onset_f1", "linearized_ser"})
+
+# Canonical demo stems -- must match run_clarity_demo_eval.py
 DEMO_STEMS = [
     "clair-de-lune-debussy",
     "fugue-no-2-bwv-847-in-c-minor",
@@ -76,19 +91,17 @@ def _read_stage_d_diag(pred_path: Path) -> tuple:
         return (None, None, None, None, None, None, None, None)
 
 
-def score_piece_subprocess(
-    stem: str,
+def _run_subprocess(
     pred_path: Path,
     ref_path: Path,
     metrics: list[str],
+    timeout: int,
 ) -> dict:
-    """Run eval._score_one_piece in a subprocess; return parsed JSON dict.
+    """Run eval._score_one_piece in a subprocess and return the parsed JSON dict.
 
-    On success: returns dict with keys onset_f1, tedn, linearized_ser (any
-    metric not in `metrics` list will be None).
-
-    On failure (timeout, crash, bad JSON): returns dict with all metric keys
-    set to None and 'error' key set to a short description string.
+    On success: returns dict with metric keys populated.
+    On failure (timeout, crash, bad JSON): returns dict with 'error' key set to
+    a short description string.
     """
     cmd = [
         str(VENV_PYTHON), "-m", "eval._score_one_piece",
@@ -102,24 +115,85 @@ def score_piece_subprocess(
             cmd,
             capture_output=True,
             text=True,
-            timeout=SCORE_TIMEOUT_SEC,
+            timeout=timeout,
             cwd=str(repo_root),
         )
         if result.returncode != 0:
             stderr_snippet = (result.stderr or "")[-500:].strip()
             return {"error": f"subprocess exit {result.returncode}: {stderr_snippet}"}
         # Last non-empty line of stdout should be the JSON payload
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
             return {"error": "subprocess produced no output"}
         payload = json.loads(lines[-1])
         return payload
     except subprocess.TimeoutExpired:
-        return {"error": f"subprocess timeout after {SCORE_TIMEOUT_SEC}s"}
+        return {"error": f"subprocess timeout after {timeout}s"}
     except json.JSONDecodeError as e:
         return {"error": f"JSON decode error: {e}"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def score_piece_subprocess(
+    stem: str,
+    pred_path: Path,
+    ref_path: Path,
+    metrics: list[str],
+) -> dict:
+    """Score one piece, splitting cheap and tedn metrics into separate subprocesses.
+
+    When *metrics* contains both tedn and at least one cheap metric
+    (onset_f1 / linearized_ser), two subprocess calls are made:
+
+      1. Cheap pair (onset_f1 + linearized_ser present in *metrics*) with a
+         60 s timeout.
+      2. Tedn-only with a 300 s timeout.
+
+    The results are merged into a single dict.  Partial failures are surfaced in
+    the 'error' key with a prefix indicating which group failed, e.g.
+    "tedn: subprocess timeout after 300s".  If both groups fail the reasons are
+    joined with " | ".
+
+    When *metrics* is a strict subset of one group (e.g. only tedn, or only
+    onset_f1), a single subprocess call is used with the appropriate timeout.
+
+    Returns a dict with metric-value keys plus optionally an 'error' key
+    describing any failure(s).
+    """
+    cheap_requested = [m for m in metrics if m in CHEAP_METRICS]
+    tedn_requested = [m for m in metrics if m == "tedn"]
+
+    # Decide whether to split into two calls
+    need_split = bool(cheap_requested) and bool(tedn_requested)
+
+    if not need_split:
+        # Single call -- use appropriate timeout
+        timeout = CHEAP_TIMEOUT_SEC if not tedn_requested else TEDN_TIMEOUT_SEC
+        return _run_subprocess(pred_path, ref_path, metrics, timeout)
+
+    # --- Split path: two subprocess calls ---
+    combined: dict = {}
+    failure_parts: list[str] = []
+
+    # 1. Cheap pair
+    cheap_result = _run_subprocess(pred_path, ref_path, cheap_requested, CHEAP_TIMEOUT_SEC)
+    if "error" in cheap_result:
+        failure_parts.append(f"cheap-pair: {cheap_result['error']}")
+    else:
+        combined.update({k: v for k, v in cheap_result.items() if k != "error"})
+
+    # 2. Tedn-only
+    tedn_result = _run_subprocess(pred_path, ref_path, tedn_requested, TEDN_TIMEOUT_SEC)
+    if "error" in tedn_result:
+        failure_parts.append(f"tedn: {tedn_result['error']}")
+    else:
+        combined.update({k: v for k, v in tedn_result.items() if k != "error"})
+
+    if failure_parts:
+        combined["error"] = " | ".join(failure_parts)
+
+    return combined
 
 
 def main() -> None:
@@ -157,11 +231,21 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"FATAL: unknown metrics: {unknown}. Valid: {valid_metrics}")
 
+    cheap_requested = [m for m in metrics if m in CHEAP_METRICS]
+    tedn_requested = [m for m in metrics if m == "tedn"]
+    splitting = bool(cheap_requested) and bool(tedn_requested)
+
     print(f"Run name:        {args.name}")
     print(f"Predictions dir: {args.predictions_dir}")
     print(f"Reference dir:   {args.reference_dir}")
     print(f"Metrics:         {metrics}")
     print(f"Pieces:          {len(DEMO_STEMS)}")
+    if splitting:
+        print(f"Scoring mode:    split (cheap={cheap_requested} @{CHEAP_TIMEOUT_SEC}s,"
+              f" tedn @{TEDN_TIMEOUT_SEC}s)")
+    else:
+        timeout = CHEAP_TIMEOUT_SEC if not tedn_requested else TEDN_TIMEOUT_SEC
+        print(f"Scoring mode:    single subprocess @{timeout}s")
     print()
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -186,8 +270,10 @@ def main() -> None:
         # Stage D diagnostics are read in-process (fast JSON read, no music21)
         stage_d_cols = _read_stage_d_diag(pred)
 
-        # Metric scoring runs in a subprocess — OS reclaims all music21/zss memory
+        # Metric scoring runs in subprocess(es) -- OS reclaims all music21/zss memory
         # when the child exits, preventing the 86 GB committed-memory OOM seen in v1.
+        # cheap metrics and tedn are split into separate calls so a tedn timeout
+        # does not discard already-computed onset_f1 / linearized_ser values.
         payload = score_piece_subprocess(stem, pred, ref, metrics)
 
         failure_reason = payload.get("error", None)
@@ -197,12 +283,14 @@ def main() -> None:
 
         rows.append((stem, f1, tedn, lin_ser) + stage_d_cols + (failure_reason,))
 
+        tedn_str = f"{tedn:.4f}" if tedn is not None else "N/A"
+        lin_str = f"{lin_ser:.4f}" if lin_ser is not None else "N/A"
+        f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
         if failure_reason:
-            print(f"[{i}/{n_total}] FAIL {stem}: {failure_reason}")
+            # Partial success: some metrics may still be populated
+            print(f"[{i}/{n_total}] PARTIAL/FAIL {stem}: {failure_reason}")
+            print(f"             onset_f1={f1_str}  tedn={tedn_str}  lin_ser={lin_str}")
         else:
-            tedn_str = f"{tedn:.4f}" if tedn is not None else "N/A"
-            lin_str = f"{lin_ser:.4f}" if lin_ser is not None else "N/A"
-            f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
             print(f"[{i}/{n_total}] {stem}: onset_f1={f1_str}  tedn={tedn_str}  lin_ser={lin_str}")
 
     csv_path = (repo_root / "eval/results" / f"clarity_demo_{args.name}.csv").resolve()
