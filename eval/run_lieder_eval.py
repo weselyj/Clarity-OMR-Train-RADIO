@@ -122,6 +122,14 @@ def main() -> None:
         "--limit", type=int, default=None,
         help="Optional cap on number of pieces (for smoke runs)",
     )
+    p.add_argument(
+        "--max-pieces", type=int, default=None,
+        help=(
+            "Truncate the eval corpus to the first N pieces. Default None = run all. "
+            "Useful for matching Stage 1's 20-piece baseline or fast smoke runs against "
+            "the full 146-piece corpus."
+        ),
+    )
     args = p.parse_args()
 
     if not args.checkpoint.exists():
@@ -150,6 +158,10 @@ def main() -> None:
     if args.limit is not None:
         eval_pieces = eval_pieces[: args.limit]
         print(f"--limit {args.limit}: running on first {len(eval_pieces)} pieces only")
+    if args.max_pieces is not None:
+        full_pieces = eval_pieces
+        eval_pieces = eval_pieces[: args.max_pieces]
+        print(f"Truncating to first {args.max_pieces} pieces of {len(full_pieces)}")
     n_total = len(eval_pieces)
     # Each row: (piece, onset_f1, tedn, lin_ser,
     #            stage_d_skipped_notes, stage_d_skipped_chords,
