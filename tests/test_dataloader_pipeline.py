@@ -650,3 +650,23 @@ def test_pin_memory_non_blocking_h2d(tmp_path):
     images = batch["images"].to(device, non_blocking=True)
     torch.cuda.synchronize()
     assert images.device.type == "cuda"
+
+
+# ---------------------------------------------------------------------------
+# CLI flags tests
+# ---------------------------------------------------------------------------
+
+
+def test_cli_flags_num_workers_and_prefetch_factor_in_help():
+    """Both --num-workers and --prefetch-factor must appear in argparse help."""
+    import subprocess, sys
+
+    result = subprocess.run(
+        [sys.executable, "src/train/train.py", "--help"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+    )
+    help_text = result.stdout + result.stderr
+    assert "--num-workers" in help_text, "--num-workers flag not found in help"
+    assert "--prefetch-factor" in help_text, "--prefetch-factor flag not found in help"
