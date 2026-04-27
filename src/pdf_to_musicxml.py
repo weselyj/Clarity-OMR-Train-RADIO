@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -16,7 +17,14 @@ from src.cli import run_assemble, run_export
 from src.manual_page_cropper import crop_pages_with_editor
 from src.eval.evaluate_stage_b_checkpoint import _run_stage_b_inference_with_progress
 from src.models.yolo_stage_a import YoloStageA, YoloStageAConfig
-from src.pipeline.export_musicxml import _write_musicxml_safe, assembled_score_to_music21, load_assembled_score, validate_musicxml_roundtrip
+from src.pipeline.export_musicxml import (
+    StageDExportDiagnostics,
+    _write_musicxml_safe,
+    assembled_score_to_music21,
+    assembled_score_to_music21_with_diagnostics,
+    load_assembled_score,
+    validate_musicxml_roundtrip,
+)
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, object]]) -> None:
@@ -221,6 +229,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail if MusicXML does not pass XSD validation (default: write best-effort output).",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help=(
+            "Stage D strict mode: re-raise any export exception instead of recording it "
+            "in diagnostics and continuing (default: False — lenient, diagnostics are written "
+            "to <output-musicxml>.diagnostics.json)."
+        ),
+    )
     return parser
 
 
@@ -374,31 +392,88 @@ def main() -> None:
             output_assembly=assembly_manifest,
         )
     )
+
+    # ------------------------------------------------------------------
+    # Stage D: MusicXML export with diagnostics
+    # ------------------------------------------------------------------
+    strict_stage_d = bool(getattr(args, "strict", False))
+    diag = StageDExportDiagnostics()
+    export_result: Dict[str, object]
+
     try:
-        export_result = run_export(
-            argparse.Namespace(
-                assembly_manifest=assembly_manifest,
-                output_musicxml=output_musicxml,
-            )
-        )
-    except (ValueError, KeyError) as exc:
-        if bool(args.strict_export) and isinstance(exc, ValueError):
-            raise
-        # Best-effort fallback: write MusicXML even if schema validation or voice consistency fails.
         assembled = load_assembled_score(assembly_manifest)
-        music_score = assembled_score_to_music21(assembled)
         output_musicxml.parent.mkdir(parents=True, exist_ok=True)
+        music_score = assembled_score_to_music21_with_diagnostics(
+            assembled, diag, strict=strict_stage_d
+        )
         _write_musicxml_safe(music_score, output_musicxml)
         try:
             validation = validate_musicxml_roundtrip(music_score)
-        except (KeyError, Exception):
-            validation = {"schema_valid": False, "best_effort_validation_skipped": True}
+        except (KeyError, Exception) as val_exc:
+            if bool(args.strict_export):
+                raise
+            validation = {"schema_valid": False, "best_effort_validation_skipped": True, "warning": str(val_exc)}
+        if bool(args.strict_export) and not bool(validation.get("schema_valid", False)):
+            preview = validation.get("schema_errors_preview") or []
+            detail = preview[0] if preview else "unknown schema validation error"
+            raise ValueError(f"Generated MusicXML failed XSD validation: {detail}")
+        export_result = {
+            **validation,
+            "output_path": str(output_musicxml),
+        }
+    except Exception as exc:
+        if strict_stage_d:
+            raise
+        # Lenient fallback: write whatever music21 produced (may be empty/partial).
+        diag.raised_during_part_append.append(
+            {
+                "part_id": "__export__",
+                "span": str(assembly_manifest),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+        )
+        # Try a plain best-effort write in case music_score exists.
+        try:
+            assembled = load_assembled_score(assembly_manifest)
+            music_score = assembled_score_to_music21(assembled)
+            output_musicxml.parent.mkdir(parents=True, exist_ok=True)
+            _write_musicxml_safe(music_score, output_musicxml)
+            try:
+                validation = validate_musicxml_roundtrip(music_score)
+            except Exception:
+                validation = {"schema_valid": False, "best_effort_validation_skipped": True}
+        except Exception:
+            validation = {"schema_valid": False, "best_effort_fallback_failed": True}
         export_result = {
             **validation,
             "output_path": str(output_musicxml),
             "best_effort": True,
             "warning": str(exc),
         }
+
+    # Emit diagnostics to a sidecar JSON file.
+    diag_dict = dataclasses.asdict(diag)
+    diag_path = output_musicxml.with_suffix(output_musicxml.suffix + ".diagnostics.json")
+    try:
+        diag_path.parent.mkdir(parents=True, exist_ok=True)
+        diag_path.write_text(json.dumps(diag_dict, indent=2), encoding="utf-8")
+        export_result["diagnostics_path"] = str(diag_path)
+    except Exception:
+        pass  # best-effort: don't let diagnostics write failure sink the run
+
+    # Print one-line stderr summary.
+    diag_summary = (
+        f"[stage_d] export-diagnostics: "
+        f"skipped_notes={diag.skipped_notes} "
+        f"skipped_chords={diag.skipped_chords} "
+        f"missing_durations={diag.missing_durations} "
+        f"malformed_spans={diag.malformed_spans} "
+        f"unknown_tokens={diag.unknown_tokens} "
+        f"fallback_rests={diag.fallback_rests} "
+        f"raised={len(diag.raised_during_part_append)}"
+    )
+    print(diag_summary, file=sys.stderr)
 
     result = {
         "pdf": str(pdf_path),
@@ -407,6 +482,7 @@ def main() -> None:
         "stage_b": stage_b_result,
         "assembly": assembly_result,
         "export": export_result,
+        "stage_d_diagnostics": diag_dict,
         "outputs": {
             "work_dir": str(work_dir),
             "stage_a_manifest": str(stage_a_manifest),
