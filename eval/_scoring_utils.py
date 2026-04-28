@@ -5,7 +5,8 @@ Imported by eval.score_demo_eval and eval.score_lieder_eval.  Contains:
   - CSV_HEADER              — canonical column list (piece + metrics + stage_d + failure)
   - _read_stage_d_diag()   — reads <pred>.diagnostics.json sidecar, returns 8-tuple
   - _run_subprocess()      — invokes eval._score_one_piece, returns parsed JSON dict
-  - score_piece_subprocess() — splits cheap / tedn into separate subprocesses
+  - score_metric_group_subprocess() — run ONE metric group in a fresh subprocess
+  - score_piece_subprocess() — thin sequential wrapper over score_metric_group_subprocess
   - _build_reference_index() — builds a dict[stem, Path] from a reference directory
   - _resolve_venv_python()   — cross-platform venv Python path detection
 
@@ -19,6 +20,8 @@ timeout or OOM does not discard already-computed onset_f1 / linearized_ser.
 import json
 import subprocess
 import sys
+import time
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -171,13 +174,31 @@ def _run_subprocess(
     metrics: list[str],
     timeout: int,
     *,
-    venv_python: Path | None = None,
+    venv_python: "Path | None" = None,
+    stderr_log: "Path | None" = None,
+    child_memory_limit_gb: float = 0.0,
 ) -> dict:
     """Run eval._score_one_piece in a subprocess and return the parsed JSON dict.
 
     On success: returns dict with metric keys populated.
     On failure (timeout, crash, bad JSON): returns dict with 'error' key set to
     a short description string.
+
+    Args:
+        pred_path: Path to the predicted MusicXML file.
+        ref_path: Path to the reference MXL file.
+        metrics: List of metric names to compute.
+        timeout: Subprocess timeout in seconds.
+        venv_python: Optional explicit Python interpreter path.
+        stderr_log: If set, stderr is redirected to this file path. On non-zero
+            return code, the last 8 KB of this file is read into the 'error' field.
+            If None, stderr is captured in-memory (legacy behavior).
+        child_memory_limit_gb: Linux-only: set RLIMIT_AS on the child process.
+            0 (default) disables the cap. Has no effect on non-Linux platforms.
+            CAVEAT: RLIMIT_AS caps virtual address space, not RSS. Some Python
+            and scientific libraries reserve more virtual memory than they actively
+            use, so this may need tuning. If it causes false failures, raise it
+            to 24 GB or disable with 0.
     """
     python = venv_python or _DEFAULT_VENV_PYTHON
     cmd = [
@@ -187,17 +208,53 @@ def _run_subprocess(
         "--metrics", ",".join(metrics),
     ]
     repo_root = Path(__file__).resolve().parents[1]
+
+    # Build preexec_fn for Linux memory cap
+    preexec_fn = None
+    if child_memory_limit_gb > 0 and sys.platform == "linux":
+        _cap_gb = child_memory_limit_gb
+
+        def _set_memory_limit():
+            import resource
+            max_bytes = int(_cap_gb * 1024 ** 3)
+            resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+
+        preexec_fn = _set_memory_limit
+
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(repo_root),
-        )
-        if result.returncode != 0:
-            stderr_snippet = (result.stderr or "")[-500:].strip()
-            return {"error": f"subprocess exit {result.returncode}: {stderr_snippet}"}
+        if stderr_log is not None:
+            stderr_log.parent.mkdir(parents=True, exist_ok=True)
+            with stderr_log.open("w", encoding="utf-8") as err_fh:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=err_fh,
+                    text=True,
+                    timeout=timeout,
+                    cwd=str(repo_root),
+                    preexec_fn=preexec_fn,
+                )
+            if result.returncode != 0:
+                # Read last 8 KB of stderr log for error message
+                try:
+                    raw = stderr_log.read_bytes()
+                    snippet = raw[-8192:].decode("utf-8", errors="replace").strip()
+                except Exception:
+                    snippet = "(could not read stderr log)"
+                return {"error": f"subprocess exit {result.returncode}: {snippet}"}
+        else:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(repo_root),
+                preexec_fn=preexec_fn,
+            )
+            if result.returncode != 0:
+                stderr_snippet = (result.stderr or "")[-500:].strip()
+                return {"error": f"subprocess exit {result.returncode}: {stderr_snippet}"}
+
         # Last non-empty line of stdout should be the JSON payload
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not lines:
@@ -212,17 +269,105 @@ def _run_subprocess(
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def score_metric_group_subprocess(
+    pred_path: Path,
+    ref_path: Path,
+    metrics: list[str],
+    timeout: int,
+    *,
+    venv_python: "Path | None" = None,
+    stderr_log: "Path | None" = None,
+    child_memory_limit_gb: float = 0.0,
+    instrumentation_log: "Path | None" = None,
+    stem: "str | None" = None,
+    group_name: "str | None" = None,
+) -> dict:
+    """Run ONE metric group in a fresh subprocess.
+
+    This is the lower-level dispatch primitive used by the two-lane scheduler.
+    Callers pass a specific group (e.g. ['onset_f1', 'linearized_ser'] or ['tedn'])
+    rather than the full metric list.
+
+    Args:
+        pred_path: Path to the predicted MusicXML file.
+        ref_path: Path to the reference MXL file.
+        metrics: Metric names for this group (e.g. ['onset_f1', 'linearized_ser'] or ['tedn']).
+        timeout: Subprocess timeout in seconds.
+        venv_python: Optional explicit Python interpreter path.
+        stderr_log: If set, stderr is redirected to this file. On failure, last 8 KB read.
+        child_memory_limit_gb: Linux-only RLIMIT_AS cap in GB. 0 = disabled.
+        instrumentation_log: If set, a JSONL line is appended with timing + return code.
+        stem: Piece stem name (for instrumentation log). Inferred from pred_path if None.
+        group_name: Group label for instrumentation log (e.g. 'cheap' or 'tedn').
+
+    Returns:
+        dict with metric-value keys, or {'error': '...'} on failure.
+    """
+    _stem = stem or pred_path.stem
+    _group = group_name or ("tedn" if metrics == ["tedn"] else "cheap")
+    start_time = time.monotonic()
+
+    result = _run_subprocess(
+        pred_path,
+        ref_path,
+        metrics,
+        timeout,
+        venv_python=venv_python,
+        stderr_log=stderr_log,
+        child_memory_limit_gb=child_memory_limit_gb,
+    )
+
+    end_time = time.monotonic()
+    duration = end_time - start_time
+    is_timeout = "error" in result and "timeout" in result.get("error", "")
+    return_code = 0 if "error" not in result else (
+        -1 if is_timeout else 1
+    )
+    stderr_size = 0
+    if stderr_log is not None and stderr_log.exists():
+        try:
+            stderr_size = stderr_log.stat().st_size
+        except Exception:
+            stderr_size = 0
+
+    if instrumentation_log is not None:
+        try:
+            instrumentation_log.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "piece": _stem,
+                "group": _group,
+                "start": start_time,
+                "end": end_time,
+                "duration_sec": round(duration, 3),
+                "return_code": return_code,
+                "timeout": is_timeout,
+                "stderr_size_bytes": stderr_size,
+            }
+            with instrumentation_log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except Exception:
+            pass  # Instrumentation failures must not abort scoring
+
+    return result
+
+
 def score_piece_subprocess(
     pred_path: Path,
     ref_path: Path,
     metrics: list[str],
     *,
-    venv_python: Path | None = None,
+    venv_python: "Path | None" = None,
     cheap_timeout: int = CHEAP_TIMEOUT_SEC,
     tedn_timeout: int = TEDN_TIMEOUT_SEC,
     parallel_metric_groups: bool = False,
+    stderr_dir: "Path | None" = None,
+    child_memory_limit_gb: float = 0.0,
+    instrumentation_log: "Path | None" = None,
 ) -> dict:
     """Score one piece, splitting cheap and tedn metrics into separate subprocesses.
+
+    Thin sequential wrapper around score_metric_group_subprocess. Preserved for
+    backward compatibility with callers that import it directly.
 
     When *metrics* contains both tedn and at least one cheap metric
     (onset_f1 / linearized_ser), two subprocess calls are made:
@@ -257,6 +402,10 @@ def score_piece_subprocess(
             When combined with --jobs N, total RAM is approximately:
               parent_ram + jobs * 2 * per_subprocess_peak_ram
             Do not enable unless memory headroom is confirmed. Default is False.
+        stderr_dir: If set, per-group stderr is redirected to files under this
+            directory: <stem>_cheap.stderr.log and <stem>_tedn.stderr.log.
+        child_memory_limit_gb: Linux-only RLIMIT_AS cap in GB. 0 = disabled.
+        instrumentation_log: If set, timing records are appended as JSONL.
 
     Returns a dict with metric-value keys plus optionally an 'error' key
     describing any failure(s).
@@ -267,10 +416,32 @@ def score_piece_subprocess(
     # Decide whether to split into two calls
     need_split = bool(cheap_requested) and bool(tedn_requested)
 
+    stem = pred_path.stem
+
+    def _cheap_stderr_log():
+        if stderr_dir is not None:
+            return stderr_dir / f"{stem}_cheap.stderr.log"
+        return None
+
+    def _tedn_stderr_log():
+        if stderr_dir is not None:
+            return stderr_dir / f"{stem}_tedn.stderr.log"
+        return None
+
     if not need_split:
         # Single call -- use appropriate timeout
         timeout = cheap_timeout if not tedn_requested else tedn_timeout
-        return _run_subprocess(pred_path, ref_path, metrics, timeout, venv_python=venv_python)
+        g_name = "tedn" if tedn_requested else "cheap"
+        sl = _tedn_stderr_log() if tedn_requested else _cheap_stderr_log()
+        return score_metric_group_subprocess(
+            pred_path, ref_path, metrics, timeout,
+            venv_python=venv_python,
+            stderr_log=sl,
+            child_memory_limit_gb=child_memory_limit_gb,
+            instrumentation_log=instrumentation_log,
+            stem=stem,
+            group_name=g_name,
+        )
 
     # --- Split path: two subprocess calls ---
     if parallel_metric_groups:
@@ -282,13 +453,25 @@ def score_piece_subprocess(
         failure_parts: list[str] = []
 
         def _run_cheap():
-            return "cheap", _run_subprocess(
-                pred_path, ref_path, cheap_requested, cheap_timeout, venv_python=venv_python
+            return "cheap", score_metric_group_subprocess(
+                pred_path, ref_path, cheap_requested, cheap_timeout,
+                venv_python=venv_python,
+                stderr_log=_cheap_stderr_log(),
+                child_memory_limit_gb=child_memory_limit_gb,
+                instrumentation_log=instrumentation_log,
+                stem=stem,
+                group_name="cheap",
             )
 
         def _run_tedn():
-            return "tedn", _run_subprocess(
-                pred_path, ref_path, tedn_requested, tedn_timeout, venv_python=venv_python
+            return "tedn", score_metric_group_subprocess(
+                pred_path, ref_path, tedn_requested, tedn_timeout,
+                venv_python=venv_python,
+                stderr_log=_tedn_stderr_log(),
+                child_memory_limit_gb=child_memory_limit_gb,
+                instrumentation_log=instrumentation_log,
+                stem=stem,
+                group_name="tedn",
             )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -309,8 +492,14 @@ def score_piece_subprocess(
     failure_parts_seq: list[str] = []
 
     # 1. Cheap pair
-    cheap_result = _run_subprocess(
-        pred_path, ref_path, cheap_requested, cheap_timeout, venv_python=venv_python
+    cheap_result = score_metric_group_subprocess(
+        pred_path, ref_path, cheap_requested, cheap_timeout,
+        venv_python=venv_python,
+        stderr_log=_cheap_stderr_log(),
+        child_memory_limit_gb=child_memory_limit_gb,
+        instrumentation_log=instrumentation_log,
+        stem=stem,
+        group_name="cheap",
     )
     if "error" in cheap_result:
         failure_parts_seq.append(f"cheap-pair: {cheap_result['error']}")
@@ -318,8 +507,14 @@ def score_piece_subprocess(
         combined_seq.update({k: v for k, v in cheap_result.items() if k != "error"})
 
     # 2. Tedn-only
-    tedn_result = _run_subprocess(
-        pred_path, ref_path, tedn_requested, tedn_timeout, venv_python=venv_python
+    tedn_result = score_metric_group_subprocess(
+        pred_path, ref_path, tedn_requested, tedn_timeout,
+        venv_python=venv_python,
+        stderr_log=_tedn_stderr_log(),
+        child_memory_limit_gb=child_memory_limit_gb,
+        instrumentation_log=instrumentation_log,
+        stem=stem,
+        group_name="tedn",
     )
     if "error" in tedn_result:
         failure_parts_seq.append(f"tedn: {tedn_result['error']}")
