@@ -50,3 +50,4 @@ PyYAML
 # verovio
 # cairosvg
 zss  # Zhang-Shasha tree edit distance (used by eval/tedn.py)
+psutil  # System memory polling for adaptive TEDN throttle (eval/score_*_eval.py)

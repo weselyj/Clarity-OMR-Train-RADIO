@@ -2,7 +2,11 @@
 
 Verifies module imports, CLI help, and the new behaviors introduced in the
 performance review (2026-04-28):
-  - --jobs 1 and --jobs 2 produce the same deterministic CSV order
+  - --cheap-jobs / --tedn-jobs / --max-active-pieces two-lane scheduler
+  - --write-order completion adds 'index' column
+  - --jobs N backward-compat alias maps correctly + prints deprecation warning
+  - --memory-limit-gb throttle
+  - --jobs 1 and --jobs 2 produce the same logical results
   - Missing reference produces a "missing reference" row (not "scoring failure")
   - Metric-aware summary prints per-metric counts
   - --resume skips already-scored pieces
@@ -15,7 +19,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -36,6 +40,70 @@ def _fake_score_payload(metrics: list[str]) -> dict:
     if "linearized_ser" in metrics:
         result["linearized_ser"] = 0.91
     return result
+
+
+def _fake_metric_group_payload(metrics: list[str]) -> dict:
+    return _fake_score_payload(metrics)
+
+
+def _run_demo_with_mock(
+    tmp_path: Path,
+    extra_argv: list[str] = None,
+    output_subdir: str = "out",
+    metrics: list[str] = None,
+) -> "tuple[Path, list[dict]]":
+    """Run score_demo_eval.main() with mocked score_metric_group_subprocess."""
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+    import eval.score_demo_eval as demo_mod
+
+    pred_dir = tmp_path / "preds"
+    ref_dir = tmp_path / "refs"
+    output_dir = tmp_path / output_subdir
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    run_metrics = metrics or ["onset_f1", "linearized_ser"]
+
+    for stem in demo_mod.DEMO_STEMS:
+        (pred_dir / f"{stem}.musicxml").write_text("<xml/>")
+        (ref_dir / f"{stem}.mxl").write_text("MXL")
+
+    def fake_score_group(pred_path, ref_path, m, timeout, *, venv_python=None,
+                         stderr_log=None, child_memory_limit_gb=0.0,
+                         instrumentation_log=None, stem=None, group_name=None):
+        return _fake_metric_group_payload(m)
+
+    base_argv = [
+        "score_demo_eval",
+        "--predictions-dir", str(pred_dir),
+        "--reference-dir", str(ref_dir),
+        "--name", "testrun",
+        "--metrics", ",".join(run_metrics),
+        "--output-dir", str(output_dir),
+    ]
+    if extra_argv:
+        base_argv.extend(extra_argv)
+
+    with patch("eval.score_demo_eval.score_metric_group_subprocess", side_effect=fake_score_group), \
+         patch("eval.score_demo_eval._resolve_venv_python", return_value=Path(sys.executable)):
+        old_argv = sys.argv
+        sys.argv = base_argv
+        try:
+            demo_mod.main()
+        except SystemExit:
+            pass
+        finally:
+            sys.argv = old_argv
+
+    csv_path = output_dir / "clarity_demo_testrun.csv"
+    rows = []
+    if csv_path.exists():
+        with csv_path.open() as fh:
+            reader = csv.DictReader(fh)
+            rows = list(reader)
+    return csv_path, rows
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +127,12 @@ class TestDemoImports:
         )
         assert result.returncode == 0, f"--help failed:\n{result.stderr}"
         assert "--jobs" in result.stdout
+        assert "--cheap-jobs" in result.stdout
+        assert "--tedn-jobs" in result.stdout
+        assert "--max-active-pieces" in result.stdout
+        assert "--write-order" in result.stdout
+        assert "--memory-limit-gb" in result.stdout
+        assert "--child-memory-limit-gb" in result.stdout
         assert "--resume" in result.stdout
         assert "--output-dir" in result.stdout
         assert "--python" in result.stdout
@@ -70,17 +144,103 @@ class TestDemoImports:
 # ---------------------------------------------------------------------------
 
 class TestDemoJobsDeterministicOrder:
-    def _run_with_mocked_scoring(
-        self, tmp_path: Path, jobs: int, metrics: list[str]
-    ) -> list[str]:
+    def test_jobs1_and_jobs2_same_order(self, tmp_path):
         if str(_REPO_ROOT) not in sys.path:
             sys.path.insert(0, str(_REPO_ROOT))
         import eval.score_demo_eval as demo_mod
 
-        # Create fake predictions and refs for all 4 DEMO_STEMS
-        pred_dir = tmp_path / f"preds_{jobs}"
-        ref_dir = tmp_path / f"refs_{jobs}"
-        output_dir = tmp_path / f"out_{jobs}"
+        metrics = ["onset_f1", "linearized_ser"]
+
+        _, rows_j1 = _run_demo_with_mock(
+            tmp_path / "j1",
+            extra_argv=["--jobs", "1", "--write-order", "deterministic"],
+            metrics=metrics,
+        )
+        _, rows_j2 = _run_demo_with_mock(
+            tmp_path / "j2",
+            extra_argv=["--jobs", "2", "--write-order", "deterministic"],
+            metrics=metrics,
+        )
+
+        order_j1 = [r["piece"] for r in rows_j1]
+        order_j2 = [r["piece"] for r in rows_j2]
+        expected = demo_mod.DEMO_STEMS
+
+        assert order_j1 == expected, f"jobs=1 order wrong: {order_j1}"
+        assert order_j2 == expected, f"jobs=2 order wrong: {order_j2}"
+        assert order_j1 == order_j2
+
+
+# ---------------------------------------------------------------------------
+# Two-lane scheduler for demo
+# ---------------------------------------------------------------------------
+
+class TestDemoTwoLaneScheduler:
+    def test_cheap_jobs_4_tedn_jobs_2_same_results(self, tmp_path):
+        """--cheap-jobs 4 --tedn-jobs 2 produces same logical results as serial."""
+        metrics = ["onset_f1", "linearized_ser", "tedn"]
+
+        _, rows_serial = _run_demo_with_mock(
+            tmp_path / "serial",
+            extra_argv=["--cheap-jobs", "1", "--tedn-jobs", "1", "--max-active-pieces", "1",
+                        "--write-order", "deterministic"],
+            metrics=metrics,
+        )
+        _, rows_parallel = _run_demo_with_mock(
+            tmp_path / "parallel",
+            extra_argv=["--cheap-jobs", "4", "--tedn-jobs", "2", "--max-active-pieces", "4",
+                        "--write-order", "deterministic"],
+            metrics=metrics,
+        )
+
+        serial_by_piece = {r["piece"]: r for r in rows_serial}
+        for row in rows_parallel:
+            stem = row["piece"]
+            assert stem in serial_by_piece
+            assert row.get("onset_f1") == serial_by_piece[stem].get("onset_f1")
+            assert row.get("tedn") == serial_by_piece[stem].get("tedn")
+
+
+# ---------------------------------------------------------------------------
+# --write-order completion for demo
+# ---------------------------------------------------------------------------
+
+class TestDemoWriteOrderCompletion:
+    def test_completion_has_index_column(self, tmp_path):
+        """--write-order completion adds 'index' column."""
+        _, rows = _run_demo_with_mock(
+            tmp_path,
+            extra_argv=["--write-order", "completion"],
+            metrics=["onset_f1"],
+        )
+        assert len(rows) > 0
+        assert "index" in rows[0], f"Expected 'index' column, keys: {list(rows[0].keys())}"
+
+    def test_deterministic_no_index_column(self, tmp_path):
+        """--write-order deterministic does not add 'index' column."""
+        _, rows = _run_demo_with_mock(
+            tmp_path,
+            extra_argv=["--write-order", "deterministic"],
+            metrics=["onset_f1"],
+        )
+        assert len(rows) > 0
+        assert "index" not in rows[0]
+
+
+# ---------------------------------------------------------------------------
+# --jobs N legacy alias for demo
+# ---------------------------------------------------------------------------
+
+class TestDemoJobsLegacyAlias:
+    def test_jobs_4_deprecation_warning(self, tmp_path):
+        """--jobs 4 prints deprecation warning with mapping."""
+        if str(_REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(_REPO_ROOT))
+        import eval.score_demo_eval as demo_mod
+
+        pred_dir = tmp_path / "preds"
+        ref_dir = tmp_path / "refs"
+        output_dir = tmp_path / "out"
         pred_dir.mkdir()
         ref_dir.mkdir()
         output_dir.mkdir()
@@ -89,50 +249,41 @@ class TestDemoJobsDeterministicOrder:
             (pred_dir / f"{stem}.musicxml").write_text("<xml/>")
             (ref_dir / f"{stem}.mxl").write_text("MXL")
 
-        def fake_score(pred_path, ref_path, metrics_list, *, venv_python=None,
-                       cheap_timeout=60, tedn_timeout=300, parallel_metric_groups=False):
-            return _fake_score_payload(metrics_list)
+        def fake_score_group(pred_path, ref_path, m, timeout, *, venv_python=None,
+                             stderr_log=None, child_memory_limit_gb=0.0,
+                             instrumentation_log=None, stem=None, group_name=None):
+            return _fake_metric_group_payload(m)
 
-        with patch("eval.score_demo_eval.score_piece_subprocess", side_effect=fake_score), \
+        captured_stderr = []
+        original_stderr = sys.stderr
+
+        import io
+
+        with patch("eval.score_demo_eval.score_metric_group_subprocess", side_effect=fake_score_group), \
              patch("eval.score_demo_eval._resolve_venv_python", return_value=Path(sys.executable)):
-            import sys as _sys
-            old_argv = _sys.argv
-            _sys.argv = [
+            old_argv = sys.argv
+            sys.argv = [
                 "score_demo_eval",
                 "--predictions-dir", str(pred_dir),
                 "--reference-dir", str(ref_dir),
-                "--name", f"test_jobs{jobs}",
-                "--metrics", ",".join(metrics),
-                "--jobs", str(jobs),
+                "--name", "legacytest",
+                "--metrics", "onset_f1",
+                "--jobs", "4",
                 "--output-dir", str(output_dir),
             ]
-            try:
-                demo_mod.main()
-            except SystemExit:
-                pass
-            finally:
-                _sys.argv = old_argv
+            stderr_buf = io.StringIO()
+            with patch("sys.stderr", stderr_buf):
+                try:
+                    demo_mod.main()
+                except SystemExit:
+                    pass
+            sys.argv = old_argv
 
-        csv_path = output_dir / f"clarity_demo_test_jobs{jobs}.csv"
-        if not csv_path.exists():
-            return []
-        with csv_path.open() as fh:
-            reader = csv.DictReader(fh)
-            return [row["piece"] for row in reader]
-
-    def test_jobs1_and_jobs2_same_order(self, tmp_path):
-        if str(_REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(_REPO_ROOT))
-        import eval.score_demo_eval as demo_mod
-
-        metrics = ["onset_f1", "linearized_ser"]
-        order_j1 = self._run_with_mocked_scoring(tmp_path, jobs=1, metrics=metrics)
-        order_j2 = self._run_with_mocked_scoring(tmp_path, jobs=2, metrics=metrics)
-
-        expected = demo_mod.DEMO_STEMS
-        assert order_j1 == expected, f"jobs=1 order wrong: {order_j1}"
-        assert order_j2 == expected, f"jobs=2 order wrong: {order_j2}"
-        assert order_j1 == order_j2
+        stderr_output = stderr_buf.getvalue()
+        assert "DEPRECATED" in stderr_output or "deprecated" in stderr_output.lower()
+        assert "cheap-jobs 4" in stderr_output
+        assert "tedn-jobs 2" in stderr_output
+        assert "max-active-pieces 4" in stderr_output
 
 
 # ---------------------------------------------------------------------------
@@ -158,14 +309,14 @@ class TestDemoMissingFiles:
             (ref_dir / f"{stem}.mxl").write_text("MXL")
 
         with patch("eval.score_demo_eval._resolve_venv_python", return_value=Path(sys.executable)):
-            import sys as _sys
-            old_argv = _sys.argv
-            _sys.argv = [
+            old_argv = sys.argv
+            sys.argv = [
                 "score_demo_eval",
                 "--predictions-dir", str(pred_dir),
                 "--reference-dir", str(ref_dir),
                 "--name", "missingpred",
                 "--metrics", "onset_f1",
+                "--write-order", "deterministic",
                 "--output-dir", str(output_dir),
             ]
             try:
@@ -173,7 +324,7 @@ class TestDemoMissingFiles:
             except SystemExit:
                 pass
             finally:
-                _sys.argv = old_argv
+                sys.argv = old_argv
 
         csv_path = output_dir / "clarity_demo_missingpred.csv"
         assert csv_path.exists()
@@ -201,14 +352,14 @@ class TestDemoMissingFiles:
             (pred_dir / f"{stem}.musicxml").write_text("<xml/>")
 
         with patch("eval.score_demo_eval._resolve_venv_python", return_value=Path(sys.executable)):
-            import sys as _sys
-            old_argv = _sys.argv
-            _sys.argv = [
+            old_argv = sys.argv
+            sys.argv = [
                 "score_demo_eval",
                 "--predictions-dir", str(pred_dir),
                 "--reference-dir", str(ref_dir),
                 "--name", "missingref",
                 "--metrics", "onset_f1",
+                "--write-order", "deterministic",
                 "--output-dir", str(output_dir),
             ]
             try:
@@ -216,7 +367,7 @@ class TestDemoMissingFiles:
             except SystemExit:
                 pass
             finally:
-                _sys.argv = old_argv
+                sys.argv = old_argv
 
         csv_path = output_dir / "clarity_demo_missingref.csv"
         assert csv_path.exists()
@@ -297,16 +448,16 @@ class TestDemoResume:
 
         scored_calls = []
 
-        def fake_score(pred_path, ref_path, metrics_list, *, venv_python=None,
-                       cheap_timeout=60, tedn_timeout=300, parallel_metric_groups=False):
+        def fake_score_group(pred_path, ref_path, m, timeout, *, venv_python=None,
+                             stderr_log=None, child_memory_limit_gb=0.0,
+                             instrumentation_log=None, stem=None, group_name=None):
             scored_calls.append(pred_path.stem)
-            return _fake_score_payload(metrics_list)
+            return _fake_metric_group_payload(m)
 
-        with patch("eval.score_demo_eval.score_piece_subprocess", side_effect=fake_score), \
+        with patch("eval.score_demo_eval.score_metric_group_subprocess", side_effect=fake_score_group), \
              patch("eval.score_demo_eval._resolve_venv_python", return_value=Path(sys.executable)):
-            import sys as _sys
-            old_argv = _sys.argv
-            _sys.argv = [
+            old_argv = sys.argv
+            sys.argv = [
                 "score_demo_eval",
                 "--predictions-dir", str(pred_dir),
                 "--reference-dir", str(ref_dir),
@@ -320,7 +471,7 @@ class TestDemoResume:
             except SystemExit:
                 pass
             finally:
-                _sys.argv = old_argv
+                sys.argv = old_argv
 
         assert first_stem not in scored_calls, (
             f"{first_stem} was re-scored despite being in partial CSV"
