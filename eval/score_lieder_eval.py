@@ -1,33 +1,40 @@
-"""Score per-piece metric results for the 4 canonical demo pieces.
+"""Score per-piece metric results for a Lieder eval inference run.
 
 Two-pass design:
-- Pass 1 (run_clarity_demo_eval.py): inference only — writes predicted MusicXML
-  and optional diagnostics sidecars to --predictions-dir.
+- Pass 1 (run_lieder_eval.py): inference only — writes predicted MusicXML
+  and Stage-D diagnostics sidecars to --predictions-dir.
 - Pass 2 (this script): scoring only — subprocess-isolates per-piece metric
   computation so each piece's music21/zss memory is fully reclaimed after the
   subprocess exits. The parent process stays small throughout.
 
+This design was adopted after a 20-piece lieder run hit 43 GB committed memory
+at piece 6/20 and had to be killed before pagefile exhaustion. The subprocess
+isolation reclaims all music21/zss state on subprocess exit; PR #26's demo eval
+ran 4/4 pieces with the parent staying ~5 GB and per-piece subprocess peaks
+~2.5 GB.
+
 Each piece is scored in up to TWO fresh child processes (eval._score_one_piece):
 
   1. Cheap pair (onset_f1 + linearized_ser): 60 s timeout. These metrics finish
-     in <2 s even for large scores (<=43 MB data) and are always attempted first.
-  2. Tedn-only: 300 s timeout.  May time out for very large scores (Clair de
-     Lune peaks >37 GB); when it does the cheap metrics are still recovered.
+     in <2 s even for large scores and are always attempted first.
+  2. Tedn-only: 300 s timeout. May time out for very large scores; when it does
+     the cheap metrics are still recovered.
 
-If only cheap metrics were requested (or only tedn), a single subprocess is
-used.  The split only activates when the requested set includes both tedn and
-at least one cheap metric.
+Shared scoring infrastructure lives in eval._scoring_utils (also used by
+eval.score_demo_eval).
 
-Shared scoring infrastructure (subprocess dispatch, sidecar reading, CSV schema)
-lives in eval._scoring_utils and is also used by eval.score_lieder_eval.
+Piece discovery: auto-discovers all .musicxml files in --predictions-dir, so
+there is no hard-coded stem list. Reference MXLs are looked up in --reference-dir
+by stem (e.g. <stem>.mxl) — point this at the openscore_lieder scores directory
+(data/openscore_lieder/scores or the eval_mxl mirror).
 
 Usage:
-    venv-cu132\\Scripts\\python -m eval.score_demo_eval \\
-        --predictions-dir eval/results/clarity_demo_stage2_best \\
-        --reference-dir data/clarity_demo/mxl \\
-        --name stage2_best
+    venv\\Scripts\\python -m eval.score_lieder_eval \\
+        --predictions-dir eval/results/lieder_mvp \\
+        --reference-dir data/openscore_lieder/scores \\
+        --name mvp
 
-Output: eval/results/clarity_demo_<name>.csv
+Output: eval/results/lieder_<name>.csv
 """
 import argparse
 import csv
@@ -47,42 +54,63 @@ from eval._scoring_utils import (
     score_piece_subprocess,
 )
 
-# Path to our venv's Python -- same one that ran inference
-VENV_PYTHON = Path(__file__).resolve().parents[1] / "venv-cu132" / "Scripts" / "python.exe"
+# Path to our venv's Python — same one that ran lieder inference
+VENV_PYTHON = Path(__file__).resolve().parents[1] / "venv" / "Scripts" / "python.exe"
 
-# Backward-compat alias
-SCORE_TIMEOUT_SEC = TEDN_TIMEOUT_SEC
 
-# Canonical demo stems -- must match run_clarity_demo_eval.py
-DEMO_STEMS = [
-    "clair-de-lune-debussy",
-    "fugue-no-2-bwv-847-in-c-minor",
-    "gnossienne-no-1",
-    "prelude-in-d-flat-major-op31-no1-scriabin",
-]
+def _discover_predictions(predictions_dir: Path) -> list[Path]:
+    """Return sorted list of .musicxml prediction files in *predictions_dir*."""
+    return sorted(predictions_dir.glob("*.musicxml"))
+
+
+def _find_reference(stem: str, reference_dir: Path) -> Path | None:
+    """Locate the ground-truth MXL for *stem* under *reference_dir*.
+
+    Searches recursively — the openscore_lieder corpus is nested under
+    <Composer>/<Opus>/<Song>/<id>.mxl, so a flat directory is not assumed.
+    Returns the first match, or None if not found.
+    """
+    # Try flat first (e.g. a pre-flattened eval_mxl mirror)
+    flat = reference_dir / f"{stem}.mxl"
+    if flat.exists():
+        return flat
+    # Recursive search for the first match
+    matches = list(reference_dir.rglob(f"{stem}.mxl"))
+    if matches:
+        return matches[0]
+    return None
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Score predicted MusicXMLs against reference MXLs, "
-                    "subprocess-isolating per-piece metric computation."
+        description="Score predicted MusicXMLs from a Lieder eval inference run against "
+                    "reference MXLs, subprocess-isolating per-piece metric computation."
     )
     p.add_argument(
         "--predictions-dir", type=Path, required=True,
-        help="Directory containing predicted .musicxml files (output of run_clarity_demo_eval.py)",
+        help="Directory containing predicted .musicxml files (output of run_lieder_eval.py). "
+             "All .musicxml files in this directory are scored.",
     )
     p.add_argument(
         "--reference-dir", type=Path, required=True,
-        help="Directory containing reference .mxl files",
+        help="Directory containing reference .mxl files. Can be the full openscore_lieder/scores "
+             "tree (recursive search used) or a flat mirror. "
+             "Example: data/openscore_lieder/scores",
     )
     p.add_argument(
         "--name", required=True,
-        help="Run name (used for output CSV filename: eval/results/clarity_demo_<name>.csv)",
+        help="Run name (used for output CSV filename: eval/results/lieder_<name>.csv). "
+             "Should match the name used with run_lieder_eval.py.",
     )
     p.add_argument(
         "--metrics",
         default="tedn,linearized_ser,onset_f1",
         help="Comma-separated list of metrics to compute (default: tedn,linearized_ser,onset_f1)",
+    )
+    p.add_argument(
+        "--max-pieces", type=int, default=None,
+        help="Score only the first N predictions (for validating a partial inference run). "
+             "Default None scores all discovered predictions.",
     )
     args = p.parse_args()
 
@@ -97,6 +125,17 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"FATAL: unknown metrics: {unknown}. Valid: {valid_metrics}")
 
+    preds = _discover_predictions(args.predictions_dir)
+    if not preds:
+        raise SystemExit(
+            f"FATAL: no .musicxml files found in {args.predictions_dir}. "
+            "Run eval/run_lieder_eval.py first."
+        )
+    if args.max_pieces is not None:
+        full_count = len(preds)
+        preds = preds[: args.max_pieces]
+        print(f"Truncating to first {args.max_pieces} predictions of {full_count}")
+
     cheap_requested = [m for m in metrics if m in CHEAP_METRICS]
     tedn_requested = [m for m in metrics if m == "tedn"]
     splitting = bool(cheap_requested) and bool(tedn_requested)
@@ -105,7 +144,7 @@ def main() -> None:
     print(f"Predictions dir: {args.predictions_dir}")
     print(f"Reference dir:   {args.reference_dir}")
     print(f"Metrics:         {metrics}")
-    print(f"Pieces:          {len(DEMO_STEMS)}")
+    print(f"Pieces:          {len(preds)}")
     if splitting:
         print(f"Scoring mode:    split (cheap={cheap_requested} @{CHEAP_TIMEOUT_SEC}s,"
               f" tedn @{TEDN_TIMEOUT_SEC}s)")
@@ -115,19 +154,15 @@ def main() -> None:
     print()
 
     repo_root = Path(__file__).resolve().parents[1]
-    n_total = len(DEMO_STEMS)
+    n_total = len(preds)
     rows: list[tuple] = []
 
-    for i, stem in enumerate(DEMO_STEMS, 1):
-        pred = args.predictions_dir / f"{stem}.musicxml"
-        ref = args.reference_dir / f"{stem}.mxl"
+    for i, pred in enumerate(preds, 1):
+        stem = pred.stem  # e.g. "bach-bwv123-liebster-gott"
+        ref = _find_reference(stem, args.reference_dir)
 
-        if not pred.exists():
-            print(f"[{i}/{n_total}] SKIP {stem}: predicted XML not found at {pred}")
-            rows.append((stem, None, None, None) + (None,) * 8 + ("predicted_xml_missing",))
-            continue
-        if not ref.exists():
-            print(f"[{i}/{n_total}] SKIP {stem}: reference MXL not found at {ref}")
+        if not ref:
+            print(f"[{i}/{n_total}] SKIP {stem}: reference MXL not found under {args.reference_dir}")
             rows.append((stem, None, None, None) + (None,) * 8 + ("reference_mxl_missing",))
             continue
 
@@ -137,7 +172,7 @@ def main() -> None:
         stage_d_cols = _read_stage_d_diag(pred)
 
         # Metric scoring runs in subprocess(es) -- OS reclaims all music21/zss memory
-        # when the child exits, preventing the 86 GB committed-memory OOM seen in v1.
+        # when the child exits, preventing the 43 GB OOM seen in the old in-process design.
         # cheap metrics and tedn are split into separate calls so a tedn timeout
         # does not discard already-computed onset_f1 / linearized_ser values.
         payload = score_piece_subprocess(
@@ -155,13 +190,12 @@ def main() -> None:
         lin_str = f"{lin_ser:.4f}" if lin_ser is not None else "N/A"
         f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
         if failure_reason:
-            # Partial success: some metrics may still be populated
             print(f"[{i}/{n_total}] PARTIAL/FAIL {stem}: {failure_reason}")
             print(f"             onset_f1={f1_str}  tedn={tedn_str}  lin_ser={lin_str}")
         else:
             print(f"[{i}/{n_total}] {stem}: onset_f1={f1_str}  tedn={tedn_str}  lin_ser={lin_str}")
 
-    csv_path = (repo_root / "eval/results" / f"clarity_demo_{args.name}.csv").resolve()
+    csv_path = (repo_root / "eval/results" / f"lieder_{args.name}.csv").resolve()
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as fh:
         w = csv.writer(fh)
@@ -179,7 +213,7 @@ def main() -> None:
     med_f1 = statistics.median(valid)
     min_f1 = min(valid)
     max_f1 = max(valid)
-    print(f"\n=== Clarity Demo Scoring Results ({args.name}) ===")
+    print(f"\n=== Lieder Scoring Results ({args.name}) ===")
     print(f"Pieces evaluated: {len(valid)} / {n_total} (failed/skipped: {failed_count})")
     print(f"Mean onset-F1:   {mean_f1:.4f}")
     print(f"Median onset-F1: {med_f1:.4f}")
