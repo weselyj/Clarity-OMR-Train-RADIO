@@ -992,13 +992,9 @@ def render_svg_pages(
         _record_verovio_warnings(capture.lines, warning_counts)
 
 
-def maybe_write_png(svg_text: str, output_png: Path) -> bool:
-    try:
-        import cairosvg
-    except ImportError:
-        return False
-    output_png.parent.mkdir(parents=True, exist_ok=True)
-    cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), write_to=str(output_png), background_color="white")
+def maybe_write_png(svg_text: str, output_png: Path, dpi: int = 300) -> bool:
+    from src.data.multi_dpi import rasterize_svg_bytes
+    rasterize_svg_bytes(svg_text.encode("utf-8"), output_png, dpi)
     return True
 
 
@@ -1023,10 +1019,10 @@ def _rasterize_svg_to_array(svg_text: str):
 
 
 def _rasterize_svg_to_image(svg_text: str):
-    import cairosvg
     from PIL import Image
+    from src.data.multi_dpi import rasterize_svg_bytes_to_png_bytes
 
-    png_bytes = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), background_color="white")
+    png_bytes = rasterize_svg_bytes_to_png_bytes(svg_text.encode("utf-8"), dpi=96)
     with Image.open(BytesIO(png_bytes)) as image_obj:
         if "A" in image_obj.getbands():
             rgba = image_obj.convert("RGBA")
@@ -1676,6 +1672,7 @@ def _render_single_job(
     project_root: Path,
     max_pages_per_score: Optional[int],
     write_png: bool,
+    dpis: Sequence[int] = (300,),
     roundtrip_validate: bool,
     show_verovio_warnings: bool,
     svg_root: Path,
@@ -1783,9 +1780,12 @@ def _render_single_job(
 
             output_png: Optional[Path] = None
             if write_png:
-                candidate_png = png_root / job.style_id / f"{page_basename}.png"
-                if maybe_write_png(svg_text, candidate_png):
-                    output_png = candidate_png
+                for dpi in dpis:
+                    dpi_dir = png_root / f"dpi{dpi}" / job.style_id
+                    candidate_png = dpi_dir / f"{page_basename}.png"
+                    if maybe_write_png(svg_text, candidate_png, dpi=dpi):
+                        if output_png is None:
+                            output_png = candidate_png
 
             roundtrip = None
             if roundtrip_validate:
@@ -2032,6 +2032,7 @@ def _render_source_task(
     project_root: Path,
     max_pages_per_score: Optional[int],
     write_png: bool,
+    dpis: Sequence[int] = (300,),
     roundtrip_validate: bool,
     show_verovio_warnings: bool,
     svg_root: Path,
@@ -2072,6 +2073,7 @@ def _render_source_task(
             project_root=project_root,
             max_pages_per_score=max_pages_per_score,
             write_png=write_png,
+            dpis=dpis,
             roundtrip_validate=roundtrip_validate,
             show_verovio_warnings=show_verovio_warnings,
             svg_root=svg_root,
@@ -2102,10 +2104,11 @@ def run(
     seed: int,
     render: bool,
     write_png: bool,
-    roundtrip_validate: bool,
-    show_verovio_warnings: bool,
-    workers: int,
-    allow_fallback_labels: bool,
+    dpis: Sequence[int] = (300,),
+    roundtrip_validate: bool = False,
+    show_verovio_warnings: bool = False,
+    workers: int = 1,
+    allow_fallback_labels: bool = False,
 ) -> Dict[str, object]:
     unknown_styles = [style_id for style_id in style_ids if style_id not in DEFAULT_STYLE_PRESETS]
     if unknown_styles:
@@ -2184,6 +2187,7 @@ def run(
                 project_root=project_root,
                 max_pages_per_score=max_pages_per_score,
                 write_png=write_png,
+                dpis=tuple(dpis),
                 roundtrip_validate=roundtrip_validate,
                 show_verovio_warnings=show_verovio_warnings,
                 svg_root=svg_root,
@@ -2359,7 +2363,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--write-png",
         action="store_true",
-        help="When rendering, also rasterize SVG to PNG (requires cairosvg).",
+        help="When rendering, rasterize SVG to PNG at a single DPI (legacy; use --dpis instead).",
+    )
+    parser.add_argument(
+        "--dpis",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One or more DPIs to rasterize each page at. Each DPI produces "
+             "a parallel set of PNGs in dpi-suffixed subdirectories. Labels "
+             "are normalized YOLO format and shared across DPIs. "
+             "When provided, implies --write-png and takes precedence over it.",
     )
     parser.add_argument(
         "--roundtrip-validate",
@@ -2385,6 +2399,17 @@ def main() -> None:
     style_ids = [style_id.strip() for style_id in args.styles.split(",") if style_id.strip()]
     input_manifest = args.input_manifest if args.input_manifest and args.input_manifest.exists() else None
 
+    # --dpis takes precedence; fall back to [300] when --write-png was used without --dpis
+    if args.dpis is not None:
+        dpis = args.dpis
+        write_png = True
+    elif args.write_png:
+        dpis = [300]
+        write_png = True
+    else:
+        dpis = [300]
+        write_png = False
+
     summary = run(
         project_root=args.project_root,
         data_root=args.data_root,
@@ -2395,7 +2420,8 @@ def main() -> None:
         max_pages_per_score=args.max_pages_per_score,
         seed=args.seed,
         render=args.mode == "render",
-        write_png=args.write_png,
+        write_png=write_png,
+        dpis=dpis,
         roundtrip_validate=args.roundtrip_validate,
         show_verovio_warnings=args.show_verovio_warnings,
         workers=max(1, args.workers),

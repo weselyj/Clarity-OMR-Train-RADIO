@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 # ImageMagick 7 "magick" binary — installed to a fixed path by Chocolatey.
@@ -53,3 +54,39 @@ def rasterize_svg(svg_path: Path, out_path: Path, dpi: int) -> None:
             f"  cmd: {cmd}\n"
             f"  stderr: {result.stderr.strip()}"
         )
+
+
+def rasterize_svg_bytes(svg_bytes: bytes, out_path: Path, dpi: int) -> None:
+    """Render SVG content supplied as *svg_bytes* to *out_path* at the requested DPI.
+
+    Mirrors ``rasterize_svg`` but accepts raw bytes instead of a file path.
+    The bytes are written to a temporary file so ImageMagick can detect the SVG
+    format via the file header (piping via stdin does not reliably set the input
+    format on all ImageMagick builds).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        tmp.write(svg_bytes)
+    try:
+        rasterize_svg(tmp_path, out_path, dpi)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def rasterize_svg_bytes_to_png_bytes(svg_bytes: bytes, dpi: int = 96) -> bytes:
+    """Render SVG content supplied as *svg_bytes* and return raw PNG bytes.
+
+    Drop-in replacement for::
+
+        cairosvg.svg2png(bytestring=svg_bytes, background_color="white")
+
+    The PNG is written to a temporary file and read back so the caller gets a
+    plain ``bytes`` object without any open file handle.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        rasterize_svg_bytes(svg_bytes, tmp_path, dpi)
+        return tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
