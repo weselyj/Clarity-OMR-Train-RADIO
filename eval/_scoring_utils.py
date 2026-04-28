@@ -6,6 +6,8 @@ Imported by eval.score_demo_eval and eval.score_lieder_eval.  Contains:
   - _read_stage_d_diag()   — reads <pred>.diagnostics.json sidecar, returns 8-tuple
   - _run_subprocess()      — invokes eval._score_one_piece, returns parsed JSON dict
   - score_piece_subprocess() — splits cheap / tedn into separate subprocesses
+  - _build_reference_index() — builds a dict[stem, Path] from a reference directory
+  - _resolve_venv_python()   — cross-platform venv Python path detection
 
 The split design is:
   1. Cheap pair (onset_f1 + linearized_ser): CHEAP_TIMEOUT_SEC (60 s)
@@ -18,6 +20,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
@@ -52,6 +55,8 @@ def _read_stage_d_diag(pred_path: Path) -> tuple:
 
     Looks for <pred_path>.diagnostics.json alongside the MusicXML output.
     Returns a tuple of 8 values (all None if the sidecar is absent or unreadable).
+    Logs a warning to stderr when parsing fails (but still returns all-None so
+    the row pipeline is not interrupted).
     """
     diag_path = pred_path.with_suffix(pred_path.suffix + ".diagnostics.json")
     try:
@@ -68,8 +73,96 @@ def _read_stage_d_diag(pred_path: Path) -> tuple:
             len(raised),
             first_error,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[warn] Stage D sidecar parse failed for {pred_path}: {exc}", file=sys.stderr)
         return (None, None, None, None, None, None, None, None)
+
+
+def _build_reference_index(reference_dir: Path) -> "dict[str, Path]":
+    """Build a stem -> Path index from all .mxl files under *reference_dir*.
+
+    Scans the directory tree once at startup. Raises SystemExit with a clear
+    error message if any duplicate stems are detected — silently choosing the
+    wrong reference would produce incorrect evaluation results, which is worse
+    than a slower run.
+
+    Returns:
+        dict mapping each stem (filename without extension) to its Path.
+    """
+    refs: dict[str, Path] = {}
+    duplicates: dict[str, list[Path]] = {}
+
+    for path in reference_dir.rglob("*.mxl"):
+        stem = path.stem
+        if stem in refs:
+            # Track all duplicates before failing so the error is actionable.
+            if stem not in duplicates:
+                duplicates[stem] = [refs[stem]]
+            duplicates[stem].append(path)
+        else:
+            refs[stem] = path
+
+    if duplicates:
+        lines = ["FATAL: duplicate reference stems detected (ambiguous reference lookup):"]
+        for stem, paths in sorted(duplicates.items()):
+            for p in paths:
+                lines.append(f"  {stem}: {p}")
+        raise SystemExit("\n".join(lines))
+
+    return refs
+
+
+def _resolve_venv_python(explicit: Optional[Path] = None) -> Path:
+    """Resolve the Python interpreter to use for scoring subprocesses.
+
+    Fallback chain (first match wins):
+      1. *explicit* — the --python CLI argument if provided.
+      2. sys.executable — if it can `import eval` (i.e. repo is on its path).
+      3. repo_root / "venv-cu132/Scripts/python.exe"  (Windows production)
+      4. repo_root / "venv/Scripts/python.exe"         (Windows fallback)
+      5. repo_root / "venv-cu132/bin/python"           (Linux/macOS production)
+      6. repo_root / "venv/bin/python"                 (Linux/macOS fallback)
+      7. Raises SystemExit with a clear message listing all paths checked.
+    """
+    checked: list[str] = []
+
+    # 1. Explicit argument
+    if explicit is not None:
+        if explicit.exists():
+            return explicit
+        checked.append(f"--python arg: {explicit} (not found)")
+
+    # 2. sys.executable if it can import eval
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import eval"],
+            capture_output=True,
+            cwd=str(_REPO_ROOT),
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return Path(sys.executable)
+        checked.append(f"sys.executable ({sys.executable}): cannot import eval")
+    except Exception as e:
+        checked.append(f"sys.executable ({sys.executable}): {e}")
+
+    # 3–6. Repo-local venvs
+    candidates = [
+        _REPO_ROOT / "venv-cu132" / "Scripts" / "python.exe",
+        _REPO_ROOT / "venv" / "Scripts" / "python.exe",
+        _REPO_ROOT / "venv-cu132" / "bin" / "python",
+        _REPO_ROOT / "venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+        checked.append(str(candidate))
+
+    raise SystemExit(
+        "FATAL: Could not locate a Python interpreter for scoring subprocesses.\n"
+        "Paths checked:\n" + "\n".join(f"  {p}" for p in checked) + "\n"
+        "Pass --python /path/to/python explicitly."
+    )
 
 
 def _run_subprocess(
@@ -120,7 +213,6 @@ def _run_subprocess(
 
 
 def score_piece_subprocess(
-    stem: str,
     pred_path: Path,
     ref_path: Path,
     metrics: list[str],
@@ -128,6 +220,7 @@ def score_piece_subprocess(
     venv_python: Path | None = None,
     cheap_timeout: int = CHEAP_TIMEOUT_SEC,
     tedn_timeout: int = TEDN_TIMEOUT_SEC,
+    parallel_metric_groups: bool = False,
 ) -> dict:
     """Score one piece, splitting cheap and tedn metrics into separate subprocesses.
 
@@ -146,6 +239,25 @@ def score_piece_subprocess(
     When *metrics* is a strict subset of one group (e.g. only tedn, or only
     onset_f1), a single subprocess call is used with the appropriate timeout.
 
+    Args:
+        pred_path: Path to the predicted MusicXML file.
+        ref_path: Path to the reference MXL file.
+        metrics: List of metric names to compute.
+        venv_python: Optional explicit Python interpreter path.
+        cheap_timeout: Timeout in seconds for the cheap-pair subprocess.
+        tedn_timeout: Timeout in seconds for the tedn subprocess.
+        parallel_metric_groups: When True AND both cheap and tedn metrics are
+            requested, run the two subprocesses concurrently using
+            ThreadPoolExecutor(max_workers=2). This can reduce per-piece wall
+            time by ~cheap_timeout seconds when cheap metrics finish quickly.
+
+            MEMORY TRADEOFF: With parallel_metric_groups=True, both the cheap
+            and tedn subprocesses are alive simultaneously within one piece,
+            roughly doubling per-piece peak memory from ~2.5 GB to ~5 GB.
+            When combined with --jobs N, total RAM is approximately:
+              parent_ram + jobs * 2 * per_subprocess_peak_ram
+            Do not enable unless memory headroom is confirmed. Default is False.
+
     Returns a dict with metric-value keys plus optionally an 'error' key
     describing any failure(s).
     """
@@ -161,28 +273,60 @@ def score_piece_subprocess(
         return _run_subprocess(pred_path, ref_path, metrics, timeout, venv_python=venv_python)
 
     # --- Split path: two subprocess calls ---
-    combined: dict = {}
-    failure_parts: list[str] = []
+    if parallel_metric_groups:
+        # Run cheap and tedn subprocesses concurrently within this piece.
+        # See docstring for memory tradeoff discussion.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        combined: dict = {}
+        failure_parts: list[str] = []
+
+        def _run_cheap():
+            return "cheap", _run_subprocess(
+                pred_path, ref_path, cheap_requested, cheap_timeout, venv_python=venv_python
+            )
+
+        def _run_tedn():
+            return "tedn", _run_subprocess(
+                pred_path, ref_path, tedn_requested, tedn_timeout, venv_python=venv_python
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_run_cheap), pool.submit(_run_tedn)]
+            for fut in as_completed(futures):
+                group, result = fut.result()
+                if "error" in result:
+                    failure_parts.append(f"{group}-pair: {result['error']}" if group == "cheap" else f"tedn: {result['error']}")
+                else:
+                    combined.update({k: v for k, v in result.items() if k != "error"})
+
+        if failure_parts:
+            combined["error"] = " | ".join(failure_parts)
+        return combined
+
+    # Sequential split (default)
+    combined_seq: dict = {}
+    failure_parts_seq: list[str] = []
 
     # 1. Cheap pair
     cheap_result = _run_subprocess(
         pred_path, ref_path, cheap_requested, cheap_timeout, venv_python=venv_python
     )
     if "error" in cheap_result:
-        failure_parts.append(f"cheap-pair: {cheap_result['error']}")
+        failure_parts_seq.append(f"cheap-pair: {cheap_result['error']}")
     else:
-        combined.update({k: v for k, v in cheap_result.items() if k != "error"})
+        combined_seq.update({k: v for k, v in cheap_result.items() if k != "error"})
 
     # 2. Tedn-only
     tedn_result = _run_subprocess(
         pred_path, ref_path, tedn_requested, tedn_timeout, venv_python=venv_python
     )
     if "error" in tedn_result:
-        failure_parts.append(f"tedn: {tedn_result['error']}")
+        failure_parts_seq.append(f"tedn: {tedn_result['error']}")
     else:
-        combined.update({k: v for k, v in tedn_result.items() if k != "error"})
+        combined_seq.update({k: v for k, v in tedn_result.items() if k != "error"})
 
-    if failure_parts:
-        combined["error"] = " | ".join(failure_parts)
+    if failure_parts_seq:
+        combined_seq["error"] = " | ".join(failure_parts_seq)
 
-    return combined
+    return combined_seq
