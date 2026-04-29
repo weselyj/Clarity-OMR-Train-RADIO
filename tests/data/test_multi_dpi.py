@@ -116,3 +116,30 @@ def test_rasterize_svg_bytes_to_png_bytes_returns_valid_png(sample_svg_bytes: by
     # 8.5 in x 96 DPI = 816 px wide, 11 in x 96 = 1056 px tall
     assert 814 <= img.width <= 818
     assert 1054 <= img.height <= 1058
+
+
+def test_rasterize_renders_unstroked_paths_with_black(tmp_path: Path):
+    """Verovio SVGs include <path stroke-width="N"/> with no stroke attribute,
+    relying on CSS for color. ImageMagick's rsvg delegate ignores the CSS, so
+    rasterize_svg must inject stroke="black" before rendering, otherwise
+    staff lines disappear.
+    """
+    import numpy as np
+    from src.data.multi_dpi import rasterize_svg_bytes
+
+    svg = b"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+  <style>path {stroke:currentColor}</style>
+  <path d="M10 50 L190 50" stroke-width="4" />
+</svg>
+"""
+    out = tmp_path / "out.png"
+    rasterize_svg_bytes(svg, out, dpi=96)
+
+    img = np.array(Image.open(out).convert("L"))
+    # The horizontal line at y=50 should produce dark pixels somewhere along that row range
+    # (allowing for stroke-width spread and rasterization fuzz)
+    middle_band = img[40:60, 20:180]
+    assert (middle_band < 128).sum() > 50, \
+        f"Expected the path to be rendered as visible dark pixels, got " \
+        f"min={middle_band.min()}, mean={middle_band.mean():.1f}"
