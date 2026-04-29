@@ -2,7 +2,7 @@
 
 This is a small ultralytics wrapper. The training hyperparameters mirror the
 recovered config from the original Stage A YOLO checkpoint (rect=True, cos_lr=True,
-augmentation disabled — sheet music is grayscale, non-flippable, and benefits
+augmentation disabled - sheet music is grayscale, non-flippable, and benefits
 from non-square aspect ratios), but with the mixed dataset and the chosen base
 model.
 """
@@ -22,9 +22,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", default="runs", help="Top-level run dir")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=1920)
-    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--device", default="0")
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable torch.compile for ~30%% speedup on 5090. Use --no-compile to disable.",
+    )
     return parser.parse_args()
 
 
@@ -46,6 +52,7 @@ def main() -> None:
         mosaic=0, mixup=0,
         save=True,
         patience=args.patience,
+        compile=args.compile,
     )
 
 
