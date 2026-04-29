@@ -6,15 +6,17 @@
 # Results land in: runs/yolo8m_baseline_v1/
 #
 # Arg-passing: TRAIN_YOLO_ARGS and TRAIN_YOLO_LOG are written to User-scope env vars
-# immediately before spawning — the WMI-detached inner process inherits them.
+# immediately before spawning - the WMI-detached inner process inherits them.
 # Each launch overwrites both vars, so only one run should be active at a time.
 
 $ErrorActionPreference = "Stop"
 $repo  = Join-Path $env:USERPROFILE "Clarity-OMR-Train-RADIO"
 $inner = Join-Path $repo "scripts\train_yolo_inner.ps1"
 
-$pyArgs  = "--model yolov8m.pt --data data\processed\mixed_v1\data.yaml --name yolo8m_baseline_v1 --project runs"
-$logName = "train_yolo8m_baseline"   # inner appends .log / .err / .pid / _wrapper.log
+# --compile uses torch.compile via triton-windows (~30% speedup). Drop --compile
+# if triton is not installed on this machine.
+$pyArgs  = "--model yolov8m.pt --data data\processed\mixed_v1\data.yaml --name yolo8m_baseline_v1 --project runs --compile"
+$logName = "train_yolo8m_baseline"
 
 [Environment]::SetEnvironmentVariable("TRAIN_YOLO_ARGS", $pyArgs,  "User")
 [Environment]::SetEnvironmentVariable("TRAIN_YOLO_LOG",  "$logName.log", "User")
@@ -23,7 +25,6 @@ $cmd    = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$inner`""
 $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$cmd}
 Write-Output ("ReturnValue=" + $result.ReturnValue + " WrapperPID=" + $result.ProcessId)
 
-# Wait briefly then confirm the python process is alive
 Start-Sleep -Seconds 30
 $pidFile = Join-Path $repo "logs\$logName.pid"
 if (Test-Path $pidFile) {
