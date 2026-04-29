@@ -2,20 +2,15 @@
 # Outer launcher: detaches YOLO26m training from SSH via WMI (Invoke-CimMethod).
 #
 # Trains on the mixed Stage A dataset produced by Phase 4.
-# Hyperparameters: rect=True, cos_lr=True, augmentation disabled (sheet music).
+# Hyperparameters: rect=True, cos_lr=True, augmentation disabled (sheet music),
+#                  batch=16 (default), no torch.compile (OOMs at imgsz=1920 batch=16).
 # Results land in: runs/yolo26m_v1/
-#
-# Arg-passing: TRAIN_YOLO_ARGS and TRAIN_YOLO_LOG are written to User-scope env vars
-# immediately before spawning - the WMI-detached inner process inherits them.
-# Each launch overwrites both vars, so only one run should be active at a time.
 
 $ErrorActionPreference = "Stop"
 $repo  = Join-Path $env:USERPROFILE "Clarity-OMR-Train-RADIO"
 $inner = Join-Path $repo "scripts\train_yolo_inner.ps1"
 
-# --compile uses torch.compile via triton-windows (~30% speedup). Drop --compile
-# if triton is not installed on this machine.
-$pyArgs  = "--model yolo26m.pt --data data\processed\mixed_v1\data.yaml --name yolo26m_v1 --project runs --compile"
+$pyArgs  = "--model yolo26m.pt --data data\processed\mixed_v1\data.yaml --name yolo26m_v1 --project runs"
 $logName = "train_yolo26m"
 
 [Environment]::SetEnvironmentVariable("TRAIN_YOLO_ARGS", $pyArgs,  "User")
@@ -30,11 +25,8 @@ $pidFile = Join-Path $repo "logs\$logName.pid"
 if (Test-Path $pidFile) {
     $pyPid = [int](Get-Content $pidFile)
     $p = Get-Process -Id $pyPid -ErrorAction SilentlyContinue
-    if ($p) {
-        Write-Output ("ALIVE PythonPID=" + $pyPid + " StartTime=" + $p.StartTime)
-    } else {
-        Write-Output ("DIED PythonPID=" + $pyPid + " (no process found)")
-    }
+    if ($p) { Write-Output ("ALIVE PythonPID=" + $pyPid + " StartTime=" + $p.StartTime) }
+    else    { Write-Output ("DIED PythonPID=" + $pyPid) }
 } else {
     Write-Output "NO PID FILE YET"
 }
