@@ -22,15 +22,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", default="runs", help="Top-level run dir")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=1920)
-    parser.add_argument("--batch", type=int, default=16)
+    # batch=8 matches the original Stage A training config. batch=16 OOMs on
+    # the 5090 at imgsz=1920 (verified empirically with cu132 nightly torch).
+    # If a future torch release improves memory layout, batch=12 or 16 may fit.
+    parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", default="0")
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable torch.compile for ~30%% speedup. Requires triton (Linux only on cu132). "
-             "Default off because triton is not reliably available on Windows.",
+        help="Enable torch.compile for ~30%% speedup. Requires triton; OOMs at "
+             "batch=16 imgsz=1920. Default off.",
     )
     return parser.parse_args()
 
