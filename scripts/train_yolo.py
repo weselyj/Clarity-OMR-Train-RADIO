@@ -1,10 +1,8 @@
 """Train a YOLO model on the mixed Stage A dataset.
 
-This is a small ultralytics wrapper. The training hyperparameters mirror the
-recovered config from the original Stage A YOLO checkpoint (rect=True, cos_lr=True,
-augmentation disabled - sheet music is grayscale, non-flippable, and benefits
-from non-square aspect ratios), but with the mixed dataset and the chosen base
-model.
+Small ultralytics wrapper. Hyperparameters mirror the recovered config from
+the original Stage A YOLO checkpoint (rect=True, cos_lr=True, augmentation
+disabled), with the mixed dataset and chosen base model.
 """
 from __future__ import annotations
 
@@ -24,10 +22,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=1920)
     # batch=8 matches the original Stage A training config. batch=16 OOMs on
     # the 5090 at imgsz=1920 (verified empirically with cu132 nightly torch).
-    # If a future torch release improves memory layout, batch=12 or 16 may fit.
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", default="0")
     parser.add_argument("--patience", type=int, default=20)
+    # ultralytics defaults workers=8. On Windows each worker spawns ~3 sub-processes
+    # so 8 workers = ~25 python.exe processes consuming ~66 GB system RAM. Reduce
+    # to 6 for ~50 GB; 4 for ~35 GB. GPU utilization barely changes between 4-8.
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
@@ -56,6 +57,7 @@ def main() -> None:
         mosaic=0, mixup=0,
         save=True,
         patience=args.patience,
+        workers=args.workers,
     )
     if args.compile:
         train_kwargs["compile"] = True

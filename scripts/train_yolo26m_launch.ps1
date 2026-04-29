@@ -3,14 +3,14 @@
 #
 # Trains on the mixed Stage A dataset produced by Phase 4.
 # Hyperparameters: rect=True, cos_lr=True, augmentation disabled (sheet music),
-#                  batch=16 (default), no torch.compile (OOMs at imgsz=1920 batch=16).
+#                  batch=8 (default), workers=6 to keep system RAM under ~80%.
 # Results land in: runs/yolo26m_v1/
 
 $ErrorActionPreference = "Stop"
 $repo  = Join-Path $env:USERPROFILE "Clarity-OMR-Train-RADIO"
 $inner = Join-Path $repo "scripts\train_yolo_inner.ps1"
 
-$pyArgs  = "--model yolo26m.pt --data data\processed\mixed_v1\data.yaml --name yolo26m_v1 --project runs"
+$pyArgs  = "--model yolo26m.pt --data data\processed\mixed_v1\data.yaml --name yolo26m_v1 --project runs --workers 6"
 $logName = "train_yolo26m"
 
 [Environment]::SetEnvironmentVariable("TRAIN_YOLO_ARGS", $pyArgs,  "User")
