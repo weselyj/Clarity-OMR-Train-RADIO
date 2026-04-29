@@ -35,9 +35,17 @@ def parse_args() -> argparse.Namespace:
         "--amp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Mixed-precision training. Default on (faster). The YOLOv8m baseline "
-             "had a NaN at epoch 83 with AMP+low LR; disable for stability on long "
-             "training runs at the cost of ~2x slower per-step compute.",
+        help="Mixed-precision training. Default on. The YOLOv8m baseline "
+             "had a NaN at epoch 83 with AMP+low LR; pair with --nan-guard "
+             "to zero NaN/Inf gradients before they corrupt weights.",
+    )
+    parser.add_argument(
+        "--nan-guard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Wrap torch.nn.utils.clip_grad_norm_ to detect and zero out NaN/Inf "
+             "gradients before optimizer step. Cheap insurance against AMP fp16 "
+             "overflows that get past the GradScaler. Recommended with --amp.",
     )
     parser.add_argument(
         "--noise",
@@ -54,14 +62,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _patch_albumentations_for_scan_noise() -> None:
-    """Replace ultralytics' default Albumentations transform list with a scan-noise pipeline.
-
-    Real-PDF eval inputs have: JPEG compression artifacts, faint sensor noise,
-    slight blur from out-of-focus scans, brightness/contrast variation, scan
-    skew (small rotation), and gentle page curvature when a book wasn't pressed
-    flat against the scanner glass. This pipeline simulates that distribution
-    so the model generalizes to noisy real-world inputs at eval time.
-    """
+    """Replace ultralytics' default Albumentations transform list with a scan-noise pipeline."""
     import cv2
     import ultralytics.data.augment as ua
     import albumentations as A
@@ -91,8 +92,50 @@ def _patch_albumentations_for_scan_noise() -> None:
     ua.Albumentations.__init__ = patched_init
 
 
+def _patch_nan_guard() -> None:
+    """Wrap torch.nn.utils.clip_grad_norm_ to zero out NaN/Inf gradients before they corrupt weights.
+
+    AMP's GradScaler detects and skips steps when its scaled grads have inf, but
+    occasional NaN can sneak through (e.g., when forward-pass numerics produce NaN
+    that propagates into grads). ultralytics calls clip_grad_norm_ on every step
+    right before optimizer.step(). We hook that call: enumerate parameters, scan
+    each .grad tensor for NaN/Inf, zero them in-place if found, then defer to the
+    original clip implementation.
+
+    A zeroed gradient turns the optimizer step into an effective no-op for that
+    parameter (preserves the previous weight). The next step continues from a
+    clean state. Loss for that batch is logged as NaN but training continues.
+
+    Counter is logged so the user can monitor frequency. Light NaN-guard hits
+    (a few per epoch) are normal under AMP; heavy hits (many per epoch) suggest
+    the LR or model state is unstable and other interventions may be needed.
+    """
+    import torch
+
+    original_clip = torch.nn.utils.clip_grad_norm_
+    nan_event_count = [0]
+
+    def safe_clip(parameters, max_norm, *args, **kwargs):
+        # Materialize parameters so we can iterate twice (NaN scan + original clip)
+        params = list(parameters) if not isinstance(parameters, list) else parameters
+        any_nan = False
+        for p in params:
+            if p.grad is not None:
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    p.grad.zero_()
+                    any_nan = True
+        if any_nan:
+            nan_event_count[0] += 1
+            print(f"[nan-guard] zeroed NaN/Inf grads (occurrence #{nan_event_count[0]})")
+        return original_clip(params, max_norm, *args, **kwargs)
+
+    torch.nn.utils.clip_grad_norm_ = safe_clip
+
+
 def main() -> None:
     args = parse_args()
+    if args.nan_guard:
+        _patch_nan_guard()
     if args.noise:
         _patch_albumentations_for_scan_noise()
     model = YOLO(args.model)
