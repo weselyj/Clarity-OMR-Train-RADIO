@@ -21,6 +21,7 @@ pymupdf
 
 # Stage A - staff detection
 ultralytics
+albumentations==2.0.8  # scan-noise augmentation for YOLO26m run; cv2 comes from ultralytics
 
 # Stage B - token recognition
 einops
@@ -50,4 +51,3 @@ PyYAML
 # verovio
 # cairosvg
 zss  # Zhang-Shasha tree edit distance (used by eval/tedn.py)
-psutil  # System memory polling for adaptive TEDN throttle (eval/score_*_eval.py)
