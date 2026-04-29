@@ -5,16 +5,16 @@
 #   --workers 6 : caps system RAM at ~80% (vs 96% with default 8 workers).
 #   --noise     : scan-noise + page-curvature augmentation pipeline.
 #   --no-amp    : disable mixed precision. The YOLOv8m baseline got a NaN at
-#                 epoch 83 with AMP at very low LR; pure-fp32 is ~2x slower
-#                 but won't NaN. ultralytics' built-in clip_grad_norm(max=10)
-#                 still runs every step.
+#                 epoch 83 with AMP at very low LR; pure-fp32 doesn't overflow.
+#   --batch 4   : fp32 ~doubles activation memory vs fp16; batch=8 OOMs on the
+#                 5090 (32 GB) without AMP. batch=4 fits with headroom.
 # Results land in: runs/yolo26m_v1/
 
 $ErrorActionPreference = "Stop"
 $repo  = Join-Path $env:USERPROFILE "Clarity-OMR-Train-RADIO"
 $inner = Join-Path $repo "scripts\train_yolo_inner.ps1"
 
-$pyArgs  = "--model yolo26m.pt --data data\processed\mixed_v1\data.yaml --name yolo26m_v1 --project runs --workers 6 --noise --no-amp"
+$pyArgs  = "--model yolo26m.pt --data data\processed\mixed_v1\data.yaml --name yolo26m_v1 --project runs --workers 6 --noise --no-amp --batch 4"
 $logName = "train_yolo26m"
 
 [Environment]::SetEnvironmentVariable("TRAIN_YOLO_ARGS", $pyArgs,  "User")
