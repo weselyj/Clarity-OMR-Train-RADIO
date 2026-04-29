@@ -28,8 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable torch.compile for ~30%% speedup on 5090. Use --no-compile to disable.",
+        default=False,
+        help="Enable torch.compile for ~30%% speedup. Requires triton (Linux only on cu132). "
+             "Default off because triton is not reliably available on Windows.",
     )
     return parser.parse_args()
 
@@ -37,7 +38,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     model = YOLO(args.model)
-    model.train(
+    train_kwargs = dict(
         data=str(args.data),
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -52,8 +53,10 @@ def main() -> None:
         mosaic=0, mixup=0,
         save=True,
         patience=args.patience,
-        compile=args.compile,
     )
+    if args.compile:
+        train_kwargs["compile"] = True
+    model.train(**train_kwargs)
 
 
 if __name__ == "__main__":
