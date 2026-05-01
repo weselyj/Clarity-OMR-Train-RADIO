@@ -216,6 +216,14 @@ class TestProcessPage:
         assert (out_crop_dir / "page1__yoloidx00.png").exists()
         assert (out_crop_dir / "page1__yoloidx01.png").exists()
 
+        # Verify crop dimensions match YOLO predicted bbox (302,242,702,358) → 400×116
+        crop0 = Image.open(out_crop_dir / "page1__yoloidx00.png")
+        assert crop0.size == (400, 116)  # YOLO predicted bbox dimensions, post-round/clip
+
+        # New report fields: no token misses or degenerate crops in this scenario
+        assert report["dropped_token_miss"] == 0
+        assert report["dropped_degenerate"] == 0
+
     def test_drops_yolo_false_positives_and_recall_gaps(self, tmp_path):
         page_img = Image.new("RGB", (1000, 1200), color="white")
         page_path = tmp_path / "page.png"
@@ -265,4 +273,53 @@ class TestProcessPage:
         assert manifest_entries[0]["staff_index"] == 0
         assert report["matches"] == 1
         assert report["dropped_yolo_fp"] == 1
+        assert report["dropped_oracle_recall_gap"] == 1
+        assert report["dropped_token_miss"] == 0
+        assert report["dropped_degenerate"] == 0
+
+    def test_handles_empty_yolo_predictions(self, tmp_path):
+        # Page with 1 oracle staff but YOLO returns no predictions at all.
+        page_img = Image.new("RGB", (1000, 1200), color="white")
+        page_path = tmp_path / "page.png"
+        page_img.save(page_path)
+
+        label_path = tmp_path / "page.txt"
+        label_path.write_text("0 0.5 0.25 0.4 0.1\n")
+
+        token_lookup = {
+            ("page1", 0): {
+                "sample_id": "page1__staff00",
+                "page_id": "page1",
+                "source_path": "/fake/source.mxl",
+                "style_id": "leipzig-default",
+                "page_number": 1,
+                "staff_index": 0,
+                "source_format": "musicxml",
+                "score_type": "piano",
+                "split": "train",
+                "token_sequence": "['<bos>', 'A', '<eos>']",
+                "token_count": 3,
+            },
+        }
+
+        # FakeYolo with empty predictions exercises the `if not results: return []` guard.
+        fake_yolo = FakeYolo([])
+
+        out_crop_dir = tmp_path / "crops"
+        out_crop_dir.mkdir()
+
+        manifest_entries, report = process_page(
+            page_id="page1",
+            page_image_path=page_path,
+            oracle_label_path=label_path,
+            yolo_model=fake_yolo,
+            token_lookup=token_lookup,
+            out_crops_dir=out_crop_dir,
+            crop_path_template="data/{filename}",
+            iou_threshold=0.5,
+        )
+
+        assert manifest_entries == []
+        assert report["yolo_boxes"] == 0
+        assert report["matches"] == 0
         assert report["dropped_oracle_recall_gap"] == 1

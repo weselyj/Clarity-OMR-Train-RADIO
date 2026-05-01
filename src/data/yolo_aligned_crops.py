@@ -145,6 +145,18 @@ def process_page(
     `crop_path_template` must contain `{filename}` and is the value written to
     each manifest entry's image_path field (relative or absolute, caller's choice).
     Crops are written under `out_crops_dir` with filename `<page_id>__yoloidx<NN>.png`.
+
+    The returned report dict contains:
+      - page_id: the page identifier
+      - yolo_boxes: total YOLO predictions on this page
+      - oracle_staves: total oracle staves in the label file
+      - matches: number of YOLO↔oracle pairs that passed IoU threshold
+      - dropped_yolo_fp: YOLO boxes that didn't match any oracle (false positives)
+      - dropped_oracle_recall_gap: oracle staves that no YOLO box matched (recall gaps)
+      - dropped_token_miss: matched staves skipped because (page_id, staff_index)
+        had no entry in token_lookup
+      - dropped_degenerate: matched staves skipped because the YOLO bbox clipped
+        to an empty region (x2 <= x1 or y2 <= y1)
     """
     out_crops_dir = Path(out_crops_dir)
     out_crops_dir.mkdir(parents=True, exist_ok=True)
@@ -158,12 +170,15 @@ def process_page(
     matched_staff_indices = {m["staff_index"] for m in matches}
     matched_yolo_indices = {m["yolo_idx"] for m in matches}
 
+    dropped_token_miss = 0
+    dropped_degenerate = 0
     manifest_entries: list[dict] = []
     for m in matches:
         sid = m["staff_index"]
         token_entry = token_lookup.get((page_id, sid))
         if token_entry is None:
             # Oracle has a bbox in the label file but no token entry. Skip — log via report.
+            dropped_token_miss += 1
             continue
         x1, y1, x2, y2 = (int(round(v)) for v in m["yolo_bbox"])
         # Clip to page bounds.
@@ -172,6 +187,7 @@ def process_page(
         y1 = max(0, min(y1, page_h))
         y2 = max(0, min(y2, page_h))
         if x2 <= x1 or y2 <= y1:
+            dropped_degenerate += 1
             continue
         crop = page_image.crop((x1, y1, x2, y2))
         filename = f"{page_id}__yoloidx{m['yolo_idx']:02d}.png"
@@ -201,5 +217,7 @@ def process_page(
         "matches": len(matches),
         "dropped_yolo_fp": len(yolo_boxes) - len(matched_yolo_indices),
         "dropped_oracle_recall_gap": len(oracles) - len(matched_staff_indices),
+        "dropped_token_miss": dropped_token_miss,
+        "dropped_degenerate": dropped_degenerate,
     }
     return manifest_entries, report
