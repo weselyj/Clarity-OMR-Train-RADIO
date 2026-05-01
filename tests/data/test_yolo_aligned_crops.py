@@ -112,3 +112,157 @@ class TestLoadOracleBboxes:
         oracles = load_oracle_bboxes_from_yolo_label(label, page_width=1000, page_height=1200)
         assert oracles[0]["staff_index"] == 0  # the y=0.25 box (top)
         assert oracles[1]["staff_index"] == 1  # the y=0.75 box (bottom)
+
+
+from PIL import Image
+
+from src.data.yolo_aligned_crops import process_page
+
+
+class FakeYolo:
+    """Stub for ultralytics YOLO that returns a fixed list of bboxes."""
+    def __init__(self, predictions):
+        self.predictions = predictions  # list of (x1,y1,x2,y2,conf)
+
+    def predict(self, image, **kwargs):
+        # Mimic ultralytics interface: returns list with .boxes.xyxy + .boxes.conf
+        class Box:
+            pass
+        class Result:
+            pass
+        result = Result()
+        result.boxes = Box()
+        # Provide as plain Python sequences so the matcher can iterate without torch.
+        result.boxes.xyxy = [[p[0], p[1], p[2], p[3]] for p in self.predictions]
+        result.boxes.conf = [p[4] for p in self.predictions]
+        return [result]
+
+
+class TestProcessPage:
+    def test_writes_crops_and_manifest_for_matched_staves(self, tmp_path):
+        # 1000×1200 white page with two oracle staves at y=240..360 and y=840..960
+        page_img = Image.new("RGB", (1000, 1200), color="white")
+        page_path = tmp_path / "page.png"
+        page_img.save(page_path)
+
+        label_path = tmp_path / "page.txt"
+        label_path.write_text("0 0.5 0.25 0.4 0.1\n0 0.5 0.75 0.4 0.1\n")
+
+        out_crop_dir = tmp_path / "crops"
+        out_crop_dir.mkdir()
+
+        # Token sequences — keyed by (page_id, staff_index)
+        token_lookup = {
+            ("page1", 0): {
+                "sample_id": "page1__staff00",
+                "page_id": "page1",
+                "source_path": "/fake/source.mxl",
+                "style_id": "leipzig-default",
+                "page_number": 1,
+                "staff_index": 0,
+                "source_format": "musicxml",
+                "score_type": "piano",
+                "split": "train",
+                "token_sequence": "['<bos>', 'A', '<eos>']",
+                "token_count": 3,
+            },
+            ("page1", 1): {
+                "sample_id": "page1__staff01",
+                "page_id": "page1",
+                "source_path": "/fake/source.mxl",
+                "style_id": "leipzig-default",
+                "page_number": 1,
+                "staff_index": 1,
+                "source_format": "musicxml",
+                "score_type": "piano",
+                "split": "train",
+                "token_sequence": "['<bos>', 'B', '<eos>']",
+                "token_count": 3,
+            },
+        }
+
+        # YOLO predicts both staves with offsets that still IoU > 0.5
+        fake_yolo = FakeYolo([
+            (302, 242, 702, 358, 0.95),
+            (300, 842, 700, 958, 0.92),
+        ])
+
+        manifest_entries, report = process_page(
+            page_id="page1",
+            page_image_path=page_path,
+            oracle_label_path=label_path,
+            yolo_model=fake_yolo,
+            token_lookup=token_lookup,
+            out_crops_dir=out_crop_dir,
+            crop_path_template="data/processed/synthetic_yolo_v1/staff_crops/leipzig-default/{filename}",
+            iou_threshold=0.5,
+        )
+
+        assert len(manifest_entries) == 2
+        assert report["yolo_boxes"] == 2
+        assert report["oracle_staves"] == 2
+        assert report["matches"] == 2
+        assert report["dropped_yolo_fp"] == 0
+        assert report["dropped_oracle_recall_gap"] == 0
+
+        # Manifest entries: image_path uses template, staff_index inherited from oracle
+        entry0 = next(e for e in manifest_entries if e["staff_index"] == 0)
+        assert entry0["sample_id"] == "page1__yoloidx00"
+        assert entry0["image_path"].endswith("page1__yoloidx00.png")
+        assert entry0["token_sequence"] == "['<bos>', 'A', '<eos>']"
+        assert entry0["dataset"] == "synthetic_fullpage"
+
+        # Crops actually written
+        assert (out_crop_dir / "page1__yoloidx00.png").exists()
+        assert (out_crop_dir / "page1__yoloidx01.png").exists()
+
+    def test_drops_yolo_false_positives_and_recall_gaps(self, tmp_path):
+        page_img = Image.new("RGB", (1000, 1200), color="white")
+        page_path = tmp_path / "page.png"
+        page_img.save(page_path)
+
+        # Two oracle staves
+        label_path = tmp_path / "page.txt"
+        label_path.write_text("0 0.5 0.25 0.4 0.1\n0 0.5 0.75 0.4 0.1\n")
+
+        token_lookup = {
+            ("page1", i): {
+                "sample_id": f"page1__staff{i:02d}",
+                "page_id": "page1",
+                "source_path": "/fake/x.mxl",
+                "style_id": "x",
+                "page_number": 1,
+                "staff_index": i,
+                "source_format": "musicxml",
+                "score_type": "piano",
+                "split": "train",
+                "token_sequence": f"['<bos>', '{i}', '<eos>']",
+                "token_count": 3,
+            } for i in (0, 1)
+        }
+
+        # YOLO finds only the first staff + 1 false positive far from anything
+        fake_yolo = FakeYolo([
+            (302, 242, 702, 358, 0.95),    # match for staff 0
+            (10, 1100, 50, 1150, 0.80),    # false positive
+        ])
+
+        out_crop_dir = tmp_path / "crops"
+        out_crop_dir.mkdir()
+
+        manifest_entries, report = process_page(
+            page_id="page1",
+            page_image_path=page_path,
+            oracle_label_path=label_path,
+            yolo_model=fake_yolo,
+            token_lookup=token_lookup,
+            out_crops_dir=out_crop_dir,
+            crop_path_template="x/{filename}",
+            iou_threshold=0.5,
+        )
+
+        assert len(manifest_entries) == 1
+        assert manifest_entries[0]["staff_index"] == 0
+        assert report["matches"] == 1
+        assert report["dropped_yolo_fp"] == 1
+        assert report["dropped_oracle_recall_gap"] == 1
