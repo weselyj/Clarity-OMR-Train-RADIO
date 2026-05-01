@@ -36,14 +36,24 @@ DEFAULT_YOLO_WEIGHTS = Path("runs/detect/runs/yolo26m_phase2_noise/weights/best.
 PNG_DPI_SUBDIR = "dpi300"
 
 
-def load_token_lookup(token_manifest_path: Path) -> dict:
-    """Build (page_id, staff_index) → token entry lookup."""
+def load_token_lookup(token_manifest_path: Path, dataset_filter: str | None = None) -> dict:
+    """Build (page_id, staff_index) → token entry lookup.
+
+    The synthetic_multi_dpi token manifest has two entries per staff: one with
+    dataset=synthetic_fullpage and one with dataset=synthetic_polyphonic (same
+    image_path + token_sequence, differs only in sample_id and dataset). When
+    `dataset_filter` is set, only entries with that dataset are kept — important
+    for Stage 3 training, whose dataset_mix expects entries tagged
+    `synthetic_fullpage`.
+    """
     lookup = {}
     for line in token_manifest_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         entry = json.loads(line)
+        if dataset_filter and entry.get("dataset") != dataset_filter:
+            continue
         lookup[(entry["page_id"], entry["staff_index"])] = entry
     return lookup
 
@@ -70,8 +80,8 @@ def main() -> int:
     yolo.to(args.device)
 
     print(f"Loading token lookup from {args.token_manifest} ...", flush=True)
-    token_lookup = load_token_lookup(args.token_manifest)
-    print(f"Loaded {len(token_lookup)} (page_id, staff_index) entries.", flush=True)
+    token_lookup = load_token_lookup(args.token_manifest, dataset_filter="synthetic_fullpage")
+    print(f"Loaded {len(token_lookup)} (page_id, staff_index) entries (filtered to synthetic_fullpage).", flush=True)
 
     out_manifest_dir = args.out_dir / "manifests"
     out_manifest_dir.mkdir(parents=True, exist_ok=True)
