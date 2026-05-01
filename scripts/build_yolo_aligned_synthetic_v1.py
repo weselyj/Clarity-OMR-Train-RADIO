@@ -22,7 +22,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from src.data.yolo_aligned_crops import process_page
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from src.data.yolo_aligned_crops import process_page  # noqa: E402
 
 DEFAULT_PAGES_MANIFEST = Path("data/processed/synthetic_multi_dpi/manifests/synthetic_pages.jsonl")
 DEFAULT_TOKEN_MANIFEST = Path("data/processed/synthetic_multi_dpi/manifests/synthetic_token_manifest.jsonl")
