@@ -115,7 +115,11 @@ def main() -> int:
             style_id = page["style_id"]
             # Always use the 300 DPI variant — match lieder inference distribution.
             png_path = Path(f"data/processed/synthetic_multi_dpi/images/{PNG_DPI_SUBDIR}/{style_id}/{page_id}.png")
-            label_path = Path(page["label_path"])
+            raw_label = page.get("label_path")
+            if not raw_label:
+                skipped_pages.append(f"{page_id} (no label_path in manifest)")
+                continue
+            label_path = Path(raw_label)
 
             if not png_path.exists():
                 skipped_pages.append(f"{page_id} (missing png)")
