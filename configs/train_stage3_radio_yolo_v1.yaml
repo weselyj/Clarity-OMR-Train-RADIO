@@ -1,0 +1,86 @@
+# Stage 3 (full-complexity) trained on YOLO-aligned crops (v1 test run).
+#
+# Paired with: data/processed/synthetic_yolo_v1/manifests/synthetic_token_manifest.jsonl
+# (built via scripts/build_yolo_aligned_synthetic_v1.py using YOLO26m Phase 2).
+#
+# Goal: close train/eval distribution mismatch on staff crops. Spec at
+# docs/superpowers/specs/2026-05-01-radio-stage3-yolo-aligned-design.md.
+#
+# Run command (resume from final Stage 2 checkpoint, swap manifest):
+#   $latest = "checkpoints/full_radio_stage2/stage2-radio-polyphonic_final.pt"
+#   venv-cu132\Scripts\python -u src/train/train.py `
+#       --stage-configs configs/train_stage3_radio_yolo_v1.yaml `
+#       --mode execute `
+#       --resume-checkpoint $latest `
+#       --start-stage stage3-radio-full-complexity `
+#       --checkpoint-dir checkpoints/full_radio_stage3_yolo_v1 `
+#       --token-manifest src/data/manifests/token_manifest_full.jsonl,data/processed/synthetic_yolo_v1/manifests/synthetic_token_manifest.jsonl `
+#       --step-log logs/full_radio_stage3_yolo_v1_steps.jsonl `
+#       --validation-batches 16
+#
+# ----- ORIGINAL CONFIG BELOW (unchanged from configs/train_stage3_radio.yaml) -----
+
+# Stage 3 (full-complexity) using C-RADIOv4-H (~700M) encoder.
+#
+# Cribbed from configs/train_stage3.yaml (DaViT baseline). Stage 3 mixes the
+# synthetic full-page corpus (Task 13 output, 126k token entries) with primus
+# and grandstaff. Lieder-main is held out for eval (NOT trained on; this is a
+# deliberate departure from the upstream config which trains on 5% lieder).
+#
+# Memory budget mirrors Stage 2: batch_size 2 + grad_accumulation 8 (effective
+# batch 16). max_sequence_length 384 (matches Stage 2; upstream Stage 3 uses
+# 512 but at batch_size 8 and a different memory profile). Same
+# RADIO-throughput rationale as earlier stages.
+#
+# Budget: 5 epochs * 24000 samples / 2 = 60k micro-batches -> ~12h on the 5090
+# at the measured 5.06 sec/optimizer-step (matches Stage 2 wall time).
+#
+# DoRA targets defined in src/train/model_factory.py::list_radio_dora_target_modules().
+#
+# Run command (resume from final Stage 2 checkpoint):
+#   $latest = "checkpoints/full_radio_stage2/stage2-radio-polyphonic_final.pt"
+#   venv\Scripts\python -u src/train/train.py `
+#       --stage-configs configs/train_stage3_radio.yaml `
+#       --mode execute `
+#       --resume-checkpoint $latest `
+#       --start-stage stage3-radio-full-complexity `
+#       --checkpoint-dir checkpoints/full_radio_stage3 `
+#       --token-manifest src/data/manifests/token_manifest_full.jsonl,data/processed/synthetic/manifests/synthetic_token_manifest.jsonl `
+#       --step-log logs/full_radio_stage3_steps.jsonl `
+#       --validation-batches 16
+
+stage_name: stage3-radio-full-complexity
+stage_b_encoder: radio_h
+
+epochs: 5
+effective_samples_per_epoch: 24000
+batch_size: 2
+grad_accumulation_steps: 8
+max_sequence_length: 384
+
+lr_dora: 0.0004
+lr_new_modules: 0.00025
+loraplus_lr_ratio: 2.0
+warmup_steps: 1000
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.05
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 1000
+validate_every_steps: 500
+
+dataset_mix:
+  - dataset: synthetic_fullpage
+    ratio: 0.80
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.10
+    split: train
+    required: true
+  - dataset: grandstaff
+    ratio: 0.10
+    split: train
+    required: true
