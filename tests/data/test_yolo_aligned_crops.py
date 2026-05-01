@@ -72,3 +72,43 @@ class TestMatchYoloToOracle:
         yolo = [{"yolo_idx": 0, "bbox": (50, 50, 150, 150), "conf": 0.95}]  # IoU = 1/7
         matches = match_yolo_to_oracle(yolo, oracles, iou_threshold=0.5)
         assert len(matches) == 0
+
+
+import textwrap
+
+from src.data.yolo_aligned_crops import load_oracle_bboxes_from_yolo_label
+
+
+class TestLoadOracleBboxes:
+    def test_yolo_label_format_to_xyxy(self, tmp_path):
+        # YOLO label format: class cx cy w h, all normalized
+        label = tmp_path / "page.txt"
+        label.write_text(textwrap.dedent("""\
+            0 0.5 0.25 0.4 0.1
+            0 0.5 0.75 0.4 0.1
+        """))
+        oracles = load_oracle_bboxes_from_yolo_label(label, page_width=1000, page_height=1200)
+        assert len(oracles) == 2
+        # First box: cx=500, cy=300, w=400, h=120 → x1=300, y1=240, x2=700, y2=360
+        assert oracles[0]["staff_index"] == 0
+        assert oracles[0]["bbox"] == pytest.approx((300.0, 240.0, 700.0, 360.0))
+        # Second box: cx=500, cy=900, w=400, h=120
+        assert oracles[1]["staff_index"] == 1
+        assert oracles[1]["bbox"] == pytest.approx((300.0, 840.0, 700.0, 960.0))
+
+    def test_empty_label_file(self, tmp_path):
+        label = tmp_path / "empty.txt"
+        label.write_text("")
+        assert load_oracle_bboxes_from_yolo_label(label, page_width=100, page_height=100) == []
+
+    def test_staff_indices_assigned_top_to_bottom(self, tmp_path):
+        # Provided in non-spatial order; function must sort by y_center to match
+        # token_manifest staff_index convention (top staff = staff_index 0).
+        label = tmp_path / "page.txt"
+        label.write_text(textwrap.dedent("""\
+            0 0.5 0.75 0.4 0.1
+            0 0.5 0.25 0.4 0.1
+        """))
+        oracles = load_oracle_bboxes_from_yolo_label(label, page_width=1000, page_height=1200)
+        assert oracles[0]["staff_index"] == 0  # the y=0.25 box (top)
+        assert oracles[1]["staff_index"] == 1  # the y=0.75 box (bottom)
