@@ -86,10 +86,13 @@ def detect_brackets_on_page(
         })
 
     brackets.sort(key=lambda b: b["y_top"])
+    # Conservative merge: only bridge tiny anti-aliasing gaps. Larger gaps
+    # are likely separate brackets for different systems; merging them
+    # over-merges adjacent systems on tightly-packed lieder pages.
     brackets = _merge_close_brackets(
         brackets,
-        x_tolerance_px=max(8, int(w * 0.012)),
-        y_gap_tolerance_px=max(20, int(h * 0.04)),
+        x_tolerance_px=max(4, int(w * 0.008)),
+        y_gap_tolerance_px=max(10, int(h * 0.012)),
     )
     return brackets
 
@@ -137,31 +140,39 @@ def _merge_close_brackets(
 def group_staves_by_brackets(
     staves: Sequence[Dict],
     brackets: Sequence[Dict],
+    *,
+    upward_attach_max_gap_frac: float = 1.5,
 ) -> List[Dict]:
     """Group staves by which bracket's y-range contains each staff's y-center.
 
-    Returns a list of system dicts: {"bbox": (x1, y1, x2, y2), "staves_in_system"}.
-    Each system bbox extends:
-      - Left to the bracket's x position (capturing the bracket itself)
-      - Vertically to MIN(staff y_top, bracket y_top) and MAX(staff y_bottom, bracket y_bottom)
+    Two assignment passes:
+      1. Containment: staves whose y-center falls within a bracket's y-range
+         are assigned to that bracket.
+      2. Upward attachment: a staff sitting just ABOVE a bracket (no other
+         bracket contains it, gap < ``upward_attach_max_gap_frac × staff_height``)
+         is attached to the bracket below. This handles lieder convention
+         where the brace covers piano grand staff only and the vocal sits above.
 
-    Staves not contained in any bracket are returned as their own 1-staff systems
-    (vocal-only or ungrouped; correct behavior for unbracketed staves).
+    Staves with no nearby bracket become their own 1-staff systems
+    (vocal-only or ungrouped).
+
+    Returns a list of system dicts: {"bbox": (x1, y1, x2, y2), "staves_in_system"}.
     """
     if not staves:
         return []
+    sorted_staves = sorted(staves, key=lambda s: s["bbox"][1])
     if not brackets:
         return [
             {
                 "bbox": tuple(s["bbox"]),
                 "staves_in_system": 1,
             }
-            for s in sorted(staves, key=lambda s: s["bbox"][1])
+            for s in sorted_staves
         ]
 
     by_bracket: Dict[int, List[Dict]] = {}
-    unassigned: List[Dict] = []
-    for staff in staves:
+    unassigned_pass1: List[Dict] = []
+    for staff in sorted_staves:
         x1, y1, x2, y2 = staff["bbox"]
         y_center = (y1 + y2) / 2
         assigned_idx = None
@@ -170,9 +181,29 @@ def group_staves_by_brackets(
                 assigned_idx = b_idx
                 break
         if assigned_idx is None:
-            unassigned.append(staff)
+            unassigned_pass1.append(staff)
         else:
             by_bracket.setdefault(assigned_idx, []).append(staff)
+
+    # Pass 2: upward attachment. For each unassigned staff, look for a bracket
+    # below within reasonable distance. Lieder vocal staff sits just above the
+    # piano brace and isn't structurally contained.
+    unassigned_pass2: List[Dict] = []
+    for staff in unassigned_pass1:
+        _x1, y1, _x2, y2 = staff["bbox"]
+        staff_h = max(1.0, y2 - y1)
+        max_gap = upward_attach_max_gap_frac * staff_h
+        attached_idx = None
+        # Sort brackets by y_top, find the first one whose y_top is below this staff
+        for b_idx, b in enumerate(brackets):
+            gap = b["y_top"] - y2
+            if 0 <= gap <= max_gap:
+                attached_idx = b_idx
+                break
+        if attached_idx is None:
+            unassigned_pass2.append(staff)
+        else:
+            by_bracket.setdefault(attached_idx, []).append(staff)
 
     out: List[Dict] = []
     for b_idx in sorted(by_bracket.keys()):
@@ -182,7 +213,6 @@ def group_staves_by_brackets(
         y1 = min(s["bbox"][1] for s in sub_staves)
         x2 = max(s["bbox"][2] for s in sub_staves)
         y2 = max(s["bbox"][3] for s in sub_staves)
-        # Bracket gives authoritative left edge + y-range
         x1 = min(x1, b["x"])
         y1 = min(y1, b["y_top"])
         y2 = max(y2, b["y_bottom"])
@@ -191,7 +221,7 @@ def group_staves_by_brackets(
             "staves_in_system": len(sub_staves),
         })
 
-    for staff in unassigned:
+    for staff in unassigned_pass2:
         x1, y1, x2, y2 = staff["bbox"]
         out.append({"bbox": (x1, y1, x2, y2), "staves_in_system": 1})
 
