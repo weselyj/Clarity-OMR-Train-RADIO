@@ -199,35 +199,40 @@ def group_staves_by_brackets(
         else:
             by_bracket.setdefault(best_idx, []).append(staff)
 
-    # Pass 2: upward attach. Group unassigned staves by which bracket they
-    # could attach to (nearest below within max_gap). Only attach if the group
-    # has size 1 (lone vocal-above-brace, lieder convention). If 2+ staves
-    # share the same target bracket, that's likely a missed bracket above —
-    # leave them all unassigned for spatial-grouping fallback so they form
-    # their own system rather than corrupting the bracket below.
-    candidates_for_attach: Dict[int, List[Dict]] = {}
+    # Pass 2: upward attach. Group all orphans by the FIRST bracket below
+    # them (regardless of gap distance). Only attach when exactly one orphan
+    # sits above a bracket — that's the lieder vocal-above-brace case.
+    # When 2+ orphans share the same bracket below, that's evidence of a
+    # missed bracket — leave them for spatial-grouping fallback so they form
+    # their own system instead of corrupting the bracket below.
+    orphans_by_target: Dict[int, List[Dict]] = {}
     no_target: List[Dict] = []
     for staff in unassigned_pass1:
         _x1, _y1, _x2, y2 = staff["bbox"]
-        staff_h = max(1.0, y2 - staff["bbox"][1])
-        max_gap = upward_attach_max_gap_factor * staff_h
-        attached_idx = None
+        target_idx = None
         for b_idx, b in enumerate(brackets):
-            gap = b["y_top"] - y2
-            if 0 <= gap <= max_gap:
-                attached_idx = b_idx
+            if b["y_top"] >= y2:
+                target_idx = b_idx
                 break
-        if attached_idx is None:
+        if target_idx is None:
             no_target.append(staff)
         else:
-            candidates_for_attach.setdefault(attached_idx, []).append(staff)
+            orphans_by_target.setdefault(target_idx, []).append(staff)
 
     unassigned_pass2: List[Dict] = list(no_target)
-    for b_idx, attach_group in candidates_for_attach.items():
-        if len(attach_group) == 1:
-            by_bracket.setdefault(b_idx, []).append(attach_group[0])
+    for b_idx, orphan_group in orphans_by_target.items():
+        if len(orphan_group) == 1:
+            # Verify the gap is reasonable — far-away solo staves shouldn't attach
+            staff = orphan_group[0]
+            staff_h = max(1.0, staff["bbox"][3] - staff["bbox"][1])
+            max_gap = upward_attach_max_gap_factor * staff_h
+            gap = brackets[b_idx]["y_top"] - staff["bbox"][3]
+            if gap <= max_gap:
+                by_bracket.setdefault(b_idx, []).append(staff)
+            else:
+                unassigned_pass2.append(staff)
         else:
-            unassigned_pass2.extend(attach_group)
+            unassigned_pass2.extend(orphan_group)
 
     out: List[Dict] = []
     for b_idx in sorted(by_bracket.keys()):
