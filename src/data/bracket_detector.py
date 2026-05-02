@@ -30,7 +30,7 @@ from typing import Dict, List, Sequence
 
 DEFAULT_THRESHOLD = 200  # ink pixels are darker than this on a 0-255 scale
 DEFAULT_MIN_ASPECT = 4.0  # height / width: barlines are tall thin lines
-DEFAULT_BARLINE_SEARCH_WIDTH_FRAC = 0.012  # ±1.2% of page width around staff x_min
+DEFAULT_BARLINE_SEARCH_WIDTH_FRAC = 0.020  # ±2% of page width around staff x_min
 
 
 def detect_brackets_on_page(
@@ -87,7 +87,10 @@ def detect_brackets_on_page(
     n_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(vertical, connectivity=4)
 
     delimiters = []
-    min_h_px = max(20, int(median_staff_h * 1.2))  # must span > 1 staff
+    # Lower bound: 0.9x median staff height. Catches small braces (single-system
+    # piano grand staff) but still rejects spurious short verticals (note stems,
+    # measure barlines).
+    min_h_px = max(15, int(median_staff_h * 0.9))
     for label_idx in range(1, n_labels):
         x, y, w_box, h_box, _area = stats[label_idx]
         if h_box < min_h_px:
