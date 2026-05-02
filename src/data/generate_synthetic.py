@@ -1442,20 +1442,26 @@ def _build_system_yolo_objects(
     if not staff_boxes or not svg_layout:
         return [], []
 
-    # Filter ossias / narrow annotation snippets before sequential assignment.
+    # Filter ossias / annotation snippets before sequential assignment.
     # Verovio sometimes renders ossia/annotation blocks as <g class="staff">
     # elements that show up in page-level per-staff annotation but aren't
-    # structurally part of any system (Burleigh-type pages). Drop staff bboxes
-    # that are noticeably narrower than the page-level dominant staff width.
-    if staff_boxes:
-        max_w = max(sb[2] for sb in staff_boxes)
-        width_threshold = max_w * 0.70  # keep staves >= 70% of widest
-        kept_with_idx = [
-            (orig_idx, sb) for orig_idx, sb in enumerate(staff_boxes)
-            if sb[2] >= width_threshold
-        ]
+    # structurally part of any system (Burleigh-type pages where extra narrow
+    # staves shift the sequential assignment).
+    #
+    # Only drop the EXTRA staves above what svg_layout expects. Keep the
+    # widest ones (structural staves are typically full-width; ossias are
+    # narrow). This preserves systems with legitimately narrow staves
+    # (e.g., truncated final system at end of piece, partial-width endings).
+    expected_total = sum(s.staves_per_system for s in svg_layout)
+    if len(staff_boxes) > expected_total > 0:
+        indexed = [(i, sb) for i, sb in enumerate(staff_boxes)]
+        # Sort by width descending; take the top expected_total
+        indexed.sort(key=lambda t: -t[1][2])
+        kept_with_idx = indexed[:expected_total]
+        # Re-sort by original index (so y-order is preserved by _assign_staff_boxes_to_systems)
+        kept_with_idx.sort(key=lambda t: t[0])
     else:
-        kept_with_idx = []
+        kept_with_idx = [(i, sb) for i, sb in enumerate(staff_boxes)]
 
     if not kept_with_idx:
         return [], []
