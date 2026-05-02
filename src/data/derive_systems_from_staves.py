@@ -3,56 +3,57 @@
 Used for AudioLabs v2 (real scans) and sparse_augment corpora where Verovio's
 authoritative system markup is not available.
 
-The grouping uses per-page gap clustering: for pages with ≥2 inter-staff gaps,
-sort the gaps and find the largest "jump" between consecutive sorted values.
-If the jump is ≥ ``bimodal_jump_ratio`` (default 1.5x), use the midpoint as
-the system-boundary threshold. This naturally separates intra-system gaps
-(small, between staves of one system) from inter-system gaps (large, between
-systems). Pages without a clean bimodal split fall back to the factor-based
-threshold ``vertical_gap_factor × avg_staff_height``.
+Two-stage threshold for per-page adaptive grouping:
 
-This handles piano-vocal lieder (3 staves per system, intra ~30-40 px,
-inter ~50-80 px — gaps are too close for a fixed factor to distinguish) and
-SATB choral (uniform large gaps — bimodal-detection misses, fallback merges).
+1. **Median-based** (primary, used when ≥3 gaps): threshold = 1.3 × median(gaps).
+   On pages with bimodal gap distributions (intra-system gaps small + inter-system
+   gaps large), the median sits at an intra-system gap, so 1.3× of it lands in
+   the gap "valley" and cleanly splits inter-system boundaries. Robust to gap
+   variance within a system.
+
+2. **Factor fallback** (used when ≤2 gaps): threshold = vertical_gap_factor *
+   avg_staff_height. Few-gap pages don't have enough samples for a stable median.
+
+Both stages handle the SATB-choral edge case (uniform large gaps) by leaving
+all staves in one system: when median ≈ inter-system gap, 1.3× exceeds the
+actual gap and no splits are made — the heuristic can't distinguish "one wide
+system" from "many adjacent systems" without bracket detection.
 """
 from __future__ import annotations
 
 from typing import Iterable, List, Dict, Optional
 
 
-def _detect_bimodal_threshold(
-    gaps: List[float],
-    bimodal_jump_ratio: float,
-) -> Optional[float]:
-    """Find a per-page system-boundary threshold from the gap distribution.
+def _median(values: List[float]) -> float:
+    n = len(values)
+    if n == 0:
+        return 0.0
+    s = sorted(values)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
 
-    Returns the midpoint between the two clusters when the largest jump in
-    sorted gaps is >= bimodal_jump_ratio. Returns None when the gaps are
-    monomodal (no clear split — caller should fall back to factor heuristic).
+
+def _adaptive_threshold(
+    gaps: List[float],
+    median_factor: float,
+) -> Optional[float]:
+    """Per-page system-boundary threshold from the gap distribution.
+
+    Returns ``median_factor × median(gaps)`` when there are enough gaps to
+    estimate a stable median (≥ 3). Returns None otherwise so the caller can
+    fall back to a fixed-factor heuristic.
     """
-    sorted_gaps = sorted(gaps)
-    n = len(sorted_gaps)
-    if n < 2:
+    if len(gaps) < 3:
         return None
-    best_ratio = 1.0
-    best_split_idx = -1
-    for i in range(n - 1):
-        if sorted_gaps[i] <= 0:
-            continue
-        ratio = sorted_gaps[i + 1] / sorted_gaps[i]
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_split_idx = i
-    if best_split_idx >= 0 and best_ratio >= bimodal_jump_ratio:
-        return (sorted_gaps[best_split_idx] + sorted_gaps[best_split_idx + 1]) / 2.0
-    return None
+    return median_factor * _median(gaps)
 
 
 def group_staves_into_systems(
     staves: Iterable[Dict],
     vertical_gap_factor: float = 2.5,
     x_overlap_threshold: float = 0.80,
-    bimodal_jump_ratio: float = 1.5,
+    median_factor: float = 1.3,
 ) -> List[Dict]:
     """Group per-staff bboxes into system bboxes by spatial proximity.
 
@@ -62,11 +63,10 @@ def group_staves_into_systems(
       - ``"staves_in_system"``: int — number of staves grouped into this system
     Output is sorted by y1 (top-to-bottom).
 
-    Adaptive threshold:
-      - For each page, compute all consecutive (sorted-by-y) inter-staff gaps.
-      - If gap distribution is bimodal (largest sorted-gap jump >= bimodal_jump_ratio),
-        use the midpoint as the system-boundary threshold (per-page adaptive).
-      - Otherwise fall back to ``vertical_gap_factor * avg_staff_height``.
+    Adaptive threshold (per-page):
+      - ≥3 gaps: ``median_factor × median(gaps)``. This sits between intra and
+        inter-system gaps for pages with bimodal distributions.
+      - ≤2 gaps: ``vertical_gap_factor × avg_staff_height`` (fallback).
     """
     sorted_staves = sorted(staves, key=lambda s: s["bbox"][1])
     n = len(sorted_staves)
@@ -84,7 +84,7 @@ def group_staves_into_systems(
         gaps.append(max(0.0, ny1 - sy2))
 
     avg_h = sum((s["bbox"][3] - s["bbox"][1]) for s in sorted_staves) / n
-    threshold = _detect_bimodal_threshold(gaps, bimodal_jump_ratio)
+    threshold = _adaptive_threshold(gaps, median_factor)
     if threshold is None:
         threshold = vertical_gap_factor * avg_h
 
