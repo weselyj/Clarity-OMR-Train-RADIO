@@ -15,6 +15,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from src.data.bracket_detector import detect_brackets_on_page, group_staves_by_brackets  # noqa: E402
 from src.data.derive_systems_from_staves import group_staves_into_systems  # noqa: E402
 from scripts.derive_audiolabs_systems import write_yolo_systems  # noqa: E402
 
@@ -28,8 +29,13 @@ def main() -> int:
     parser.add_argument("--labels-dir", type=Path, default=DEFAULT_LABELS_DIR)
     parser.add_argument("--images-dir", type=Path, default=DEFAULT_IMAGES_DIR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--vertical-gap-factor", type=float, default=1.5)
+    parser.add_argument("--vertical-gap-factor", type=float, default=2.5)
     parser.add_argument("--x-overlap-threshold", type=float, default=0.80)
+    parser.add_argument(
+        "--use-bracket-detection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args()
 
     from PIL import Image
@@ -42,6 +48,8 @@ def main() -> int:
     n_pages = 0
     n_systems = 0
     n_skipped = 0
+    n_bracket_detected = 0
+    n_fallback_spatial = 0
 
     for label_path in label_files:
         relative = label_path.relative_to(args.labels_dir)
@@ -82,20 +90,30 @@ def main() -> int:
             y2 = (cy + h / 2) * page_h
             staves.append({"bbox": (x1, y1, x2, y2)})
 
-        systems = group_staves_into_systems(
-            staves,
-            vertical_gap_factor=args.vertical_gap_factor,
-            x_overlap_threshold=args.x_overlap_threshold,
-        )
+        systems = []
+        if args.use_bracket_detection:
+            brackets = detect_brackets_on_page(image_path, staves)
+            if brackets:
+                systems = group_staves_by_brackets(staves, brackets)
+                n_bracket_detected += 1
+        if not systems:
+            systems = group_staves_into_systems(
+                staves,
+                vertical_gap_factor=args.vertical_gap_factor,
+                x_overlap_threshold=args.x_overlap_threshold,
+            )
+            n_fallback_spatial += 1
 
         out_path = args.out_dir / style_id / f"{page_id}.txt"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         write_yolo_systems(systems, page_w, page_h, out_path)
 
         n_pages += 1
         n_systems += len(systems)
 
     print(
-        f"Done. {n_pages} pages, {n_systems} systems, {n_skipped} skipped (no image).",
+        f"Done. {n_pages} pages, {n_systems} systems, {n_skipped} skipped (no image). "
+        f"Bracket-detected: {n_bracket_detected}, Spatial-fallback: {n_fallback_spatial}.",
         flush=True,
     )
     return 0

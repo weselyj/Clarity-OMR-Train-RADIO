@@ -14,6 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from src.data.bracket_detector import detect_brackets_on_page, group_staves_by_brackets  # noqa: E402
 from src.data.derive_systems_from_staves import group_staves_into_systems  # noqa: E402
 
 DEFAULT_LABELS_DIR = Path("data/processed/omr_layout_real/labels")
@@ -75,8 +76,15 @@ def main() -> int:
     parser.add_argument("--labels-dir", type=Path, default=DEFAULT_LABELS_DIR)
     parser.add_argument("--images-dir", type=Path, default=DEFAULT_IMAGES_DIR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--vertical-gap-factor", type=float, default=1.5)
+    parser.add_argument("--vertical-gap-factor", type=float, default=2.5,
+                        help="Spatial fallback factor when bracket detection fails on a page.")
     parser.add_argument("--x-overlap-threshold", type=float, default=0.80)
+    parser.add_argument(
+        "--use-bracket-detection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detect first-barlines visually; fall back to spatial heuristic if none found.",
+    )
     args = parser.parse_args()
 
     from PIL import Image
@@ -90,6 +98,8 @@ def main() -> int:
     n_systems = 0
     n_staves_grouped = 0
     n_skipped_no_image = 0
+    n_bracket_detected = 0
+    n_fallback_spatial = 0
 
     for label_path in label_files:
         page_id = label_path.stem
@@ -121,11 +131,21 @@ def main() -> int:
             y2 = (cy + h / 2) * page_h
             staves.append({"bbox": (x1, y1, x2, y2)})
 
-        systems = group_staves_into_systems(
-            staves,
-            vertical_gap_factor=args.vertical_gap_factor,
-            x_overlap_threshold=args.x_overlap_threshold,
-        )
+        # Visual bracket detection first; fall back to spatial heuristic if no
+        # delimiters detected on this page.
+        systems = []
+        if args.use_bracket_detection:
+            brackets = detect_brackets_on_page(image_path, staves)
+            if brackets:
+                systems = group_staves_by_brackets(staves, brackets)
+                n_bracket_detected += 1
+        if not systems:
+            systems = group_staves_into_systems(
+                staves,
+                vertical_gap_factor=args.vertical_gap_factor,
+                x_overlap_threshold=args.x_overlap_threshold,
+            )
+            n_fallback_spatial += 1
 
         out_path = args.out_dir / f"{page_id}.txt"
         write_yolo_systems(systems, page_w, page_h, out_path)
@@ -136,7 +156,8 @@ def main() -> int:
 
     print(
         f"Done. {n_pages} pages, {n_systems} systems, {n_staves_grouped} staves grouped, "
-        f"{n_skipped_no_image} skipped (no image).",
+        f"{n_skipped_no_image} skipped (no image). "
+        f"Bracket-detected: {n_bracket_detected}, Spatial-fallback: {n_fallback_spatial}.",
         flush=True,
     )
     return 0

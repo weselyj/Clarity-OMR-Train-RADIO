@@ -1425,24 +1425,53 @@ def _build_system_yolo_objects(
 ) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
     """Group per-staff bboxes into per-system YOLO label objects.
 
-    Uses Verovio's authoritative ``staves_per_system`` from the SVG layout
-    to sequentially assign staff boxes to systems (top-to-bottom), then
-    unions each group into one bbox.
+    Uses Verovio's authoritative system y-range from each ``_SvgSystemInfo`` to
+    assign staff bboxes to systems by overlap. Falls back to sequential
+    assignment when overlap-based fails (defensive — should rarely happen since
+    Verovio's y-range is authoritative).
+
+    The overlap-based approach correctly handles pages with extra
+    ``<g class="staff">`` elements (ossia/annotation snippets) that aren't
+    structurally part of any system: those bboxes won't y-overlap any system
+    and get dropped.
 
     Returns a pair ``(label_objects, staves_in_system)`` where:
       - ``label_objects`` is ``[(0, (x, y, w, h)), ...]`` — class 0, page-pixel coords
       - ``staves_in_system`` is a parallel list of stave counts
-    Surplus staff boxes beyond what ``svg_layout`` accounts for are dropped
-    (matching ``_assign_staff_boxes_to_systems`` behavior).
     """
     if not staff_boxes or not svg_layout:
         return [], []
 
-    box_to_system = _assign_staff_boxes_to_systems(staff_boxes, svg_layout)
+    # Step 1: assign each staff to system by y-center containment, or closest
+    # system if y-center is outside all ranges (boundary cases).
+    candidates: Dict[int, List[Tuple[int, float]]] = {}
+    for box_idx, (_sx, sy, sw, sh) in enumerate(staff_boxes):
+        s_y_center = sy + sh / 2.0
+        best_sys = None
+        for i, sys_info in enumerate(svg_layout):
+            if sys_info.y_top <= s_y_center <= sys_info.y_bottom:
+                best_sys = i
+                break
+        if best_sys is None:
+            best_dist = float("inf")
+            for i, sys_info in enumerate(svg_layout):
+                sys_center = (sys_info.y_top + sys_info.y_bottom) / 2.0
+                d = abs(s_y_center - sys_center)
+                if d < best_dist:
+                    best_dist = d
+                    best_sys = i
+        if best_sys is not None:
+            candidates.setdefault(best_sys, []).append((box_idx, sw))
 
+    # Step 2: enforce Verovio's authoritative staves_per_system count per
+    # system. When more staves match than expected, keep the widest ones —
+    # narrow staves are usually ossias / annotation snippets, not structural
+    # parts of the system.
     by_system: Dict[int, List[int]] = {}
-    for box_idx, (sys_idx, _pos) in box_to_system.items():
-        by_system.setdefault(sys_idx, []).append(box_idx)
+    for sys_idx, cands in candidates.items():
+        max_count = svg_layout[sys_idx].staves_per_system
+        cands.sort(key=lambda t: -t[1])  # widest first
+        by_system[sys_idx] = [c[0] for c in cands[:max_count]]
 
     label_objects: List[Tuple[int, Tuple[float, float, float, float]]] = []
     staves_in_system: List[int] = []
