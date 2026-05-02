@@ -1442,36 +1442,32 @@ def _build_system_yolo_objects(
     if not staff_boxes or not svg_layout:
         return [], []
 
-    # Step 1: assign each staff to system by y-center containment, or closest
-    # system if y-center is outside all ranges (boundary cases).
-    candidates: Dict[int, List[Tuple[int, float]]] = {}
-    for box_idx, (_sx, sy, sw, sh) in enumerate(staff_boxes):
-        s_y_center = sy + sh / 2.0
-        best_sys = None
-        for i, sys_info in enumerate(svg_layout):
-            if sys_info.y_top <= s_y_center <= sys_info.y_bottom:
-                best_sys = i
-                break
-        if best_sys is None:
-            best_dist = float("inf")
-            for i, sys_info in enumerate(svg_layout):
-                sys_center = (sys_info.y_top + sys_info.y_bottom) / 2.0
-                d = abs(s_y_center - sys_center)
-                if d < best_dist:
-                    best_dist = d
-                    best_sys = i
-        if best_sys is not None:
-            candidates.setdefault(best_sys, []).append((box_idx, sw))
+    # Filter ossias / narrow annotation snippets before sequential assignment.
+    # Verovio sometimes renders ossia/annotation blocks as <g class="staff">
+    # elements that show up in page-level per-staff annotation but aren't
+    # structurally part of any system (Burleigh-type pages). Drop staff bboxes
+    # that are noticeably narrower than the page-level dominant staff width.
+    if staff_boxes:
+        max_w = max(sb[2] for sb in staff_boxes)
+        width_threshold = max_w * 0.70  # keep staves >= 70% of widest
+        kept_with_idx = [
+            (orig_idx, sb) for orig_idx, sb in enumerate(staff_boxes)
+            if sb[2] >= width_threshold
+        ]
+    else:
+        kept_with_idx = []
 
-    # Step 2: enforce Verovio's authoritative staves_per_system count per
-    # system. When more staves match than expected, keep the widest ones —
-    # narrow staves are usually ossias / annotation snippets, not structural
-    # parts of the system.
+    if not kept_with_idx:
+        return [], []
+
+    kept_boxes = [sb for _idx, sb in kept_with_idx]
+    box_to_system = _assign_staff_boxes_to_systems(kept_boxes, svg_layout)
+
+    # Map back to original indices
     by_system: Dict[int, List[int]] = {}
-    for sys_idx, cands in candidates.items():
-        max_count = svg_layout[sys_idx].staves_per_system
-        cands.sort(key=lambda t: -t[1])  # widest first
-        by_system[sys_idx] = [c[0] for c in cands[:max_count]]
+    for kept_idx, (sys_idx, _pos) in box_to_system.items():
+        orig_idx = kept_with_idx[kept_idx][0]
+        by_system.setdefault(sys_idx, []).append(orig_idx)
 
     label_objects: List[Tuple[int, Tuple[float, float, float, float]]] = []
     staves_in_system: List[int] = []
