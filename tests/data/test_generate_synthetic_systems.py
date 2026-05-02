@@ -49,7 +49,7 @@ def test_two_three_staff_systems_grouped():
     ]
     svg_layout = _layout(3, 3)
 
-    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout)
+    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout, leftward_bracket_margin_px=0, vertical_margin_frac=0)
 
     assert len(label_objects) == 2
     assert staves_per == [3, 3]
@@ -72,7 +72,7 @@ def test_single_staff_system():
     staff_boxes = [(100.0, 200.0, 1800.0, 80.0)]
     svg_layout = _layout(1)
 
-    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout)
+    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout, leftward_bracket_margin_px=0, vertical_margin_frac=0)
 
     assert len(label_objects) == 1
     assert staves_per == [1]
@@ -95,7 +95,7 @@ def test_unequal_staff_widths_unioned_to_widest_extent():
     ]
     svg_layout = _layout(2)
 
-    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout)
+    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout, leftward_bracket_margin_px=0, vertical_margin_frac=0)
 
     assert len(label_objects) == 1
     assert staves_per == [2]
@@ -119,7 +119,7 @@ def test_extra_staff_boxes_beyond_layout_are_dropped():
     ]
     svg_layout = _layout(2)
 
-    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout)
+    label_objects, staves_per = _build_system_yolo_objects(staff_boxes, svg_layout, leftward_bracket_margin_px=0, vertical_margin_frac=0)
 
     assert len(label_objects) == 1
     assert staves_per == [2]
@@ -137,45 +137,61 @@ def test_top_to_bottom_ordering_preserved():
     ]
     svg_layout = _layout(1, 1)
 
-    label_objects, _ = _build_system_yolo_objects(staff_boxes, svg_layout)
+    label_objects, _ = _build_system_yolo_objects(staff_boxes, svg_layout, leftward_bracket_margin_px=0, vertical_margin_frac=0)
 
     assert len(label_objects) == 2
     # First (top) system has smaller y
     assert label_objects[0][1][1] < label_objects[1][1][1]
 
 
-def test_bbox_extends_left_to_bracket_when_svg_layout_provides_x_left():
-    """When svg_layout has x_left to the left of staff bboxes, the system bbox
-    extends leftward to include the bracket position."""
-    # Staff bboxes start at x=200; bracket sits at x=80 (per Verovio rect).
-    staff_boxes = [
-        (200.0, 200.0, 1900.0, 80.0),
-        (200.0, 320.0, 1900.0, 80.0),
-    ]
-    svg_layout = _layout(2, x_left=80.0)
+def test_leftward_margin_extends_bbox_left_to_capture_bracket():
+    """leftward_bracket_margin_px extends bbox left by a fixed pixel amount.
 
-    label_objects, _ = _build_system_yolo_objects(staff_boxes, svg_layout)
+    Synthetic uses this instead of Verovio's x_left because Verovio reports
+    rect coords in internal MEI units, not pixel space.
+    """
+    staff_boxes = [(200.0, 200.0, 1900.0, 80.0)]
+    svg_layout = _layout(1)
+
+    label_objects, _ = _build_system_yolo_objects(
+        staff_boxes, svg_layout,
+        leftward_bracket_margin_px=40, vertical_margin_frac=0,
+    )
 
     assert len(label_objects) == 1
-    _, (x, y, w, h) = label_objects[0]
-    # Left edge should be 80 (bracket), not 200 (staff start)
-    assert x == pytest.approx(80.0)
-    # Right edge unchanged: 200 + 1900 = 2100, so width = 2100 - 80 = 2020
-    assert w == pytest.approx(2020.0)
-    assert y == pytest.approx(200.0)
+    _, (x, _y, w, _h) = label_objects[0]
+    # x = max(0, 200 - 40) = 160
+    assert x == pytest.approx(160.0)
+    # right edge unchanged at 2100, width = 2100 - 160 = 1940
+    assert w == pytest.approx(1940.0)
 
 
-def test_bbox_uses_staff_xmin_when_x_left_is_to_the_right():
-    """If x_left is to the RIGHT of staff bboxes (bug or odd page), use the
-    smaller of the two — never shrink the bbox."""
-    staff_boxes = [
-        (50.0, 200.0, 2000.0, 80.0),  # staves start at x=50
-    ]
-    # Pretend Verovio reports x_left=300 (silly but possible on edge cases)
-    svg_layout = _layout(1, x_left=300.0)
+def test_leftward_margin_clamps_to_zero():
+    """If staff is near the left edge, margin can't push bbox negative."""
+    staff_boxes = [(20.0, 200.0, 2000.0, 80.0)]
+    svg_layout = _layout(1)
 
-    label_objects, _ = _build_system_yolo_objects(staff_boxes, svg_layout)
+    label_objects, _ = _build_system_yolo_objects(
+        staff_boxes, svg_layout,
+        leftward_bracket_margin_px=40, vertical_margin_frac=0,
+    )
 
     _, (x, _y, _w, _h) = label_objects[0]
-    # Should still use 50 (the staff x_min), not 300
-    assert x == pytest.approx(50.0)
+    assert x == pytest.approx(0.0)
+
+
+def test_vertical_margin_extends_bbox_top_and_bottom():
+    """vertical_margin_frac × per_staff_h is added to top and bottom."""
+    staff_boxes = [(100.0, 200.0, 2000.0, 80.0)]
+    svg_layout = _layout(1)
+
+    label_objects, _ = _build_system_yolo_objects(
+        staff_boxes, svg_layout,
+        leftward_bracket_margin_px=0, vertical_margin_frac=0.5,
+    )
+
+    _, (_x, y, _w, h) = label_objects[0]
+    # per_staff_h = 80 (1 staff), v_margin = 0.5 * 80 = 40
+    # y = max(0, 200 - 40) = 160; y_max = 280 + 40 = 320; h = 160
+    assert y == pytest.approx(160.0)
+    assert h == pytest.approx(160.0)

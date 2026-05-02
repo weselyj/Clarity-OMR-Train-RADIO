@@ -1422,6 +1422,9 @@ def _assign_staff_boxes_to_systems(
 def _build_system_yolo_objects(
     staff_boxes: Sequence[Tuple[float, float, float, float]],
     svg_layout: Sequence["_SvgSystemInfo"],
+    *,
+    leftward_bracket_margin_px: float = 40.0,
+    vertical_margin_frac: float = 0.3,
 ) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
     """Group per-staff bboxes into per-system YOLO label objects.
 
@@ -1485,16 +1488,15 @@ def _build_system_yolo_objects(
         y_min = min(staff_boxes[i][1] for i in indices)
         x_max = max(staff_boxes[i][0] + staff_boxes[i][2] for i in indices)
         y_max = max(staff_boxes[i][1] + staff_boxes[i][3] for i in indices)
-        # Pull the bbox left edge out to include the bracket: Verovio's system
-        # bounding-box rect's x is at the bracket position when it's a real
-        # pixel-space value. Skip when negative (Verovio sometimes emits x="-1"
-        # for unset, or when the rect is in internal units rather than pixel
-        # coords). The left-edge clamp at the end ensures bbox stays on-page.
-        if 0 <= sys_idx < len(svg_layout):
-            sys_x_left = svg_layout[sys_idx].x_left
-            if sys_x_left is not None and sys_x_left >= 0 and sys_x_left < x_min:
-                x_min = sys_x_left
-        x_min = max(0.0, x_min)
+        # Pull the bbox left edge out to include the bracket. Verovio's system
+        # bounding-box rect's x_left is in internal units (not pixel coords),
+        # so we use a fixed pixel margin instead. Plus a small vertical margin
+        # to capture notes/dynamics extending past staff lines.
+        x_min = max(0.0, x_min - leftward_bracket_margin_px)
+        per_staff_h = max(1.0, (y_max - y_min) / max(1, len(indices)))
+        v_margin = vertical_margin_frac * per_staff_h
+        y_min = max(0.0, y_min - v_margin)
+        y_max = y_max + v_margin
         bbox = (x_min, y_min, max(0.0, x_max - x_min), max(0.0, y_max - y_min))
         label_objects.append((0, bbox))
         staves_in_system.append(len(indices))

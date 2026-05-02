@@ -29,7 +29,7 @@ def write_yolo_systems(
     out_path: Path,
     leftward_bracket_margin_px: float = 40.0,
     rightward_margin_px: float = 40.0,
-    vertical_margin_frac: float = 0.5,
+    vertical_margin_frac: float = 0.9,  # AudioLabs (Wagner symphonic): high/low notes need extra room
 ) -> None:
     """Write YOLO-format system labels (class 0) + .staves.json sidecar.
 

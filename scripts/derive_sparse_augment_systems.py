@@ -106,7 +106,9 @@ def main() -> int:
 
         out_path = args.out_dir / style_id / f"{page_id}.txt"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        write_yolo_systems(systems, page_w, page_h, out_path)
+        # sparse_augment: smaller vertical margin (cleaner Verovio renders, less
+        # extreme note range than scanned symphonic music)
+        write_yolo_systems(systems, page_w, page_h, out_path, vertical_margin_frac=0.2)
 
         n_pages += 1
         n_systems += len(systems)
