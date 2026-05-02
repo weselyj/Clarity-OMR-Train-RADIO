@@ -1480,13 +1480,15 @@ def _build_system_yolo_objects(
         x_max = max(staff_boxes[i][0] + staff_boxes[i][2] for i in indices)
         y_max = max(staff_boxes[i][1] + staff_boxes[i][3] for i in indices)
         # Pull the bbox left edge out to include the bracket: Verovio's system
-        # bounding-box rect's x is at the bracket position. This gives YOLO a
-        # distinctive visual anchor for system detection (brackets are unique
-        # markers that don't appear elsewhere on the page).
+        # bounding-box rect's x is at the bracket position when it's a real
+        # pixel-space value. Skip when negative (Verovio sometimes emits x="-1"
+        # for unset, or when the rect is in internal units rather than pixel
+        # coords). The left-edge clamp at the end ensures bbox stays on-page.
         if 0 <= sys_idx < len(svg_layout):
             sys_x_left = svg_layout[sys_idx].x_left
-            if sys_x_left is not None:
-                x_min = min(x_min, sys_x_left)
+            if sys_x_left is not None and sys_x_left >= 0 and sys_x_left < x_min:
+                x_min = sys_x_left
+        x_min = max(0.0, x_min)
         bbox = (x_min, y_min, max(0.0, x_max - x_min), max(0.0, y_max - y_min))
         label_objects.append((0, bbox))
         staves_in_system.append(len(indices))
