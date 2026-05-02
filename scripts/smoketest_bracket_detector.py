@@ -82,13 +82,14 @@ def main() -> int:
             page_w, page_h = img.size
         print(f"  Image: {image_path.name} ({page_w}x{page_h})")
 
-        brackets = detect_brackets_on_page(image_path)
+        label_path = case["labels"] if case["labels"].suffix == ".txt" else case["labels"].with_suffix(".txt")
+        staves_for_detect = yolo_to_pixel_staves(label_path, page_w, page_h)
+        brackets = detect_brackets_on_page(image_path, staves_for_detect)
         print(f"  Detected {len(brackets)} brackets:")
         for i, b in enumerate(brackets):
             print(f"    {i}: x={b['x']:.0f}, y_top={b['y_top']:.0f}, y_bot={b['y_bottom']:.0f}, h={b['height']:.0f}")
 
-        label_path = case["labels"] if case["labels"].suffix == ".txt" else case["labels"].with_suffix(".txt")
-        staves = yolo_to_pixel_staves(label_path, page_w, page_h)
+        staves = staves_for_detect
         print(f"  Per-staff bboxes: {len(staves)}")
         if not staves:
             print("    (no labels found, skip grouping)")

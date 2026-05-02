@@ -1,100 +1,113 @@
-"""Visual bracket/brace detection for grouping staves into systems.
+"""Visual system-delimiter detection for grouping staves into systems.
 
 Heuristic spatial grouping of staves (used for AudioLabs and sparse_augment) hits
-a fundamental limit: vocal-to-piano gaps can exceed inter-system gaps, causing
-brackets to be split across labels. The fix is to *see* the bracket itself —
-brackets and braces are vertical structures on the LEFT side of every system,
-spanning exactly the staves they group.
+a fundamental limit: vocal-to-piano gaps can exceed inter-system gaps. The fix
+is to *see* a visual signal that consistently marks system boundaries.
+
+We use the **first barline of each system**: in standard music engraving, the
+first barline (just after the clef/key/time-signature, before measure 1) always
+spans ALL staves of a system, regardless of bracket/brace style above it. More
+reliable than detecting brackets directly because:
+  - Lieder vocal+piano grand staff: bracket only covers piano, but first barline
+    spans vocal+piano.
+  - SATB choral: bracket spans all staves; first barline does too.
+  - Solo piano: brace only; first barline spans both staves.
+  - Orchestral: nested brackets/braces; first barline spans all.
 
 Pipeline:
-1. ``detect_brackets_on_page(image_path)`` -> list of bracket regions
-   {"x", "y_top", "y_bottom", "height"} sorted top-to-bottom. Uses OpenCV
-   morphological vertical-line extraction on the leftmost ~10% of the page.
-2. ``group_staves_by_brackets(staves, brackets)`` -> system bboxes by assigning
-   each staff to the bracket whose y-range contains the staff's y-center.
-   Bracket position becomes the bbox left edge (no need for the leftward margin
-   hack any more); bracket vertical extent is the y-range source of truth.
-3. Falls back to spatial heuristic when no brackets are detected (e.g.,
-   vocal-only single-staff "systems" with no bracket).
+1. ``detect_brackets_on_page(image_path, staves)`` -> list of system delimiters
+   {"x", "y_top", "y_bottom", "height"}. Looks for vertical lines at x ~ leftmost
+   staff start, where the first barline of each system sits. Uses ``staves`` to
+   know where to look.
+2. ``group_staves_by_brackets(staves, delimiters)`` -> system bboxes by assigning
+   each staff to the delimiter whose y-range overlaps the staff most. Falls back
+   to per-staff-as-system when no delimiters detected.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Sequence
 
-# Defaults derived from typical Verovio + scan layouts:
-# - Brackets/braces sit within the leftmost ~10% of page width
-# - Minimum bracket height is ~half a staff height (so a brace on a single
-#   piano grand staff is detectable); skip shorter components as noise
-# - Aspect ratio (h/w) >= 5 is "vertical enough"; brackets are tall thin lines
-DEFAULT_SEARCH_LEFT_FRAC = 0.10
 DEFAULT_THRESHOLD = 200  # ink pixels are darker than this on a 0-255 scale
-DEFAULT_MIN_HEIGHT_FRAC = 0.02  # of page height
-DEFAULT_MIN_ASPECT = 4.0  # height / width
+DEFAULT_MIN_ASPECT = 4.0  # height / width: barlines are tall thin lines
+DEFAULT_BARLINE_SEARCH_WIDTH_FRAC = 0.012  # ±1.2% of page width around staff x_min
 
 
 def detect_brackets_on_page(
     image_path: Path,
+    staves: Sequence[Dict] = (),
     *,
-    search_left_frac: float = DEFAULT_SEARCH_LEFT_FRAC,
     threshold: int = DEFAULT_THRESHOLD,
-    min_height_frac: float = DEFAULT_MIN_HEIGHT_FRAC,
     min_aspect: float = DEFAULT_MIN_ASPECT,
+    barline_search_width_frac: float = DEFAULT_BARLINE_SEARCH_WIDTH_FRAC,
 ) -> List[Dict]:
-    """Detect vertical brackets/braces on the left side of a music page.
+    """Detect vertical system delimiters (first-barlines) on a music page.
 
-    Returns a list of bracket dicts: {"x", "y_top", "y_bottom", "height"} in
-    page-pixel coordinates, sorted top-to-bottom. Empty list if no brackets
-    are detected (page may have unbracketed systems → caller falls back).
+    Looks for vertical lines at x ~= leftmost staff start, where the first
+    barline of each system sits. Each detected line spans the full vertical
+    extent of one system (engraving convention).
+
+    ``staves`` is the list of per-staff bboxes (each {"bbox": (x1, y1, x2, y2)}
+    in pixel coords). Used to find the leftmost staff x and median staff height.
+
+    Returns a list of delimiter dicts {"x", "y_top", "y_bottom", "height"}
+    sorted top-to-bottom. Empty list if no delimiters detected.
     """
     import cv2
-    import numpy as np  # noqa: F401  (used implicitly via cv2)
 
     img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         return []
     h, w = img.shape
 
-    search_width = max(8, int(w * search_left_frac))
-    left_strip = img[:, :search_width]
+    if not staves:
+        return []
 
-    # Binary: ink (dark) -> white (255) on black bg
-    _, binary = cv2.threshold(left_strip, threshold, 255, cv2.THRESH_BINARY_INV)
+    staff_xmins = [s["bbox"][0] for s in staves]
+    staff_heights = sorted(s["bbox"][3] - s["bbox"][1] for s in staves)
+    staff_xmin = min(staff_xmins)
+    median_staff_h = staff_heights[len(staff_heights) // 2]
 
-    # Vertical-line morphology: tall thin kernel. Anything that survives is
-    # a vertical structure (bracket spine, brace, barline, slur — most are filtered
-    # later by the leftmost-x check or aspect ratio).
-    vert_kernel_h = max(20, int(h * min_height_frac * 0.6))
+    # Crop a thin vertical strip at staff_xmin where the first barline sits.
+    delta = max(8, int(w * barline_search_width_frac))
+    x_lo = max(0, int(staff_xmin) - delta)
+    x_hi = min(w, int(staff_xmin) + delta)
+    if x_hi <= x_lo:
+        return []
+    strip = img[:, x_lo:x_hi]
+
+    _, binary = cv2.threshold(strip, threshold, 255, cv2.THRESH_BINARY_INV)
+
+    # Kernel >= 1.5x median staff height: only catches system-spanning lines,
+    # not single-staff barlines or short vertical decorations.
+    vert_kernel_h = max(20, int(median_staff_h * 1.5))
     vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_kernel_h))
     vertical = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel)
 
     n_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(vertical, connectivity=4)
 
-    brackets = []
-    min_h_px = max(8, int(h * min_height_frac))
-    for label_idx in range(1, n_labels):  # 0 is background
+    delimiters = []
+    min_h_px = max(20, int(median_staff_h * 1.2))  # must span > 1 staff
+    for label_idx in range(1, n_labels):
         x, y, w_box, h_box, _area = stats[label_idx]
         if h_box < min_h_px:
             continue
         if h_box / max(w_box, 1) < min_aspect:
             continue
-        brackets.append({
-            "x": float(x),
+        delimiters.append({
+            "x": float(x_lo + x),  # translate strip x back to page x
             "y_top": float(y),
             "y_bottom": float(y + h_box),
             "height": float(h_box),
         })
 
-    brackets.sort(key=lambda b: b["y_top"])
-    # Conservative merge: only bridge tiny anti-aliasing gaps. Larger gaps
-    # are likely separate brackets for different systems; merging them
-    # over-merges adjacent systems on tightly-packed lieder pages.
-    brackets = _merge_close_brackets(
-        brackets,
+    delimiters.sort(key=lambda b: b["y_top"])
+    delimiters = _merge_close_brackets(
+        delimiters,
         x_tolerance_px=max(4, int(w * 0.008)),
-        y_gap_tolerance_px=max(10, int(h * 0.012)),
+        y_gap_tolerance_px=max(10, int(median_staff_h * 0.5)),
     )
-    return brackets
+    return delimiters
 
 
 def _merge_close_brackets(
@@ -103,13 +116,11 @@ def _merge_close_brackets(
     x_tolerance_px: int,
     y_gap_tolerance_px: int,
 ) -> List[Dict]:
-    """Merge brackets at similar x with small y-gap (likely one bracket split by anti-aliasing)."""
+    """Merge brackets at similar x with small y-gap (one bracket split by anti-aliasing)."""
     if not brackets:
         return []
-    # Group by approximate x cluster
     by_x: Dict[int, List[Dict]] = {}
     for b in sorted(brackets, key=lambda b: b["x"]):
-        # Bucket by x_tolerance_px
         placed = False
         for key in list(by_x.keys()):
             if abs(b["x"] - key) <= x_tolerance_px:
@@ -120,7 +131,7 @@ def _merge_close_brackets(
             by_x[int(b["x"])] = [b]
 
     merged: List[Dict] = []
-    for x_key, group in by_x.items():
+    for _x_key, group in by_x.items():
         group.sort(key=lambda b: b["y_top"])
         cur = dict(group[0])
         for nxt in group[1:]:
@@ -140,23 +151,18 @@ def _merge_close_brackets(
 def group_staves_by_brackets(
     staves: Sequence[Dict],
     brackets: Sequence[Dict],
-    *,
-    upward_attach_max_gap_frac: float = 1.5,
 ) -> List[Dict]:
-    """Group staves by which bracket's y-range contains each staff's y-center.
+    """Group staves by which delimiter's y-range overlaps the staff.
 
-    Two assignment passes:
-      1. Containment: staves whose y-center falls within a bracket's y-range
-         are assigned to that bracket.
-      2. Upward attachment: a staff sitting just ABOVE a bracket (no other
-         bracket contains it, gap < ``upward_attach_max_gap_frac × staff_height``)
-         is attached to the bracket below. This handles lieder convention
-         where the brace covers piano grand staff only and the vocal sits above.
+    Uses overlap (any y-overlap, not strict containment) so a vocal staff at
+    the top of a system whose barline starts slightly below the vocal still
+    gets grouped correctly.
 
-    Staves with no nearby bracket become their own 1-staff systems
-    (vocal-only or ungrouped).
+    Each system bbox extends:
+      - Left to the delimiter's x position
+      - Vertically to MIN(staff y_top, delimiter y_top) and MAX(staff y_bottom, delimiter y_bottom)
 
-    Returns a list of system dicts: {"bbox": (x1, y1, x2, y2), "staves_in_system"}.
+    Staves not overlapping any delimiter become their own 1-staff systems.
     """
     if not staves:
         return []
@@ -171,39 +177,23 @@ def group_staves_by_brackets(
         ]
 
     by_bracket: Dict[int, List[Dict]] = {}
-    unassigned_pass1: List[Dict] = []
+    unassigned: List[Dict] = []
     for staff in sorted_staves:
-        x1, y1, x2, y2 = staff["bbox"]
-        y_center = (y1 + y2) / 2
-        assigned_idx = None
-        for b_idx, b in enumerate(brackets):
-            if b["y_top"] <= y_center <= b["y_bottom"]:
-                assigned_idx = b_idx
-                break
-        if assigned_idx is None:
-            unassigned_pass1.append(staff)
-        else:
-            by_bracket.setdefault(assigned_idx, []).append(staff)
-
-    # Pass 2: upward attachment. For each unassigned staff, look for a bracket
-    # below within reasonable distance. Lieder vocal staff sits just above the
-    # piano brace and isn't structurally contained.
-    unassigned_pass2: List[Dict] = []
-    for staff in unassigned_pass1:
         _x1, y1, _x2, y2 = staff["bbox"]
-        staff_h = max(1.0, y2 - y1)
-        max_gap = upward_attach_max_gap_frac * staff_h
-        attached_idx = None
-        # Sort brackets by y_top, find the first one whose y_top is below this staff
+        # Find the delimiter with the most y-overlap with this staff
+        best_idx = None
+        best_overlap = 0.0
         for b_idx, b in enumerate(brackets):
-            gap = b["y_top"] - y2
-            if 0 <= gap <= max_gap:
-                attached_idx = b_idx
-                break
-        if attached_idx is None:
-            unassigned_pass2.append(staff)
+            ov_top = max(y1, b["y_top"])
+            ov_bot = min(y2, b["y_bottom"])
+            overlap = max(0.0, ov_bot - ov_top)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = b_idx
+        if best_idx is None or best_overlap <= 0:
+            unassigned.append(staff)
         else:
-            by_bracket.setdefault(attached_idx, []).append(staff)
+            by_bracket.setdefault(best_idx, []).append(staff)
 
     out: List[Dict] = []
     for b_idx in sorted(by_bracket.keys()):
@@ -221,7 +211,7 @@ def group_staves_by_brackets(
             "staves_in_system": len(sub_staves),
         })
 
-    for staff in unassigned_pass2:
+    for staff in unassigned:
         x1, y1, x2, y2 = staff["bbox"]
         out.append({"bbox": (x1, y1, x2, y2), "staves_in_system": 1})
 
