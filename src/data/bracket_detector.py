@@ -233,9 +233,13 @@ def group_staves_by_brackets(
             "staves_in_system": len(sub_staves),
         })
 
-    for staff in unassigned_pass2:
-        x1, y1, x2, y2 = staff["bbox"]
-        out.append({"bbox": (x1, y1, x2, y2), "staves_in_system": 1})
+    # For staves still unassigned after both passes, run spatial-grouping on
+    # the remainder so missed-bracket systems are still grouped (e.g., Wagner
+    # title page where the first system's brace isn't detected).
+    if unassigned_pass2:
+        from src.data.derive_systems_from_staves import group_staves_into_systems
+        spatial_systems = group_staves_into_systems(unassigned_pass2)
+        out.extend(spatial_systems)
 
     out.sort(key=lambda s: s["bbox"][1])
     return out
