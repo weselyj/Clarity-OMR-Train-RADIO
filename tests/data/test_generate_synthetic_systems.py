@@ -14,8 +14,12 @@ from src.data.generate_synthetic import (
 )
 
 
-def _layout(*staves_per_system: int) -> list[_SvgSystemInfo]:
-    """Build a list of _SvgSystemInfo with synthetic y-bounds (top-to-bottom)."""
+def _layout(*staves_per_system: int, x_left=None) -> list[_SvgSystemInfo]:
+    """Build a list of _SvgSystemInfo with synthetic y-bounds (top-to-bottom).
+
+    x_left=None means no bracket info available (default; bbox left edge comes
+    from staff boxes alone). Pass an explicit x_left to test bracket inclusion.
+    """
     out: list[_SvgSystemInfo] = []
     y = 100.0
     for s in staves_per_system:
@@ -25,8 +29,9 @@ def _layout(*staves_per_system: int) -> list[_SvgSystemInfo]:
             staves_per_system=s,
             y_top=y,
             y_bottom=y + h,
+            x_left=x_left,
         ))
-        y += h + 100.0  # gap between systems
+        y += h + 100.0
     return out
 
 
@@ -137,3 +142,40 @@ def test_top_to_bottom_ordering_preserved():
     assert len(label_objects) == 2
     # First (top) system has smaller y
     assert label_objects[0][1][1] < label_objects[1][1][1]
+
+
+def test_bbox_extends_left_to_bracket_when_svg_layout_provides_x_left():
+    """When svg_layout has x_left to the left of staff bboxes, the system bbox
+    extends leftward to include the bracket position."""
+    # Staff bboxes start at x=200; bracket sits at x=80 (per Verovio rect).
+    staff_boxes = [
+        (200.0, 200.0, 1900.0, 80.0),
+        (200.0, 320.0, 1900.0, 80.0),
+    ]
+    svg_layout = _layout(2, x_left=80.0)
+
+    label_objects, _ = _build_system_yolo_objects(staff_boxes, svg_layout)
+
+    assert len(label_objects) == 1
+    _, (x, y, w, h) = label_objects[0]
+    # Left edge should be 80 (bracket), not 200 (staff start)
+    assert x == pytest.approx(80.0)
+    # Right edge unchanged: 200 + 1900 = 2100, so width = 2100 - 80 = 2020
+    assert w == pytest.approx(2020.0)
+    assert y == pytest.approx(200.0)
+
+
+def test_bbox_uses_staff_xmin_when_x_left_is_to_the_right():
+    """If x_left is to the RIGHT of staff bboxes (bug or odd page), use the
+    smaller of the two — never shrink the bbox."""
+    staff_boxes = [
+        (50.0, 200.0, 2000.0, 80.0),  # staves start at x=50
+    ]
+    # Pretend Verovio reports x_left=300 (silly but possible on edge cases)
+    svg_layout = _layout(1, x_left=300.0)
+
+    label_objects, _ = _build_system_yolo_objects(staff_boxes, svg_layout)
+
+    _, (x, _y, _w, _h) = label_objects[0]
+    # Should still use 50 (the staff x_min), not 300
+    assert x == pytest.approx(50.0)

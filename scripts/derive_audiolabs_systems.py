@@ -21,13 +21,25 @@ DEFAULT_IMAGES_DIR = Path("data/processed/omr_layout_real/images")
 DEFAULT_OUT_DIR = Path("data/processed/omr_layout_real/labels_systems")
 
 
-def write_yolo_systems(systems, page_w, page_h, out_path: Path) -> None:
-    """Write YOLO-format system labels (class 0) + .staves.json sidecar."""
+def write_yolo_systems(
+    systems,
+    page_w,
+    page_h,
+    out_path: Path,
+    leftward_bracket_margin_px: float = 40.0,
+) -> None:
+    """Write YOLO-format system labels (class 0) + .staves.json sidecar.
+
+    Extends the bbox left edge by ``leftward_bracket_margin_px`` to capture
+    brackets in real scans (heuristic — real-scan per-staff labels don't include
+    brackets). Set to 0 to disable.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     staves_per_bbox = []
     for s in systems:
         x1, y1, x2, y2 = s["bbox"]
+        x1 = max(0.0, x1 - leftward_bracket_margin_px)
         cx = ((x1 + x2) / 2) / max(page_w, 1)
         cy = ((y1 + y2) / 2) / max(page_h, 1)
         w = (x2 - x1) / max(page_w, 1)

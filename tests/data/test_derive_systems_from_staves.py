@@ -60,6 +60,26 @@ class TestGroupStavesIntoSystems:
         systems = group_staves_into_systems(staves)
         assert len(systems) == 2
 
+    def test_satb_choral_with_lyric_gaps_grouped(self):
+        """SATB choral page: 4 vocal staves with ~100 px lyric gaps between them.
+
+        Real-world failure mode: a Chorissimo choral page has 4 staves of height
+        ~50 px separated by ~100 px gaps (lyrics sit between staves). The old
+        heuristic with vertical_gap_factor=1.5 split them into 4 systems; the
+        loosened factor=2.5 default groups them into one system (matching the
+        bracket grouping a human reader would see).
+        """
+        staves = [
+            # staff_h ≈ 50 px, inter-staff gap ≈ 100 px (within 2.5x staff_h)
+            {"bbox": (100, 200, 2100, 250)},
+            {"bbox": (100, 350, 2100, 400)},
+            {"bbox": (100, 500, 2100, 550)},
+            {"bbox": (100, 650, 2100, 700)},
+        ]
+        systems = group_staves_into_systems(staves)
+        assert len(systems) == 1
+        assert systems[0]["staves_in_system"] == 4
+
     def test_unsorted_input_sorts_by_y(self):
         """Input given in non-spatial order — should still produce correct system grouping."""
         staves = [

@@ -1312,6 +1312,12 @@ class _SvgSystemInfo:
     staves_per_system: int
     y_top: float
     y_bottom: float
+    # x_left is the left edge of the system bounding-box rect, which Verovio
+    # places at the bracket position (rect width is just the bracket itself,
+    # ~20-30 px). Use as a candidate for the bbox left edge to capture the
+    # bracket as a distinctive YOLO-detection anchor. None when no bracket
+    # info is available (e.g., older callers, or pages without a system rect).
+    x_left: Optional[float] = None
 
 
 def _extract_system_layout_from_svg(
@@ -1331,7 +1337,7 @@ def _extract_system_layout_from_svg(
     except ET.ParseError:
         return None
 
-    raw: List[Tuple[float, float, int, int]] = []  # (y_top, y_bottom, measures, staves)
+    raw: List[Tuple[float, float, int, int, float]] = []  # (y_top, y_bottom, measures, staves, x_left)
     for elem in root.iter():
         if elem.attrib.get("class", "").strip() != "system":
             continue
@@ -1350,23 +1356,27 @@ def _extract_system_layout_from_svg(
             if c.attrib.get("class", "").strip() == "staff"
         )
 
-        # Extract bounding box y and height
+        # Extract bounding box y, height, and x (bracket left edge).
         y_top = 0.0
         y_bottom = 0.0
+        x_left = 0.0
         for child in elem.iter():
             if child.attrib.get("class", "").strip() == "system bounding-box":
                 for rect in child.iter():
                     tag = rect.tag.split("}")[-1] if "}" in rect.tag else rect.tag
                     if tag == "rect":
+                        x_val = parse_float(rect.attrib.get("x"))
                         y_val = parse_float(rect.attrib.get("y"))
                         h_val = parse_float(rect.attrib.get("height"))
                         if y_val is not None:
                             y_top = y_val
                             y_bottom = y_val + (h_val or 0.0)
+                        if x_val is not None:
+                            x_left = x_val
                         break
                 break
 
-        raw.append((y_top, y_bottom, len(measures), staves_in_first))
+        raw.append((y_top, y_bottom, len(measures), staves_in_first, x_left))
 
     if not raw:
         return None
@@ -1378,8 +1388,9 @@ def _extract_system_layout_from_svg(
             staves_per_system=s,
             y_top=yt,
             y_bottom=yb,
+            x_left=xl,
         )
-        for yt, yb, m, s in raw
+        for yt, yb, m, s, xl in raw
     ]
 
 
@@ -1443,6 +1454,14 @@ def _build_system_yolo_objects(
         y_min = min(staff_boxes[i][1] for i in indices)
         x_max = max(staff_boxes[i][0] + staff_boxes[i][2] for i in indices)
         y_max = max(staff_boxes[i][1] + staff_boxes[i][3] for i in indices)
+        # Pull the bbox left edge out to include the bracket: Verovio's system
+        # bounding-box rect's x is at the bracket position. This gives YOLO a
+        # distinctive visual anchor for system detection (brackets are unique
+        # markers that don't appear elsewhere on the page).
+        if 0 <= sys_idx < len(svg_layout):
+            sys_x_left = svg_layout[sys_idx].x_left
+            if sys_x_left is not None:
+                x_min = min(x_min, sys_x_left)
         bbox = (x_min, y_min, max(0.0, x_max - x_min), max(0.0, y_max - y_min))
         label_objects.append((0, bbox))
         staves_in_system.append(len(indices))

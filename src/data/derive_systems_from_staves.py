@@ -5,6 +5,10 @@ authoritative system markup is not available.
 
 Heuristic: group adjacent staves vertically (gap < vertical_gap_factor * staff_height) AND
 x-extent overlap >= x_overlap_threshold. Produces one system bbox per group, sorted top-to-bottom.
+
+vertical_gap_factor=2.5 is loose enough to group SATB choral systems where lyrics
+sit between staves (gap ~80-150 px, staff height ~50 px → ratio up to ~3). Tighter
+factors (e.g., 1.5) under-merge brackets-grouped vocal systems.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ from typing import Iterable, List, Dict
 
 def group_staves_into_systems(
     staves: Iterable[Dict],
-    vertical_gap_factor: float = 1.5,
+    vertical_gap_factor: float = 2.5,
     x_overlap_threshold: float = 0.80,
 ) -> List[Dict]:
     """Group per-staff bboxes into system bboxes by spatial proximity.
