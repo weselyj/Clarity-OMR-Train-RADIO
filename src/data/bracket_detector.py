@@ -151,36 +151,37 @@ def _merge_close_brackets(
 def group_staves_by_brackets(
     staves: Sequence[Dict],
     brackets: Sequence[Dict],
+    *,
+    upward_attach_max_gap_factor: float = 2.5,
 ) -> List[Dict]:
     """Group staves by which delimiter's y-range overlaps the staff.
 
-    Uses overlap (any y-overlap, not strict containment) so a vocal staff at
-    the top of a system whose barline starts slightly below the vocal still
-    gets grouped correctly.
+    Two-pass assignment:
+      1. **Overlap**: assign each staff to the delimiter with most y-overlap.
+      2. **Upward attach**: for unassigned staves, look for a delimiter BELOW
+         within ``upward_attach_max_gap_factor × staff_height``. This handles
+         vocal staves that sit above piano-only braces (lieder/choral
+         convention where the first barline only spans piano staves).
 
     Each system bbox extends:
       - Left to the delimiter's x position
       - Vertically to MIN(staff y_top, delimiter y_top) and MAX(staff y_bottom, delimiter y_bottom)
 
-    Staves not overlapping any delimiter become their own 1-staff systems.
+    Staves with no nearby delimiter become their own 1-staff systems.
     """
     if not staves:
         return []
     sorted_staves = sorted(staves, key=lambda s: s["bbox"][1])
     if not brackets:
         return [
-            {
-                "bbox": tuple(s["bbox"]),
-                "staves_in_system": 1,
-            }
+            {"bbox": tuple(s["bbox"]), "staves_in_system": 1}
             for s in sorted_staves
         ]
 
     by_bracket: Dict[int, List[Dict]] = {}
-    unassigned: List[Dict] = []
+    unassigned_pass1: List[Dict] = []
     for staff in sorted_staves:
         _x1, y1, _x2, y2 = staff["bbox"]
-        # Find the delimiter with the most y-overlap with this staff
         best_idx = None
         best_overlap = 0.0
         for b_idx, b in enumerate(brackets):
@@ -191,9 +192,27 @@ def group_staves_by_brackets(
                 best_overlap = overlap
                 best_idx = b_idx
         if best_idx is None or best_overlap <= 0:
-            unassigned.append(staff)
+            unassigned_pass1.append(staff)
         else:
             by_bracket.setdefault(best_idx, []).append(staff)
+
+    # Pass 2: upward attach for orphaned staves above a delimiter.
+    unassigned_pass2: List[Dict] = []
+    for staff in unassigned_pass1:
+        _x1, y1, _x2, y2 = staff["bbox"]
+        staff_h = max(1.0, y2 - y1)
+        max_gap = upward_attach_max_gap_factor * staff_h
+        attached_idx = None
+        # Find first delimiter whose y_top is below the staff's y_bottom (within max_gap)
+        for b_idx, b in enumerate(brackets):
+            gap = b["y_top"] - y2
+            if 0 <= gap <= max_gap:
+                attached_idx = b_idx
+                break
+        if attached_idx is None:
+            unassigned_pass2.append(staff)
+        else:
+            by_bracket.setdefault(attached_idx, []).append(staff)
 
     out: List[Dict] = []
     for b_idx in sorted(by_bracket.keys()):
@@ -211,7 +230,7 @@ def group_staves_by_brackets(
             "staves_in_system": len(sub_staves),
         })
 
-    for staff in unassigned:
+    for staff in unassigned_pass2:
         x1, y1, x2, y2 = staff["bbox"]
         out.append({"bbox": (x1, y1, x2, y2), "staves_in_system": 1})
 
