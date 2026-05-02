@@ -86,7 +86,52 @@ def detect_brackets_on_page(
         })
 
     brackets.sort(key=lambda b: b["y_top"])
+    brackets = _merge_close_brackets(
+        brackets,
+        x_tolerance_px=max(8, int(w * 0.012)),
+        y_gap_tolerance_px=max(20, int(h * 0.04)),
+    )
     return brackets
+
+
+def _merge_close_brackets(
+    brackets: List[Dict],
+    *,
+    x_tolerance_px: int,
+    y_gap_tolerance_px: int,
+) -> List[Dict]:
+    """Merge brackets at similar x with small y-gap (likely one bracket split by anti-aliasing)."""
+    if not brackets:
+        return []
+    # Group by approximate x cluster
+    by_x: Dict[int, List[Dict]] = {}
+    for b in sorted(brackets, key=lambda b: b["x"]):
+        # Bucket by x_tolerance_px
+        placed = False
+        for key in list(by_x.keys()):
+            if abs(b["x"] - key) <= x_tolerance_px:
+                by_x[key].append(b)
+                placed = True
+                break
+        if not placed:
+            by_x[int(b["x"])] = [b]
+
+    merged: List[Dict] = []
+    for x_key, group in by_x.items():
+        group.sort(key=lambda b: b["y_top"])
+        cur = dict(group[0])
+        for nxt in group[1:]:
+            gap = nxt["y_top"] - cur["y_bottom"]
+            if gap <= y_gap_tolerance_px:
+                cur["y_bottom"] = max(cur["y_bottom"], nxt["y_bottom"])
+                cur["height"] = cur["y_bottom"] - cur["y_top"]
+            else:
+                merged.append(cur)
+                cur = dict(nxt)
+        merged.append(cur)
+
+    merged.sort(key=lambda b: b["y_top"])
+    return merged
 
 
 def group_staves_by_brackets(
