@@ -60,6 +60,27 @@ class TestGroupStavesIntoSystems:
         systems = group_staves_into_systems(staves)
         assert len(systems) == 2
 
+    def test_piano_vocal_lieder_5_systems_3_staves_each(self):
+        """Schubert lieder D911-04 page 004 layout: 5 systems × 3 staves each.
+
+        Real-world failure mode that motivated bimodal threshold detection:
+        intra-system gaps (~30-40 px between vocal/treble/bass) and
+        inter-system gaps (~50 px) are too close for any single fixed factor
+        to distinguish. The bimodal-detection heuristic finds the natural
+        split per-page.
+        """
+        staves = []
+        y = 100.0
+        for sys_idx in range(5):
+            for staff_idx in range(3):
+                staves.append({"bbox": (100.0, y, 2100.0, y + 40.0)})
+                y += 40.0 + 30.0  # staff_h=40, intra-gap=30
+            y += 20.0  # extra inter-system gap (intra=30, inter=30+20=50)
+        systems = group_staves_into_systems(staves)
+        assert len(systems) == 5, f"Expected 5 systems, got {len(systems)}"
+        for sys_dict in systems:
+            assert sys_dict["staves_in_system"] == 3
+
     def test_satb_choral_with_lyric_gaps_grouped(self):
         """SATB choral page: 4 vocal staves with ~100 px lyric gaps between them.
 
