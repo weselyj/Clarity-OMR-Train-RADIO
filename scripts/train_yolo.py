@@ -7,7 +7,11 @@ disabled), with the mixed dataset and chosen base model.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
 from ultralytics import YOLO
 
