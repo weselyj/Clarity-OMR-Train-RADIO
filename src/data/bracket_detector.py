@@ -65,13 +65,17 @@ def detect_brackets_on_page(
 
     staff_xmins = [s["bbox"][0] for s in staves]
     staff_heights = sorted(s["bbox"][3] - s["bbox"][1] for s in staves)
-    staff_xmin = min(staff_xmins)
+    staff_xmin_min = min(staff_xmins)
+    staff_xmin_max = max(staff_xmins)
     median_staff_h = staff_heights[len(staff_heights) // 2]
 
-    # Crop a thin vertical strip at staff_xmin where the first barline sits.
+    # Search across the range of staff x-starts: pages where different systems
+    # have different left margins (Verovio synthetic excerpts where some systems
+    # are shorter / right-justified) need brackets detected at multiple x
+    # positions. Strip extends from min - delta to max + delta.
     delta = max(8, int(w * barline_search_width_frac))
-    x_lo = max(0, int(staff_xmin) - delta)
-    x_hi = min(w, int(staff_xmin) + delta)
+    x_lo = max(0, int(staff_xmin_min) - delta)
+    x_hi = min(w, int(staff_xmin_max) + delta)
     if x_hi <= x_lo:
         return []
     strip = img[:, x_lo:x_hi]

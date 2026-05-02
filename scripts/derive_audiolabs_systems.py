@@ -29,8 +29,8 @@ def write_yolo_systems(
     out_path: Path,
     leftward_bracket_margin_px: float = 40.0,
     rightward_margin_px: float = 40.0,
-    vertical_margin_frac: float = 0.5,
-    vertical_margin_extra_px: float = 8.0,  # absolute padding on top of frac (Wagner high/low notes)
+    vertical_margin_frac: float = 0.3,
+    vertical_margin_extra_px: float = 4.0,  # absolute padding for Wagner symphonic note range
 ) -> None:
     """Write YOLO-format system labels (class 0) + .staves.json sidecar.
 
