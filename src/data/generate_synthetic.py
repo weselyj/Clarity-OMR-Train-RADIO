@@ -1408,6 +1408,48 @@ def _assign_staff_boxes_to_systems(
     return result
 
 
+def _build_system_yolo_objects(
+    staff_boxes: Sequence[Tuple[float, float, float, float]],
+    svg_layout: Sequence["_SvgSystemInfo"],
+) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
+    """Group per-staff bboxes into per-system YOLO label objects.
+
+    Uses Verovio's authoritative ``staves_per_system`` from the SVG layout
+    to sequentially assign staff boxes to systems (top-to-bottom), then
+    unions each group into one bbox.
+
+    Returns a pair ``(label_objects, staves_in_system)`` where:
+      - ``label_objects`` is ``[(0, (x, y, w, h)), ...]`` — class 0, page-pixel coords
+      - ``staves_in_system`` is a parallel list of stave counts
+    Surplus staff boxes beyond what ``svg_layout`` accounts for are dropped
+    (matching ``_assign_staff_boxes_to_systems`` behavior).
+    """
+    if not staff_boxes or not svg_layout:
+        return [], []
+
+    box_to_system = _assign_staff_boxes_to_systems(staff_boxes, svg_layout)
+
+    by_system: Dict[int, List[int]] = {}
+    for box_idx, (sys_idx, _pos) in box_to_system.items():
+        by_system.setdefault(sys_idx, []).append(box_idx)
+
+    label_objects: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    staves_in_system: List[int] = []
+    for sys_idx in sorted(by_system.keys()):
+        indices = by_system[sys_idx]
+        if not indices:
+            continue
+        x_min = min(staff_boxes[i][0] for i in indices)
+        y_min = min(staff_boxes[i][1] for i in indices)
+        x_max = max(staff_boxes[i][0] + staff_boxes[i][2] for i in indices)
+        y_max = max(staff_boxes[i][1] + staff_boxes[i][3] for i in indices)
+        bbox = (x_min, y_min, max(0.0, x_max - x_min), max(0.0, y_max - y_min))
+        label_objects.append((0, bbox))
+        staves_in_system.append(len(indices))
+
+    return label_objects, staves_in_system
+
+
 def _extract_measure_range_from_sequence(
     staff_sequence: Sequence[str],
     measure_start: int,
@@ -1679,6 +1721,7 @@ def _render_single_job(
     png_root: Path,
     staff_crop_root: Path,
     label_root: Path,
+    label_systems_root: Path,
     token_cache: Dict[str, Optional[List[List[str]]]],
     allow_fallback_labels: bool,
 ) -> Dict[str, object]:
@@ -1736,6 +1779,7 @@ def _render_single_job(
                 page_ink_array=page_ink_array,
             )
             output_label = label_root / job.style_id / f"{page_basename}.txt"
+            output_label_systems = label_systems_root / job.style_id / f"{page_basename}.txt"
             staff_boxes = _sorted_staff_boxes(objects)
             barline_class_id = YOLO_CLASS_TO_ID.get("barline_system")
             barline_boxes = [
@@ -1769,6 +1813,29 @@ def _render_single_job(
                 yolo_labels_rejected += 1
                 for reason in reject_reasons:
                     yolo_reject_reasons[reason] += 1
+
+            # System-level labels: parsed once here and reused below for token pairing.
+            svg_layout = _extract_system_layout_from_svg(svg_text)
+            staves_in_system: List[int] = []
+            label_systems_written = False
+            if label_valid and svg_layout:
+                system_label_objects, staves_in_system = _build_system_yolo_objects(staff_boxes, svg_layout)
+                if system_label_objects:
+                    write_yolo_labels(
+                        output_label_systems,
+                        system_label_objects,
+                        page_width=page_width,
+                        page_height=page_height,
+                    )
+                    output_label_systems.with_suffix(".staves.json").write_text(
+                        json.dumps(staves_in_system), encoding="utf-8",
+                    )
+                    label_systems_written = True
+            if not label_systems_written and output_label_systems.exists():
+                output_label_systems.unlink()
+                sidecar = output_label_systems.with_suffix(".staves.json")
+                if sidecar.exists():
+                    sidecar.unlink()
 
             class_counter = Counter()
             for class_id, _ in label_objects:
@@ -1819,7 +1886,7 @@ def _render_single_job(
                     token_pairing_mismatches += 1
                 else:
                     # --- Primary path: SVG-based exact measure mapping ---
-                    svg_layout = _extract_system_layout_from_svg(svg_text)
+                    # svg_layout was hoisted above (alongside system-label emission)
                     use_svg = svg_layout is not None and len(svg_layout) > 0
 
                     if use_svg:
@@ -1984,6 +2051,8 @@ def _render_single_job(
                     "svg_path": relpath(project_root, output_svg),
                     "png_path": relpath(project_root, output_png) if output_png else None,
                     "label_path": relpath(project_root, output_label) if label_written else None,
+                    "label_systems_path": relpath(project_root, output_label_systems) if label_systems_written else None,
+                    "staves_in_system": staves_in_system,
                     "yolo_label_valid": label_valid,
                     "yolo_reject_reasons": reject_reasons,
                     "page_width": page_width,
@@ -2039,6 +2108,7 @@ def _render_source_task(
     png_root: Path,
     staff_crop_root: Path,
     label_root: Path,
+    label_systems_root: Path,
     allow_fallback_labels: bool,
 ) -> Dict[str, object]:
     source_key = str(task.source_path.resolve())
@@ -2080,6 +2150,7 @@ def _render_source_task(
             png_root=png_root,
             staff_crop_root=staff_crop_root,
             label_root=label_root,
+            label_systems_root=label_systems_root,
             token_cache=token_cache,
             allow_fallback_labels=allow_fallback_labels,
         )
@@ -2136,6 +2207,7 @@ def run(
     png_root = synthetic_root / "images"
     staff_crop_root = synthetic_root / "staff_crops"
     label_root = synthetic_root / "labels"
+    label_systems_root = synthetic_root / "labels_systems"
     manifest_root = synthetic_root / "manifests"
     manifest_root.mkdir(parents=True, exist_ok=True)
 
@@ -2194,6 +2266,7 @@ def run(
                 png_root=png_root,
                 staff_crop_root=staff_crop_root,
                 label_root=label_root,
+                label_systems_root=label_systems_root,
                 allow_fallback_labels=allow_fallback_labels,
             )
 
