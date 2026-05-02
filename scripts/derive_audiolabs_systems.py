@@ -27,19 +27,34 @@ def write_yolo_systems(
     page_h,
     out_path: Path,
     leftward_bracket_margin_px: float = 40.0,
+    vertical_margin_frac: float = 0.5,
 ) -> None:
     """Write YOLO-format system labels (class 0) + .staves.json sidecar.
 
-    Extends the bbox left edge by ``leftward_bracket_margin_px`` to capture
-    brackets in real scans (heuristic — real-scan per-staff labels don't include
-    brackets). Set to 0 to disable.
+    Real-scan per-staff annotations are drawn tightly around the 5 staff lines
+    and miss content that extends above/below: high notes with ledger lines,
+    low notes, dynamics, lyrics. We expand the system bbox accordingly:
+
+    - Left: by ``leftward_bracket_margin_px`` to capture brackets (~40 px).
+    - Top/bottom: by ``vertical_margin_frac × avg_staff_height`` to capture
+      notes/dynamics/lyrics (~0.5 × staff height per side).
+
+    Both expansions clamp to page bounds. Set the parameters to 0 to disable.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     staves_per_bbox = []
     for s in systems:
         x1, y1, x2, y2 = s["bbox"]
+        # Per-system staff height = total system height / staves count
+        n_staves = max(1, int(s["staves_in_system"]))
+        per_staff_h = max(0.0, (y2 - y1) / n_staves)
+        v_margin = vertical_margin_frac * per_staff_h
+
         x1 = max(0.0, x1 - leftward_bracket_margin_px)
+        y1 = max(0.0, y1 - v_margin)
+        y2 = min(float(page_h), y2 + v_margin)
+
         cx = ((x1 + x2) / 2) / max(page_w, 1)
         cy = ((y1 + y2) / 2) / max(page_h, 1)
         w = (x2 - x1) / max(page_w, 1)
