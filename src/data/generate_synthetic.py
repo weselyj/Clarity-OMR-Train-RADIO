@@ -1424,7 +1424,7 @@ def _build_system_yolo_objects(
     svg_layout: Sequence["_SvgSystemInfo"],
     *,
     leftward_bracket_margin_px: float = 40.0,
-    vertical_margin_frac: float = 0.3,
+    vertical_margin_frac: float = 0.0,
 ) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
     """Group per-staff bboxes into per-system YOLO label objects.
 

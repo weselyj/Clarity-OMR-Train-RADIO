@@ -29,7 +29,8 @@ def write_yolo_systems(
     out_path: Path,
     leftward_bracket_margin_px: float = 40.0,
     rightward_margin_px: float = 40.0,
-    vertical_margin_frac: float = 0.9,  # AudioLabs (Wagner symphonic): high/low notes need extra room
+    vertical_margin_frac: float = 0.5,
+    vertical_margin_extra_px: float = 8.0,  # absolute padding on top of frac (Wagner high/low notes)
 ) -> None:
     """Write YOLO-format system labels (class 0) + .staves.json sidecar.
 
@@ -54,7 +55,7 @@ def write_yolo_systems(
         # Per-system staff height = total system height / staves count
         n_staves = max(1, int(s["staves_in_system"]))
         per_staff_h = max(0.0, (y2 - y1) / n_staves)
-        v_margin = vertical_margin_frac * per_staff_h
+        v_margin = vertical_margin_frac * per_staff_h + vertical_margin_extra_px
 
         x1 = max(0.0, x1 - leftward_bracket_margin_px)
         x2 = min(float(page_w), x2 + rightward_margin_px)
