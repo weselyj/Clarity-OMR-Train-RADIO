@@ -199,23 +199,35 @@ def group_staves_by_brackets(
         else:
             by_bracket.setdefault(best_idx, []).append(staff)
 
-    # Pass 2: upward attach for orphaned staves above a delimiter.
-    unassigned_pass2: List[Dict] = []
+    # Pass 2: upward attach. Group unassigned staves by which bracket they
+    # could attach to (nearest below within max_gap). Only attach if the group
+    # has size 1 (lone vocal-above-brace, lieder convention). If 2+ staves
+    # share the same target bracket, that's likely a missed bracket above —
+    # leave them all unassigned for spatial-grouping fallback so they form
+    # their own system rather than corrupting the bracket below.
+    candidates_for_attach: Dict[int, List[Dict]] = {}
+    no_target: List[Dict] = []
     for staff in unassigned_pass1:
-        _x1, y1, _x2, y2 = staff["bbox"]
-        staff_h = max(1.0, y2 - y1)
+        _x1, _y1, _x2, y2 = staff["bbox"]
+        staff_h = max(1.0, y2 - staff["bbox"][1])
         max_gap = upward_attach_max_gap_factor * staff_h
         attached_idx = None
-        # Find first delimiter whose y_top is below the staff's y_bottom (within max_gap)
         for b_idx, b in enumerate(brackets):
             gap = b["y_top"] - y2
             if 0 <= gap <= max_gap:
                 attached_idx = b_idx
                 break
         if attached_idx is None:
-            unassigned_pass2.append(staff)
+            no_target.append(staff)
         else:
-            by_bracket.setdefault(attached_idx, []).append(staff)
+            candidates_for_attach.setdefault(attached_idx, []).append(staff)
+
+    unassigned_pass2: List[Dict] = list(no_target)
+    for b_idx, attach_group in candidates_for_attach.items():
+        if len(attach_group) == 1:
+            by_bracket.setdefault(b_idx, []).append(attach_group[0])
+        else:
+            unassigned_pass2.extend(attach_group)
 
     out: List[Dict] = []
     for b_idx in sorted(by_bracket.keys()):
