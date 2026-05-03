@@ -2,7 +2,7 @@
   "dataset_name": "mixed_systems_v1",
   "build_seed": 20260502,
   "val_ratio": 0.2,
-  "elapsed_seconds": 28.2,
+  "elapsed_seconds": 24.8,
   "n_train_pairs": 20594,
   "n_val_pairs": 5142,
   "n_total_pairs": 25736,
