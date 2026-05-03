@@ -1,61 +1,64 @@
 """Derive system-level YOLO labels for sparse_augment from existing per-staff labels.
 
 Input: data/processed/sparse_augment/labels/{style}/*.txt + corresponding images.
+       data/processed/sparse_augment/pages/{style}/*.svg  (Verovio SVG, same stem)
 Output: data/processed/sparse_augment/labels_systems/{style}/*.txt + .staves.json sidecars.
 
-sparse_augment layout: labels nested per-style (labels/<style>/<page>.txt);
-images keyed by DPI then style (images/dpi{N}/<style>/<page>.png).
+v15 algorithm: SVG-hierarchy grouping (same as generate_synthetic.py).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from src.data.bracket_detector import detect_brackets_on_page, group_staves_by_brackets  # noqa: E402
-from src.data.derive_systems_from_staves import group_staves_into_systems  # noqa: E402
-from scripts.derive_audiolabs_systems import write_yolo_systems  # noqa: E402
+from src.data.generate_synthetic import (  # noqa: E402
+    _build_system_yolo_objects_v15,
+    write_yolo_labels,
+)
 
 DEFAULT_LABELS_DIR = Path("data/processed/sparse_augment/labels")
+DEFAULT_PAGES_DIR  = Path("data/processed/sparse_augment/pages")
 DEFAULT_IMAGES_DIR = Path("data/processed/sparse_augment/images")
-DEFAULT_OUT_DIR = Path("data/processed/sparse_augment/labels_systems")
+DEFAULT_OUT_DIR    = Path("data/processed/sparse_augment/labels_systems")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--labels-dir", type=Path, default=DEFAULT_LABELS_DIR)
+    parser.add_argument("--pages-dir",  type=Path, default=DEFAULT_PAGES_DIR)
     parser.add_argument("--images-dir", type=Path, default=DEFAULT_IMAGES_DIR)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--vertical-gap-factor", type=float, default=2.5)
-    parser.add_argument("--x-overlap-threshold", type=float, default=0.80)
-    parser.add_argument(
-        "--use-bracket-detection",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
+    parser.add_argument("--out-dir",    type=Path, default=DEFAULT_OUT_DIR)
     args = parser.parse_args()
 
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ImportError:
+        print("Pillow is required: pip install Pillow", file=sys.stderr)
+        return 1
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     label_files = sorted(args.labels_dir.rglob("*.txt"))
-    print(f"Processing {len(label_files)} per-staff label files (sparse_augment)...", flush=True)
+    print(f"Processing {len(label_files)} per-staff label files (sparse_augment v15)...", flush=True)
 
     n_pages = 0
     n_systems = 0
-    n_skipped = 0
-    n_bracket_detected = 0
-    n_fallback_spatial = 0
+    n_skipped_no_image = 0
+    n_skipped_no_svg = 0
 
     for label_path in label_files:
-        relative = label_path.relative_to(args.labels_dir)
-        page_id = relative.stem
-        style_id = relative.parent.name if relative.parent.name else ""
+        relative  = label_path.relative_to(args.labels_dir)
+        page_id   = relative.stem
+        style_id  = relative.parent.name if relative.parent.name else ""
 
+        # ----------------------------------------------------------------
+        # Resolve the PNG (need page dimensions)
+        # ----------------------------------------------------------------
         image_path = None
         for dpi_dir in args.images_dir.iterdir():
             if not dpi_dir.is_dir():
@@ -69,13 +72,24 @@ def main() -> int:
                 break
 
         if image_path is None:
-            n_skipped += 1
+            n_skipped_no_image += 1
             continue
 
         with Image.open(image_path) as img:
             page_w, page_h = img.size
 
-        staves = []
+        # ----------------------------------------------------------------
+        # Resolve the SVG (v15 hierarchy grouping needs it)
+        # ----------------------------------------------------------------
+        svg_path = args.pages_dir / style_id / f"{page_id}.svg"
+        if not svg_path.exists():
+            n_skipped_no_svg += 1
+            continue
+
+        # ----------------------------------------------------------------
+        # Read per-staff YOLO labels → pixel (x, y, w, h)
+        # ----------------------------------------------------------------
+        staff_boxes = []
         for line in label_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
@@ -83,38 +97,45 @@ def main() -> int:
             parts = line.split()
             if len(parts) < 5:
                 continue
-            cx, cy, w, h = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
+            cx, cy, w, h = (float(parts[1]), float(parts[2]),
+                             float(parts[3]), float(parts[4]))
             x1 = (cx - w / 2) * page_w
             y1 = (cy - h / 2) * page_h
-            x2 = (cx + w / 2) * page_w
-            y2 = (cy + h / 2) * page_h
-            staves.append({"bbox": (x1, y1, x2, y2)})
+            w_px = w * page_w
+            h_px = h * page_h
+            staff_boxes.append((x1, y1, w_px, h_px))
 
-        systems = []
-        if args.use_bracket_detection:
-            brackets = detect_brackets_on_page(image_path, staves)
-            if brackets:
-                systems = group_staves_by_brackets(staves, brackets)
-                n_bracket_detected += 1
-        if not systems:
-            systems = group_staves_into_systems(
-                staves,
-                vertical_gap_factor=args.vertical_gap_factor,
-                x_overlap_threshold=args.x_overlap_threshold,
-            )
-            n_fallback_spatial += 1
+        if not staff_boxes:
+            n_skipped_no_image += 1  # treat empty label as nothing to do
+            continue
 
+        # ----------------------------------------------------------------
+        # v15 system grouping
+        # ----------------------------------------------------------------
+        system_label_objects, staves_in_system = _build_system_yolo_objects_v15(
+            svg_path, staff_boxes, page_w, page_h
+        )
+
+        if not system_label_objects:
+            continue
+
+        # ----------------------------------------------------------------
+        # Write output — same flat YOLO format + .staves.json sidecar
+        # ----------------------------------------------------------------
         out_path = args.out_dir / style_id / f"{page_id}.txt"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        # sparse_augment: cleaner Verovio renders, no extra absolute padding
-        write_yolo_systems(systems, page_w, page_h, out_path, vertical_margin_extra_px=0.0)
+        write_yolo_labels(out_path, system_label_objects,
+                          page_width=page_w, page_height=page_h)
+        out_path.with_suffix(".staves.json").write_text(
+            json.dumps(staves_in_system), encoding="utf-8"
+        )
 
         n_pages += 1
-        n_systems += len(systems)
+        n_systems += len(system_label_objects)
 
     print(
-        f"Done. {n_pages} pages, {n_systems} systems, {n_skipped} skipped (no image). "
-        f"Bracket-detected: {n_bracket_detected}, Spatial-fallback: {n_fallback_spatial}.",
+        f"Done. {n_pages} pages, {n_systems} systems. "
+        f"Skipped: {n_skipped_no_image} (no image), {n_skipped_no_svg} (no SVG).",
         flush=True,
     )
     return 0

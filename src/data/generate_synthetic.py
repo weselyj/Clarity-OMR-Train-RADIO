@@ -56,6 +56,23 @@ DEFAULT_STYLE_PRESETS: Dict[str, Dict[str, object]] = {
 YOLO_CLASS_NAMES = ["staff"]
 YOLO_CLASS_TO_ID = {name: idx for idx, name in enumerate(YOLO_CLASS_NAMES)}
 
+# ---------------------------------------------------------------------------
+# v15 system-layout constants — tune here without touching algorithm code
+# ---------------------------------------------------------------------------
+# Margins added to raw system bboxes (derived from grouped staff bboxes)
+V15_SYSTEM_TOP_MARGIN_PX:    float = 80.0
+V15_SYSTEM_BOTTOM_MARGIN_PX: float = 130.0
+V15_RIGHT_BARLINE_MARGIN_PX: float = 60.0
+V15_LEFTWARD_BRACKET_MARGIN_PX: float = 40.0
+
+# Minimum pixel gap between adjacent final system bboxes (neighbor cap)
+V15_NEIGHBOR_GAP_PX: float = 2.0
+
+# Per-row SVG fallback expansion ratios (used when an SVG row has no matching
+# disk label — larger than per-staff ratios to cover ledger-line notes)
+V15_SYNTHETIC_ROW_TOP_RATIO:    float = 0.4
+V15_SYNTHETIC_ROW_BOTTOM_RATIO: float = 1.5   # bumped from 0.7 in v15 for deep bass-clef chords
+
 SCORE_TYPE_TARGET_DISTRIBUTION = {
     "piano": 0.40,
     "orchestral": 0.25,
@@ -1419,6 +1436,90 @@ def _assign_staff_boxes_to_systems(
     return result
 
 
+def _select_staff_boxes_for_svg_layout(
+    staff_boxes: Sequence[Tuple[float, float, float, float]],
+    svg_layout: Sequence["_SvgSystemInfo"],
+) -> List[Tuple[int, Tuple[float, float, float, float]]]:
+    """Select the staff boxes most consistent with the SVG's system counts.
+
+    Synthetic pages occasionally include extra staff-like boxes from ossias,
+    cue fragments, or annotations. Dropping the narrowest boxes is a useful
+    first approximation, but it can discard legitimate short final systems and
+    silently shift every later system. This dynamic assignment keeps top-to-
+    bottom order and exact ``staves_per_system`` counts while allowing surplus
+    boxes to be skipped where they least fit the page's system structure.
+    """
+    if not staff_boxes or not svg_layout:
+        return []
+
+    expected_total = sum(s.staves_per_system for s in svg_layout)
+    indexed = [(i, sb) for i, sb in enumerate(staff_boxes)]
+    if len(indexed) <= expected_total:
+        return indexed
+
+    widths = sorted(max(1.0, sb[2]) for sb in staff_boxes)
+    heights = sorted(max(1.0, sb[3]) for sb in staff_boxes)
+    median_w = widths[len(widths) // 2]
+    median_h = heights[len(heights) // 2]
+
+    def skip_penalty(box: Tuple[float, float, float, float]) -> float:
+        width_frac = max(0.0, box[2]) / max(1.0, median_w)
+        # Skipping a full-width staff should be expensive; skipping a short
+        # ossia/cue-like staff should be relatively cheap.
+        return median_h * (0.25 + 2.0 * width_frac * width_frac)
+
+    def skipped_penalty(start: int, end: int) -> float:
+        return sum(skip_penalty(indexed[i][1]) for i in range(start, end))
+
+    def group_cost(start: int, count: int) -> float:
+        group = [indexed[i][1] for i in range(start, start + count)]
+        y_top = min(y for _x, y, _w, _h in group)
+        y_bottom = max(y + h for _x, y, _w, h in group)
+        x_left = min(x for x, _y, _w, _h in group)
+        x_right = max(x + w for x, _y, w, _h in group)
+        widths_in_group = [w for _x, _y, w, _h in group]
+        x_span = x_right - x_left
+        widest = max(widths_in_group)
+        x_spread = max(0.0, x_span - widest)
+        return (y_bottom - y_top) + 0.05 * x_spread
+
+    n = len(indexed)
+    counts = [s.staves_per_system for s in svg_layout]
+    # dp[(sys_idx, next_box_idx)] = (cost, selected_original_indices)
+    states: Dict[int, Tuple[float, List[int]]] = {0: (0.0, [])}
+    for sys_idx, count in enumerate(counts):
+        next_states: Dict[int, Tuple[float, List[int]]] = {}
+        systems_left_after = len(counts) - sys_idx - 1
+        min_boxes_after = sum(counts[sys_idx + 1:])
+        for cursor, (base_cost, selected) in states.items():
+            latest_start = n - count - min_boxes_after
+            for start in range(cursor, latest_start + 1):
+                end = start + count
+                cost = (
+                    base_cost
+                    + skipped_penalty(cursor, start)
+                    + group_cost(start, count)
+                )
+                chosen = selected + [indexed[i][0] for i in range(start, end)]
+                prev = next_states.get(end)
+                if prev is None or cost < prev[0]:
+                    next_states[end] = (cost, chosen)
+        states = next_states
+        if not states:
+            return indexed[:expected_total]
+
+    best_cost = None
+    best_selected: List[int] = []
+    for cursor, (cost, selected) in states.items():
+        total_cost = cost + skipped_penalty(cursor, n)
+        if best_cost is None or total_cost < best_cost:
+            best_cost = total_cost
+            best_selected = selected
+
+    selected_set = set(best_selected)
+    return [(i, sb) for i, sb in indexed if i in selected_set]
+
+
 def _build_system_yolo_objects(
     staff_boxes: Sequence[Tuple[float, float, float, float]],
     svg_layout: Sequence["_SvgSystemInfo"],
@@ -1428,15 +1529,11 @@ def _build_system_yolo_objects(
 ) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
     """Group per-staff bboxes into per-system YOLO label objects.
 
-    Uses Verovio's authoritative system y-range from each ``_SvgSystemInfo`` to
-    assign staff bboxes to systems by overlap. Falls back to sequential
-    assignment when overlap-based fails (defensive — should rarely happen since
-    Verovio's y-range is authoritative).
-
-    The overlap-based approach correctly handles pages with extra
-    ``<g class="staff">`` elements (ossia/annotation snippets) that aren't
-    structurally part of any system: those bboxes won't y-overlap any system
-    and get dropped.
+    Uses Verovio's authoritative ``staves_per_system`` counts, then assigns
+    already-pixel-space staff boxes in top-to-bottom order. When surplus
+    staff-like boxes are present, a small dynamic-programming pass chooses which
+    boxes to skip by looking for compact vertical groups matching the expected
+    per-system counts. This avoids width-only pruning shifting later systems.
 
     Returns a pair ``(label_objects, staves_in_system)`` where:
       - ``label_objects`` is ``[(0, (x, y, w, h)), ...]`` — class 0, page-pixel coords
@@ -1445,26 +1542,7 @@ def _build_system_yolo_objects(
     if not staff_boxes or not svg_layout:
         return [], []
 
-    # Filter ossias / annotation snippets before sequential assignment.
-    # Verovio sometimes renders ossia/annotation blocks as <g class="staff">
-    # elements that show up in page-level per-staff annotation but aren't
-    # structurally part of any system (Burleigh-type pages where extra narrow
-    # staves shift the sequential assignment).
-    #
-    # Only drop the EXTRA staves above what svg_layout expects. Keep the
-    # widest ones (structural staves are typically full-width; ossias are
-    # narrow). This preserves systems with legitimately narrow staves
-    # (e.g., truncated final system at end of piece, partial-width endings).
-    expected_total = sum(s.staves_per_system for s in svg_layout)
-    if len(staff_boxes) > expected_total > 0:
-        indexed = [(i, sb) for i, sb in enumerate(staff_boxes)]
-        # Sort by width descending; take the top expected_total
-        indexed.sort(key=lambda t: -t[1][2])
-        kept_with_idx = indexed[:expected_total]
-        # Re-sort by original index (so y-order is preserved by _assign_staff_boxes_to_systems)
-        kept_with_idx.sort(key=lambda t: t[0])
-    else:
-        kept_with_idx = [(i, sb) for i, sb in enumerate(staff_boxes)]
+    kept_with_idx = _select_staff_boxes_for_svg_layout(staff_boxes, svg_layout)
 
     if not kept_with_idx:
         return [], []
@@ -1500,6 +1578,371 @@ def _build_system_yolo_objects(
         bbox = (x_min, y_min, max(0.0, x_max - x_min), max(0.0, y_max - y_min))
         label_objects.append((0, bbox))
         staves_in_system.append(len(indices))
+
+    return label_objects, staves_in_system
+
+
+# ---------------------------------------------------------------------------
+# v15 SVG-hierarchy helpers (ported from verovio_overlay_v15.py)
+# ---------------------------------------------------------------------------
+
+class _SvgStaffRow:
+    """One staff row extracted from a Verovio SVG hierarchy."""
+    __slots__ = ("sys_idx", "row_idx", "y_top", "y_bot", "y_center", "x_min", "x_max")
+
+    def __init__(
+        self,
+        sys_idx: int,
+        row_idx: int,
+        y_top: float,
+        y_bot: float,
+        y_center: float,
+        x_min: float,
+        x_max: float,
+    ) -> None:
+        self.sys_idx  = sys_idx
+        self.row_idx  = row_idx
+        self.y_top    = y_top
+        self.y_bot    = y_bot
+        self.y_center = y_center
+        self.x_min    = x_min
+        self.x_max    = x_max
+
+
+def _find_inner_svg_v15(root: ET.Element) -> Optional[ET.Element]:
+    """Find the inner SVG element with class='definition-scale' that carries the viewBox."""
+    for child in root.iter():
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag != "svg":
+            continue
+        if "definition-scale" in child.attrib.get("class", "").lower() and child.attrib.get("viewBox"):
+            return child
+    return None
+
+
+def _viewbox_scale_v15(
+    inner_svg: ET.Element, png_w: int, png_h: int
+) -> Tuple[float, float, float, float, float, float]:
+    """Return (vb_x, vb_y, vb_w, vb_h, sx, sy) from the inner SVG viewBox."""
+    vb = inner_svg.attrib.get("viewBox", "")
+    nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", vb)]
+    vb_x, vb_y, vb_w, vb_h = nums[:4]
+    return vb_x, vb_y, vb_w, vb_h, png_w / vb_w, png_h / vb_h
+
+
+def _staff_line_segments_v15(
+    staff_g: ET.Element,
+) -> List[Tuple[float, float, float, float]]:
+    """Extract horizontal staff-line segments from a <g class='staff'> element."""
+    segments: List[Tuple[float, float, float, float]] = []
+    for child in staff_g:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag != "path":
+            continue
+        d = child.attrib.get("d", "")
+        vals = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", d)]
+        if len(vals) < 4:
+            continue
+        x1, y1, x2, y2 = vals[:4]
+        if abs(y1 - y2) > 2.0:
+            continue  # skip non-horizontal paths
+        if abs(x2 - x1) < 10.0:
+            continue  # skip very short segments
+        segments.append((x1, y1, x2, y2))
+    return segments
+
+
+def _parse_svg_hierarchy_staves_v15(
+    svg_path: Path,
+    png_w: int,
+    png_h: int,
+) -> Tuple[List[_SvgStaffRow], int]:
+    """Parse SVG tree to extract one _SvgStaffRow per (sys_idx, row_idx).
+
+    Returns (svg_staff_rows, n_systems_in_svg).  On any parse error or when
+    no <g class='system'> elements exist, returns ([], 0) — callers use this
+    as the trigger for the single-staff fallback.
+    """
+    try:
+        content = svg_path.read_text(encoding="utf-8")
+        root = ET.fromstring(content)
+    except (OSError, ET.ParseError):
+        return [], 0
+
+    inner_svg = _find_inner_svg_v15(root)
+    if inner_svg is None:
+        return [], 0
+
+    vb_x, vb_y, vb_w, vb_h, sx, sy = _viewbox_scale_v15(inner_svg, png_w, png_h)
+
+    system_elems = [
+        elem for elem in inner_svg.iter()
+        if elem.attrib.get("class", "").strip() == "system"
+    ]
+    if not system_elems:
+        return [], 0
+
+    svg_rows: List[_SvgStaffRow] = []
+    for sys_idx, sys_elem in enumerate(system_elems):
+        measures = [
+            c for c in sys_elem
+            if c.attrib.get("class", "").strip() == "measure"
+        ]
+        if not measures:
+            continue
+
+        first_staves = [
+            c for c in measures[0]
+            if c.attrib.get("class", "").strip() == "staff"
+        ]
+        n_rows = len(first_staves)
+        if n_rows == 0:
+            continue
+
+        # Gather staff-line segments per row across all measures
+        row_segments: Dict[int, List[Tuple[float, float, float, float]]] = {
+            i: [] for i in range(n_rows)
+        }
+        for measure in measures:
+            staff_groups = [
+                c for c in measure
+                if c.attrib.get("class", "").strip() == "staff"
+            ]
+            for row_idx, sg in enumerate(staff_groups[:n_rows]):
+                row_segments[row_idx].extend(_staff_line_segments_v15(sg))
+
+        for row_idx in range(n_rows):
+            segs = row_segments[row_idx]
+            if not segs:
+                continue
+
+            ys = [s[1] for s in segs]
+            y_top_svg    = min(ys)
+            y_bot_svg    = max(ys)
+            y_center_svg = (y_top_svg + y_bot_svg) / 2.0
+
+            y_top_px    = (y_top_svg    - vb_y) * sy
+            y_bot_px    = (y_bot_svg    - vb_y) * sy
+            y_center_px = (y_center_svg - vb_y) * sy
+
+            x_min_svg = min(min(s[0], s[2]) for s in segs)
+            x_max_svg = max(max(s[0], s[2]) for s in segs)
+            x_min_px  = (x_min_svg - vb_x) * sx
+            x_max_px  = (x_max_svg - vb_x) * sx
+
+            svg_rows.append(_SvgStaffRow(
+                sys_idx=sys_idx,
+                row_idx=row_idx,
+                y_top=y_top_px,
+                y_bot=y_bot_px,
+                y_center=y_center_px,
+                x_min=x_min_px,
+                x_max=x_max_px,
+            ))
+
+    return svg_rows, len(system_elems)
+
+
+def _expand_single_staff_v15(
+    x1: float, y1: float, x2: float, y2: float,
+    page_h: float,
+    top_ratio: float,
+    bottom_ratio: float,
+) -> Tuple[float, float, float, float]:
+    """Expand a single staff bbox vertically using ratio-based padding."""
+    h = max(0.0, y2 - y1)
+    top_pad    = max(8.0, h * top_ratio)
+    bottom_pad = max(8.0, h * bottom_ratio)
+    return x1, max(0.0, y1 - top_pad), x2, min(float(page_h), y2 + bottom_pad)
+
+
+def _build_system_yolo_objects_v15(
+    svg_path: Path,
+    staff_yolo_boxes: Sequence[Tuple[float, float, float, float]],
+    png_w: int,
+    png_h: int,
+) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
+    """Build system YOLO label objects using the v15 SVG-hierarchy algorithm.
+
+    Parameters
+    ----------
+    svg_path:
+        Path to the Verovio-rendered SVG for this page (must exist on disk).
+    staff_yolo_boxes:
+        Already-expanded per-staff bboxes in pixel-space YOLO format
+        ``(x, y, w, h)`` — the same list passed to the old
+        ``_build_system_yolo_objects``.
+    png_w, png_h:
+        Page dimensions in pixels (used for coordinate normalisation and
+        clamping).
+
+    Returns
+    -------
+    label_objects : list of ``(class_id, (x, y, w, h))``
+        One entry per system, class_id always 0.  Coords are pixel-space
+        ``(x, y, w, h)`` ready for ``write_yolo_labels``.
+    staves_in_system : list of int
+        Parallel list of stave counts per system (same length as
+        ``label_objects``).
+
+    Algorithm (v15)
+    ---------------
+    1. Parse the SVG ``<g class="system">`` hierarchy to get per-row pixel
+       extents (``_parse_svg_hierarchy_staves_v15``).
+    2. Assign each per-staff disk label to the SVG row with the closest
+       y_center; inherits that row's sys_idx.
+    3. For SVG rows that received no disk label, synthesise a bbox from SVG
+       staff-line geometry using larger expansion ratios
+       (``V15_SYNTHETIC_ROW_TOP_RATIO``, ``V15_SYNTHETIC_ROW_BOTTOM_RATIO``).
+    4. Single-staff fallback: if the SVG has no ``<g class="system">``
+       elements, treat each disk label as its own system.
+    5. Apply fixed pixel margins (top/bottom/left/right), a neighbor-aware
+       cap so adjacent systems do not overlap, and clamp to page bounds.
+    """
+    if not staff_yolo_boxes:
+        return [], []
+
+    # Convert (x, y, w, h) pixel YOLO → (x1, y1, x2, y2) pixel absolute
+    staff_abs: List[Tuple[float, float, float, float]] = []
+    for x, y, w, h in staff_yolo_boxes:
+        staff_abs.append((x, y, x + w, y + h))
+
+    svg_rows, n_svg_systems = _parse_svg_hierarchy_staves_v15(svg_path, png_w, png_h)
+
+    # -----------------------------------------------------------------------
+    # Single-staff fallback: no <g class="system"> elements in SVG
+    # -----------------------------------------------------------------------
+    if n_svg_systems == 0:
+        label_objects: List[Tuple[int, Tuple[float, float, float, float]]] = []
+        staves_in_system: List[int] = []
+        # Sort by y-center, assign each disk label its own system
+        sorted_abs = sorted(staff_abs, key=lambda b: (b[1] + b[3]) / 2.0)
+        for i, (x1, y1, x2, y2) in enumerate(sorted_abs):
+            # Apply margins + clamp (treat single staff as a 1-staff system)
+            final_x1 = max(0.0,          x1 - V15_LEFTWARD_BRACKET_MARGIN_PX)
+            final_x2 = min(float(png_w), x2 + V15_RIGHT_BARLINE_MARGIN_PX)
+            final_y1 = max(0.0,          y1 - V15_SYSTEM_TOP_MARGIN_PX)
+            final_y2 = min(float(png_h), y2 + V15_SYSTEM_BOTTOM_MARGIN_PX)
+            w_px = max(0.0, final_x2 - final_x1)
+            h_px = max(0.0, final_y2 - final_y1)
+            label_objects.append((0, (final_x1, final_y1, w_px, h_px)))
+            staves_in_system.append(1)
+        return label_objects, staves_in_system
+
+    # -----------------------------------------------------------------------
+    # Multi-staff path: SVG-hierarchy grouping
+    # -----------------------------------------------------------------------
+
+    # Step 1: Assign each disk label to closest SVG row by y_center distance
+    # -----------------------------------------------------------------------
+    # assignments[i] = (sys_idx, row_idx) for disk label i
+    assignments: List[Tuple[int, int]] = []
+    for x1, y1, x2, y2 in staff_abs:
+        yc = (y1 + y2) / 2.0
+        closest = min(svg_rows, key=lambda r: abs(r.y_center - yc))
+        assignments.append((closest.sys_idx, closest.row_idx))
+
+    # Step 2: Group disk labels by system
+    by_system: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    for i, (sys_idx, _row_idx) in enumerate(assignments):
+        by_system.setdefault(sys_idx, []).append(staff_abs[i])
+
+    claimed_rows: Dict[int, set] = {}
+    for i, (sys_idx, row_idx) in enumerate(assignments):
+        claimed_rows.setdefault(sys_idx, set()).add(row_idx)
+
+    # Step 3: Build raw system bboxes, applying per-row SVG fallback for
+    #         unclaimed rows
+    # -----------------------------------------------------------------------
+    # raw_bboxes[sys_idx] = (raw_x1, raw_y1, raw_x2, raw_y2) in pixel abs
+    raw_bboxes: Dict[int, Tuple[float, float, float, float]] = {}
+    staves_per_sys: Dict[int, int] = {}
+
+    for si in range(n_svg_systems):
+        svg_rows_in_sys = [r for r in svg_rows if r.sys_idx == si]
+        if not svg_rows_in_sys:
+            continue
+
+        disk_members = by_system.get(si, [])
+        claimed = claimed_rows.get(si, set())
+        unclaimed = [r for r in svg_rows_in_sys if r.row_idx not in claimed]
+
+        synthetic_members: List[Tuple[float, float, float, float]] = []
+        for row in unclaimed:
+            _, exp_y1, _, exp_y2 = _expand_single_staff_v15(
+                row.x_min, row.y_top, row.x_max, row.y_bot,
+                float(png_h),
+                V15_SYNTHETIC_ROW_TOP_RATIO,
+                V15_SYNTHETIC_ROW_BOTTOM_RATIO,
+            )
+            synthetic_members.append((row.x_min, exp_y1, row.x_max, exp_y2))
+
+        all_members = disk_members + synthetic_members
+        if not all_members:
+            continue
+
+        raw_bboxes[si] = (
+            min(m[0] for m in all_members),
+            min(m[1] for m in all_members),
+            max(m[2] for m in all_members),
+            max(m[3] for m in all_members),
+        )
+        staves_per_sys[si] = len(disk_members) + len(synthetic_members)
+
+    if not raw_bboxes:
+        return [], []
+
+    # Step 4: Apply margins, neighbor cap, clamp
+    # -----------------------------------------------------------------------
+    sorted_sys = sorted(raw_bboxes.keys(), key=lambda si: raw_bboxes[si][1])
+    n = len(sorted_sys)
+
+    # Compute gap midpoints between consecutive raw systems
+    gap_mids: List[float] = []
+    for i in range(n - 1):
+        a_bot = raw_bboxes[sorted_sys[i]][3]
+        b_top = raw_bboxes[sorted_sys[i + 1]][1]
+        gap_mids.append((a_bot + b_top) / 2.0)
+
+    final_bboxes: Dict[int, Tuple[float, float, float, float]] = {}
+    for i, si in enumerate(sorted_sys):
+        rx1, ry1, rx2, ry2 = raw_bboxes[si]
+
+        # Apply margins
+        y_top_exp = ry1 - V15_SYSTEM_TOP_MARGIN_PX
+        y_bot_exp = ry2 + V15_SYSTEM_BOTTOM_MARGIN_PX
+        x_lft_exp = rx1 - V15_LEFTWARD_BRACKET_MARGIN_PX
+        x_rgt_exp = rx2 + V15_RIGHT_BARLINE_MARGIN_PX
+
+        # Neighbor cap: prevent overlapping into adjacent system's territory
+        if i > 0:
+            limit = gap_mids[i - 1]
+            if y_top_exp < limit:
+                y_top_exp = limit
+        if i + 1 < n:
+            limit = gap_mids[i]
+            if y_bot_exp > limit:
+                y_bot_exp = limit
+
+        # Clamp to page
+        final_x1 = max(0.0,          x_lft_exp)
+        final_y1 = max(0.0,          y_top_exp)
+        final_x2 = min(float(png_w), x_rgt_exp)
+        final_y2 = min(float(png_h), y_bot_exp)
+
+        final_bboxes[si] = (final_x1, final_y1, final_x2, final_y2)
+
+    # Convert (x1,y1,x2,y2) → YOLO (x,y,w,h) and build output
+    label_objects = []
+    staves_in_system = []
+    for si in sorted_sys:
+        x1, y1, x2, y2 = final_bboxes[si]
+        w_px = max(0.0, x2 - x1)
+        h_px = max(0.0, y2 - y1)
+        if w_px <= 0 or h_px <= 0:
+            continue
+        label_objects.append((0, (x1, y1, w_px, h_px)))
+        staves_in_system.append(staves_per_sys.get(si, 0))
 
     return label_objects, staves_in_system
 
@@ -1868,12 +2311,15 @@ def _render_single_job(
                 for reason in reject_reasons:
                     yolo_reject_reasons[reason] += 1
 
-            # System-level labels: parsed once here and reused below for token pairing.
+            # System-level labels: v15 SVG-hierarchy grouping.
+            # svg_layout is still parsed for the token-pairing path below.
             svg_layout = _extract_system_layout_from_svg(svg_text)
             staves_in_system: List[int] = []
             label_systems_written = False
-            if label_valid and svg_layout:
-                system_label_objects, staves_in_system = _build_system_yolo_objects(staff_boxes, svg_layout)
+            if label_valid:
+                system_label_objects, staves_in_system = _build_system_yolo_objects_v15(
+                    output_svg, staff_boxes, int(page_width), int(page_height)
+                )
                 if system_label_objects:
                     write_yolo_labels(
                         output_label_systems,
@@ -2559,4 +3005,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

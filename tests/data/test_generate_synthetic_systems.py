@@ -128,6 +128,45 @@ def test_extra_staff_boxes_beyond_layout_are_dropped():
     assert h == pytest.approx(200.0)  # 400 - 200, not 520 - 200
 
 
+def test_surplus_staff_does_not_shift_later_systems():
+    """A surplus staff-like box between systems should be skipped in place.
+
+    This guards the Satie/Hensel failure class: width-only pruning can keep a
+    nearby annotation/cue staff and drop a legitimate shorter final staff,
+    shifting all later system assignments.
+    """
+    staff_boxes = [
+        # System 0 expects 3 staves
+        (100.0, 100.0, 2000.0, 40.0),
+        (100.0, 180.0, 2000.0, 40.0),
+        (100.0, 260.0, 2000.0, 40.0),
+        # Surplus staff-like object close enough to shift sequential grouping
+        (300.0, 340.0, 1700.0, 40.0),
+        # System 1 expects 3 staves
+        (100.0, 620.0, 2000.0, 40.0),
+        (100.0, 700.0, 2000.0, 40.0),
+        (100.0, 780.0, 2000.0, 40.0),
+        # Legitimate shorter final system expects 3 staves
+        (100.0, 1040.0, 700.0, 40.0),
+        (100.0, 1120.0, 700.0, 40.0),
+        (100.0, 1200.0, 700.0, 40.0),
+    ]
+    svg_layout = _layout(3, 3, 3)
+
+    label_objects, staves_per = _build_system_yolo_objects(
+        staff_boxes, svg_layout, leftward_bracket_margin_px=0, vertical_margin_frac=0,
+    )
+
+    assert staves_per == [3, 3, 3]
+    assert len(label_objects) == 3
+    # The second system should start at the true second-system staff, not at
+    # the surplus staff-like object.
+    assert label_objects[1][1][1] == pytest.approx(620.0)
+    # The short final system must be retained.
+    assert label_objects[2][1][0] == pytest.approx(100.0)
+    assert label_objects[2][1][2] == pytest.approx(700.0)
+
+
 def test_top_to_bottom_ordering_preserved():
     """Output order matches svg_layout order (top-to-bottom)."""
     staff_boxes = [

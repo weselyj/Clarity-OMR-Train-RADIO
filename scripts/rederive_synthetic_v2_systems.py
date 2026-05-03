@@ -24,8 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from src.data.generate_synthetic import (  # noqa: E402
-    _build_system_yolo_objects,
-    _extract_system_layout_from_svg,
+    _build_system_yolo_objects_v15,
     write_yolo_labels,
 )
 
@@ -122,13 +121,9 @@ def main() -> int:
                 n_no_labels += 1
                 continue
 
-            svg_text = svg_path.read_text(encoding="utf-8")
-            svg_layout = _extract_system_layout_from_svg(svg_text)
-            if not svg_layout:
-                n_no_layout += 1
-                continue
-
-            label_objects, staves_in_system = _build_system_yolo_objects(staff_boxes, svg_layout)
+            label_objects, staves_in_system = _build_system_yolo_objects_v15(
+                svg_path, staff_boxes, page_w, page_h
+            )
             if not label_objects:
                 continue
 
