@@ -116,3 +116,54 @@ def test_canonicalize_two_staves_assigns_staff_idx_top_down() -> None:
     bot_note = next(n for n in notes if n.staff_idx == 1)
     assert top_note.payload[0] == "C5"
     assert bot_note.payload[0] == "C3"
+
+
+def test_canonicalize_tie_start_and_stop() -> None:
+    score = music21.stream.Score()
+    part = music21.stream.Part()
+    measure = music21.stream.Measure(number=1)
+    n1 = music21.note.Note("C4", quarterLength=1.0)
+    n1.tie = music21.tie.Tie("start")
+    n2 = music21.note.Note("C4", quarterLength=1.0)
+    n2.tie = music21.tie.Tie("stop")
+    measure.append(n1)
+    measure.append(n2)
+    part.append(measure)
+    score.append(part)
+
+    events = canonicalize_score(score)
+    kinds = [e.kind for e in events]
+    assert "tie_open" in kinds
+    assert "tie_close" in kinds
+
+
+def test_canonicalize_articulations() -> None:
+    score = music21.stream.Score()
+    part = music21.stream.Part()
+    measure = music21.stream.Measure(number=1)
+    n = music21.note.Note("C4", quarterLength=1.0)
+    n.articulations = [music21.articulations.Accent(), music21.articulations.Staccato()]
+    measure.append(n)
+    part.append(measure)
+    score.append(part)
+
+    events = canonicalize_score(score)
+    arts = [e for e in events if e.kind == "articulation"]
+    payloads = sorted(e.payload for e in arts)
+    assert payloads == ["accent", "staccato"]
+
+
+def test_canonicalize_ornaments_and_fermata() -> None:
+    score = music21.stream.Score()
+    part = music21.stream.Part()
+    measure = music21.stream.Measure(number=1)
+    n = music21.note.Note("C4", quarterLength=1.0)
+    n.expressions = [music21.expressions.Trill(), music21.expressions.Fermata()]
+    measure.append(n)
+    part.append(measure)
+    score.append(part)
+
+    events = canonicalize_score(score)
+    orns = [e for e in events if e.kind == "ornament"]
+    payloads = sorted(e.payload for e in orns)
+    assert payloads == ["fermata", "trill"]

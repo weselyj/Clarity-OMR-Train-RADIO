@@ -93,5 +93,67 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     )
                 )
 
+            # Tie open/close events (emit alongside the underlying note/chord)
+            if hasattr(elem, "tie") and elem.tie is not None:
+                tie_type = getattr(elem.tie, "type", None)
+                if tie_type in ("start", "continue"):
+                    events.append(
+                        CanonicalEvent(
+                            offset_ql=offset_ql,
+                            kind="tie_open",
+                            payload=None,
+                            staff_idx=staff_idx,
+                        )
+                    )
+                if tie_type in ("stop", "continue"):
+                    events.append(
+                        CanonicalEvent(
+                            offset_ql=offset_ql,
+                            kind="tie_close",
+                            payload=None,
+                            staff_idx=staff_idx,
+                        )
+                    )
+
+            # Articulations (each maps to a name like 'accent', 'staccato')
+            articulation_name_map = {
+                "Accent": "accent",
+                "Staccato": "staccato",
+                "Staccatissimo": "staccatissimo",
+                "Tenuto": "tenuto",
+                "StrongAccent": "marcato",
+            }
+            for art in getattr(elem, "articulations", []) or []:
+                name = articulation_name_map.get(type(art).__name__)
+                if name is not None:
+                    events.append(
+                        CanonicalEvent(
+                            offset_ql=offset_ql,
+                            kind="articulation",
+                            payload=name,
+                            staff_idx=staff_idx,
+                        )
+                    )
+
+            # Ornaments + fermata (live in .expressions)
+            ornament_name_map = {
+                "Trill": "trill",
+                "Mordent": "mordent",
+                "InvertedMordent": "inverted_mordent",
+                "Turn": "turn",
+                "Fermata": "fermata",
+            }
+            for expr in getattr(elem, "expressions", []) or []:
+                name = ornament_name_map.get(type(expr).__name__)
+                if name is not None:
+                    events.append(
+                        CanonicalEvent(
+                            offset_ql=offset_ql,
+                            kind="ornament",
+                            payload=name,
+                            staff_idx=staff_idx,
+                        )
+                    )
+
     events.sort(key=lambda e: (e.staff_idx, e.offset_ql, e.kind))
     return events
