@@ -510,39 +510,51 @@ def kern_pitch_token(body: str) -> str:
     return f"{base.upper()}{accidental}{octave}"
 
 
+TUPLET_RATIOS = {
+    "<tuplet_3>": (3, 2),  # 3 in time of 2 (triplet)
+    "<tuplet_5>": (5, 4),  # 5 in time of 4 (quintuplet)
+    "<tuplet_6>": (6, 4),  # 6 in time of 4 (sextuplet — same ratio as tuplet_3 in arithmetic)
+    "<tuplet_7>": (7, 4),  # 7 in time of 4 (septuplet)
+}
+
+
 def kern_duration_components(duration_num: int, dots: int, is_rest: bool) -> List[str]:
+    """Convert a kern duration code (reciprocal: 4=quarter, 8=eighth, 16=sixteenth, ...)
+    into OMR duration tokens, including tuplet markers when applicable.
+
+    Math: kern duration codes are reciprocals (1/duration_num of a whole note).
+    For an N:M tuplet, kern_code = base_code × N / M. Inversely: base = kern_code × M / N.
+    """
     if duration_num <= 0:
         raise ValueError(f"Unsupported Kern duration '{duration_num}'")
 
+    # Plain (non-tuplet) duration: direct lookup.
     if str(duration_num) in KERN_DURATION_TO_NAME:
         duration_name = KERN_DURATION_TO_NAME[str(duration_num)]
         return duration_tokens(duration_name, dots=dots, is_rest=is_rest)
 
-    base_by_divisor = {
-        3: "<tuplet_3>",
-        5: "<tuplet_5>",
-        6: "<tuplet_6>",
-        7: "<tuplet_7>",
-    }
-    for divisor, tuplet_token in base_by_divisor.items():
-        if duration_num % divisor != 0:
+    # Try each tuplet ratio: base = duration_num × M / N must be an integer
+    # AND must map to a known plain kern duration.
+    # Order: tuplet_3 first since it's far more common than 5/6/7. Tuplet disambiguation
+    # (3 vs 6 for the same arithmetic) happens contextually in disambiguate_tuplet_grouping.
+    for tuplet_token, (n, m) in TUPLET_RATIOS.items():
+        if (duration_num * m) % n != 0:
             continue
-        base = duration_num // divisor
+        base = (duration_num * m) // n
         base_name = KERN_DURATION_TO_NAME.get(str(base))
         if base_name is None:
             continue
         return [tuplet_token, *duration_tokens(base_name, dots=dots, is_rest=is_rest)]
 
-    # GrandStaff includes a small tail of non-canonical durations (e.g. 22, 36).
-    # Quantize these to the nearest representable duration in our fixed token scheme.
+    # Non-canonical durations (e.g., 22, 36): quantize to nearest representable duration.
     target_ql = 4.0 / float(duration_num)
     candidates: List[Tuple[float, Optional[str], str]] = []
     for base_raw, base_name in KERN_DURATION_TO_NAME.items():
         base_num = int(base_raw)
         candidates.append((4.0 / float(base_num), None, base_name))
-        for divisor, tuplet_token in base_by_divisor.items():
-            quantized_num = base_num * divisor
-            candidates.append((4.0 / float(quantized_num), tuplet_token, base_name))
+        for tuplet_token, (n, m) in TUPLET_RATIOS.items():
+            quantized_num = base_num * n / m  # the kern code that would represent this tuplet
+            candidates.append((4.0 / quantized_num, tuplet_token, base_name))
 
     best_ql, best_tuplet, best_name = min(
         candidates, key=lambda item: abs(item[0] - target_ql)

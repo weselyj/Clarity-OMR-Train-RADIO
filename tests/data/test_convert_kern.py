@@ -241,3 +241,30 @@ def test_ornament_emits_before_articulation(tmp_path: Path) -> None:
     trill_idx = tokens.index("trill")
     accent_idx = tokens.index("accent")
     assert trill_idx < accent_idx
+
+
+def test_kern_24_is_sixteenth_triplet_not_eighth_triplet(tmp_path: Path) -> None:
+    """Kern duration code 24 = sixteenth-triplet (3 in time of 2 sixteenths).
+    The math: kern_code = base × N/M = 16 × 3/2 = 24. Inversely, base = 24 × 2/3 = 16."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n24c\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "<tuplet_3>" in tokens
+    assert "_sixteenth" in tokens
+    # The buggy version produced _eighth.
+    assert "_eighth" not in tokens
+
+
+def test_kern_48_can_be_thirty_second_tuplet(tmp_path: Path) -> None:
+    """Kern duration 48: base = 48 × 2/3 = 32 (32nd note). With tuplet_3 OR tuplet_6 grouping."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n48c\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "_thirty_second" in tokens
+    assert "_sixteenth" not in tokens  # was buggy output
+
+
+def test_kern_12_is_eighth_triplet(tmp_path: Path) -> None:
+    """Kern 12: base = 12 × 2/3 = 8 (eighth note) with tuplet_3."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n12c\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "<tuplet_3>" in tokens
+    assert "_eighth" in tokens
