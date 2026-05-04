@@ -27,6 +27,8 @@ STRUCTURAL_TOKENS = [
     "<tuplet_7>",
 ]
 
+STAFF_INDEX_MARKER_TOKENS = [f"<staff_idx_{i}>" for i in range(8)]
+
 DURATION_TOKENS = [
     "_whole",
     "_half",
@@ -382,6 +384,7 @@ def build_default_token_list() -> List[str]:
             *OTHER_NOTATION_TOKENS,
             *TEMPO_TOKENS,
             *EXPRESSION_TOKENS,
+            *STAFF_INDEX_MARKER_TOKENS,
         ]
     )
 
@@ -460,7 +463,7 @@ def build_default_vocabulary() -> OMRVocabulary:
         tokens=tokens,
         token_to_id=token_to_id,
         id_to_token=id_to_token,
-        structural_tokens=set(STRUCTURAL_TOKENS),
+        structural_tokens=set(STRUCTURAL_TOKENS) | set(STAFF_INDEX_MARKER_TOKENS),
         pitch_tokens=pitch_tokens,
         note_tokens=note_tokens,
         grace_tokens=grace_tokens,
