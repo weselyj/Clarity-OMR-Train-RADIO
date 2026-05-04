@@ -45,6 +45,19 @@ class CompareResult:
         return len(self.divergences) == 0
 
 
+def _tuplet_ratio(elem) -> tuple | None:
+    """Return (numNotesActual, numNotesNormal) of the outermost tuplet on this element, or None."""
+    tuplets = list(getattr(elem.duration, "tuplets", []) or [])
+    if not tuplets:
+        return None
+    t = tuplets[0]
+    actual = int(getattr(t, "numberNotesActual", 0) or 0)
+    normal = int(getattr(t, "numberNotesNormal", 0) or 0)
+    if actual == 0 or normal == 0:
+        return None
+    return (actual, normal)
+
+
 def canonicalize_score(score) -> List[CanonicalEvent]:
     """Walk a music21 score and emit a flat ordered list of canonical events.
 
@@ -70,7 +83,7 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     CanonicalEvent(
                         offset_ql=offset_ql,
                         kind="chord",
-                        payload=(pitches, duration_ql),
+                        payload=(pitches, duration_ql, _tuplet_ratio(elem)),
                         staff_idx=staff_idx,
                     )
                 )
@@ -79,7 +92,7 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     CanonicalEvent(
                         offset_ql=offset_ql,
                         kind="rest",
-                        payload=duration_ql,
+                        payload=(duration_ql, _tuplet_ratio(elem)),
                         staff_idx=staff_idx,
                     )
                 )
@@ -88,7 +101,7 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     CanonicalEvent(
                         offset_ql=offset_ql,
                         kind="note",
-                        payload=(elem.pitch.nameWithOctave, duration_ql),
+                        payload=(elem.pitch.nameWithOctave, duration_ql, _tuplet_ratio(elem)),
                         staff_idx=staff_idx,
                     )
                 )

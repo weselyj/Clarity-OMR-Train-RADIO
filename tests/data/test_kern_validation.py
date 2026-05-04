@@ -62,7 +62,7 @@ def test_canonicalize_simple_quarter_note() -> None:
     events = canonicalize_score(score)
     notes = [e for e in events if e.kind == "note"]
     assert len(notes) == 1
-    assert notes[0].payload == ("C4", 1.0)
+    assert notes[0].payload == ("C4", 1.0, None)
     assert notes[0].staff_idx == 0
 
 
@@ -77,7 +77,7 @@ def test_canonicalize_rest() -> None:
     events = canonicalize_score(score)
     rests = [e for e in events if e.kind == "rest"]
     assert len(rests) == 1
-    assert rests[0].payload == 2.0
+    assert rests[0].payload == (2.0, None)
 
 
 def test_canonicalize_chord() -> None:
@@ -91,9 +91,10 @@ def test_canonicalize_chord() -> None:
     events = canonicalize_score(score)
     chords = [e for e in events if e.kind == "chord"]
     assert len(chords) == 1
-    pitches, dur = chords[0].payload
+    pitches, dur, tuplet = chords[0].payload
     assert pitches == ("C4", "E4", "G4")
     assert dur == 1.0
+    assert tuplet is None
 
 
 def test_canonicalize_two_staves_assigns_staff_idx_top_down() -> None:
@@ -167,3 +168,24 @@ def test_canonicalize_ornaments_and_fermata() -> None:
     orns = [e for e in events if e.kind == "ornament"]
     payloads = sorted(e.payload for e in orns)
     assert payloads == ["fermata", "trill"]
+
+
+def test_canonicalize_triplet_ratio() -> None:
+    """A note with tuplet 3:2 should have its tuplet recorded in the canonical event."""
+    score = music21.stream.Score()
+    part = music21.stream.Part()
+    measure = music21.stream.Measure(number=1)
+    n = music21.note.Note("C4", quarterLength=1.0 / 3.0)  # eighth-triplet
+    n.duration.appendTuplet(music21.duration.Tuplet(3, 2))
+    measure.append(n)
+    part.append(measure)
+    score.append(part)
+
+    events = canonicalize_score(score)
+    note_events = [e for e in events if e.kind == "note"]
+    assert len(note_events) == 1
+    # Payload extended to include tuplet ratio when present.
+    payload = note_events[0].payload
+    assert payload[0] == "C4"
+    # Third element is tuplet ratio (3, 2) or None when absent
+    assert payload[2] == (3, 2)
