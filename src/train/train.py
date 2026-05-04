@@ -1435,6 +1435,81 @@ def _expand_lora_rank_tensors_for_resume(
     return expanded_state, notes
 
 
+def _extend_vocab_tensors_for_resume(
+    state_dict: Dict[str, object],
+    model_state: Dict[str, object],
+    init_seed: int = 0,
+) -> Tuple[Dict[str, object], List[str]]:
+    """Pad vocab-shaped tensors with new rows when checkpoint vocab < target vocab.
+
+    Operates on `token_embedding.weight`, `lm_head.weight`, `lm_head.bias`. Padding init:
+    weight rows = mean(existing rows) + N(0, 0.01); bias entries = 0. Caller is responsible
+    for weight tying — if `lm_head.weight is token_embedding.weight` in the live model,
+    `model.load_state_dict` will preserve the tie.
+    """
+    import torch
+
+    expanded_state = dict(state_dict)
+    notes: List[str] = []
+    target_keys = ("token_embedding.weight", "lm_head.weight", "lm_head.bias")
+    g = torch.Generator()
+    g.manual_seed(int(init_seed))
+    # Track already-extended tensors by source object identity to handle weight tying.
+    # When lm_head.weight is the same tensor object as token_embedding.weight, reuse
+    # the already-computed extended result so tied weights remain identical after padding.
+    extended_by_id: Dict[int, object] = {}
+
+    for key in target_keys:
+        # Find the matching tensor in checkpoint and live model — names may have a prefix
+        # like 'base_model.model.' for DoRA-wrapped models. Pick the first match by suffix.
+        ckpt_key = next((k for k in state_dict if k.endswith(key)), None)
+        model_key = next((k for k in model_state if k.endswith(key)), None)
+        if ckpt_key is None or model_key is None:
+            continue
+        source_value = state_dict[ckpt_key]
+        target_value = model_state[model_key]
+        if not isinstance(source_value, torch.Tensor) or not isinstance(target_value, torch.Tensor):
+            continue
+        source_shape = tuple(int(d) for d in source_value.shape)
+        target_shape = tuple(int(d) for d in target_value.shape)
+        if source_shape == target_shape:
+            continue
+
+        # Validate diff: target = source with N extra rows at the end (axis 0), every other axis equal.
+        if len(source_shape) != len(target_shape):
+            raise ValueError(f"only +N rows at end of axis 0 supported; got rank diff for {ckpt_key}")
+        if any(s != t for s, t in zip(source_shape[1:], target_shape[1:])):
+            raise ValueError(
+                f"only +N rows at end of axis 0 supported; non-axis-0 dims differ for {ckpt_key}: {source_shape} -> {target_shape}"
+            )
+        if target_shape[0] <= source_shape[0]:
+            raise ValueError(
+                f"only +N rows at end of axis 0 supported; target rows not greater than source for {ckpt_key}"
+            )
+        n_new = target_shape[0] - source_shape[0]
+
+        # Reuse previously computed extension if this is a tied tensor (same object).
+        src_id = id(source_value)
+        if src_id in extended_by_id:
+            expanded_state[ckpt_key] = extended_by_id[src_id]
+            notes.append(f"{ckpt_key}: extended vocab dim 0 from {source_shape[0]} to {target_shape[0]} (tied)")
+            continue
+
+        if key.endswith("bias"):
+            new_rows = torch.zeros(n_new, dtype=source_value.dtype)
+        else:
+            mean_row = source_value.mean(dim=0, keepdim=True)
+            noise = torch.randn(n_new, source_shape[1], generator=g, dtype=source_value.dtype) * 0.01
+            new_rows = mean_row.expand(n_new, source_shape[1]) + noise
+
+        extended = torch.cat([source_value, new_rows.to(device=source_value.device, dtype=source_value.dtype)], dim=0)
+        expanded_state[ckpt_key] = extended
+        extended_by_id[src_id] = extended
+        notes.append(f"{ckpt_key}: extended vocab dim 0 from {source_shape[0]} to {target_shape[0]}")
+
+    return expanded_state, notes
+
+
 def run_execute_mode(
     stages: Sequence[StageTrainingConfig],
     grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
@@ -1580,6 +1655,18 @@ def run_execute_mode(
                     f"{checkpoint_rank} -> {target_rank}.",
                     file=sys.stderr,
                 )
+        # Vocab extension: pad embedding/lm_head when target vocab > checkpoint vocab.
+        # Required when adding new tokens (e.g., <staff_idx_N>) at the end of the vocabulary.
+        model_state, vocab_extension_notes = _extend_vocab_tensors_for_resume(
+            model_state,
+            model.state_dict(),
+            init_seed=int(seed),
+        )
+        if vocab_extension_notes:
+            print(
+                f"[train] extended {len(vocab_extension_notes)} vocab tensors for resume.",
+                file=sys.stderr,
+            )
         load_result = model.load_state_dict(model_state, strict=False)
         missing_keys = set(load_result.missing_keys)
         unexpected_keys = set(load_result.unexpected_keys)
