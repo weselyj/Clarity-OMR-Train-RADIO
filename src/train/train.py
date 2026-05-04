@@ -1442,16 +1442,22 @@ def _extend_vocab_tensors_for_resume(
 ) -> Tuple[Dict[str, object], List[str]]:
     """Pad vocab-shaped tensors with new rows when checkpoint vocab < target vocab.
 
-    Operates on `token_embedding.weight`, `lm_head.weight`, `lm_head.bias`. Padding init:
-    weight rows = mean(existing rows) + N(0, 0.01); bias entries = 0. Caller is responsible
-    for weight tying — if `lm_head.weight is token_embedding.weight` in the live model,
-    `model.load_state_dict` will preserve the tie.
+    Handles both plain and PEFT/DoRA-wrapped names.  Any key in the live model that contains
+    ``"token_embedding"`` or ``"lm_head"`` as a substring is a candidate.  Examples:
+
+    * Plain:        ``token_embedding.weight``, ``lm_head.weight``, ``lm_head.bias``
+    * PEFT-wrapped: ``base_model.model.token_embedding.original_module.weight``,
+                    ``base_model.model.token_embedding.modules_to_save.default.weight``,
+                    ``base_model.model.lm_head.original_module.weight``, … (6 keys total)
+
+    Padding init: weight rows = mean(existing rows) + N(0, 0.01); bias entries = 0.
+    Caller is responsible for weight tying — if ``lm_head.weight is token_embedding.weight``
+    in the live model, ``model.load_state_dict`` will preserve the tie.
     """
     import torch
 
     expanded_state = dict(state_dict)
     notes: List[str] = []
-    target_keys = ("token_embedding.weight", "lm_head.weight", "lm_head.bias")
     g = torch.Generator()
     g.manual_seed(int(init_seed))
     # Track already-extended tensors by source object identity to handle weight tying.
@@ -1459,13 +1465,18 @@ def _extend_vocab_tensors_for_resume(
     # the already-computed extended result so tied weights remain identical after padding.
     extended_by_id: Dict[int, object] = {}
 
-    for key in target_keys:
-        # Find the matching tensor in checkpoint and live model — names may have a prefix
-        # like 'base_model.model.' for DoRA-wrapped models. Pick the first match by suffix.
-        ckpt_key = next((k for k in state_dict if k.endswith(key)), None)
-        model_key = next((k for k in model_state if k.endswith(key)), None)
-        if ckpt_key is None or model_key is None:
+    _VOCAB_SUBSTRINGS = ("token_embedding", "lm_head")
+
+    # Iterate ALL keys in the live model that look like vocab-shaped layers.
+    # The checkpoint is expected to have the exact same key (PEFT wraps both consistently).
+    for model_key in model_state:
+        if not any(sub in model_key for sub in _VOCAB_SUBSTRINGS):
             continue
+        # The checkpoint must contain an identically named key.
+        if model_key not in state_dict:
+            continue
+
+        ckpt_key = model_key
         source_value = state_dict[ckpt_key]
         target_value = model_state[model_key]
         if not isinstance(source_value, torch.Tensor) or not isinstance(target_value, torch.Tensor):
@@ -1495,7 +1506,7 @@ def _extend_vocab_tensors_for_resume(
             notes.append(f"{ckpt_key}: extended vocab dim 0 from {source_shape[0]} to {target_shape[0]} (tied)")
             continue
 
-        if key.endswith("bias"):
+        if ckpt_key.endswith("bias"):
             new_rows = torch.zeros(n_new, dtype=source_value.dtype)
         else:
             mean_row = source_value.mean(dim=0, keepdim=True)
