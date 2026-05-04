@@ -106,3 +106,43 @@ def test_sub_spine_split_emits_voices_within_spine(tmp_path: Path) -> None:
     assert "<voice_1>" in treble_block
     assert "<voice_2>" in treble_block
     assert "<voice_2>" not in bass_block
+
+
+def test_voice_index_overflow_drops_excess(tmp_path: Path) -> None:
+    """A spine with 5 sub-spines (>MAX_SUPPORTED_VOICE_INDEX=4) drops the 5th."""
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n"
+        "*clefG2\n"
+        "*k[]\n"
+        "*M4/4\n"
+        "*^\n"
+        "*\t*^\n"
+        "*\t*\t*^\n"
+        "*\t*\t*\t*^\n"
+        "=1\t=1\t=1\t=1\t=1\n"
+        "4c\t4d\t4e\t4f\t4g\n"
+        "*-\t*-\t*-\t*-\t*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    # We expect voices 1..4 to appear; voice 5 dropped silently (no <voice_5> token).
+    assert "<voice_1>" in tokens
+    assert "<voice_4>" in tokens
+    assert "<voice_5>" not in tokens
+    # The dropped pitch ("g") should not appear.
+    assert "note-G4" not in tokens
+
+
+def test_malformed_no_kern_header_returns_empty(tmp_path: Path) -> None:
+    """A file without **kern header returns []."""
+    krn = _write_kern(
+        tmp_path,
+        "this is not a kern file\nsome content\n",
+    )
+    tokens = convert_kern_file(krn)
+    assert tokens == []
+
+
+def test_empty_file_returns_empty(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "")
+    assert convert_kern_file(krn) == []
