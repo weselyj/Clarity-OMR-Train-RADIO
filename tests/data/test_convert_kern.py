@@ -194,3 +194,30 @@ def test_slur_open_close_emit_tokens(tmp_path: Path) -> None:
     tokens = convert_kern_file(krn)
     assert "slur_start" in tokens
     assert "slur_end" in tokens
+
+
+def test_accent_emits_accent_token(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c^\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "accent" in tokens
+
+
+def test_staccato_emits_staccato_token(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c'\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "staccato" in tokens
+
+
+def test_fermata_emits_fermata_token(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c;\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "fermata" in tokens
+
+
+def test_articulation_emits_before_pitch(tmp_path: Path) -> None:
+    """Canonical order: articulations come before pitch (and after ornaments, but no ornaments here)."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c^\n*-\n")
+    tokens = convert_kern_file(krn)
+    accent_idx = tokens.index("accent")
+    note_idx = tokens.index("note-C4")
+    assert accent_idx < note_idx

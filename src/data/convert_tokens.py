@@ -83,6 +83,14 @@ EXPRESSION_CLASS_TO_TOKEN = {
     "Turn": "turn",
 }
 
+KERN_ARTICULATION_MAP = {
+    "^": "accent",
+    "'": "staccato",
+    "`": "staccatissimo",  # backtick in kern
+    "~": "tenuto",
+    ";": "fermata",
+}
+
 DYNAMIC_VALUE_TO_TOKEN = {
     token[len("dynamic-") :].lower(): token for token in DYNAMIC_TOKENS if token.startswith("dynamic-")
 }
@@ -559,6 +567,12 @@ def parse_kern_event(
     slur_close = ")" in body
     body_clean = body_clean.replace("(", "").replace(")", "")
 
+    articulations: List[str] = []
+    for sym, name in KERN_ARTICULATION_MAP.items():
+        if sym in body_clean:
+            articulations.append(name)
+            body_clean = body_clean.replace(sym, "")
+
     if "r" in body_clean.lower():
         rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
         return KernEvent(
@@ -569,6 +583,7 @@ def parse_kern_event(
             tie_close=tie_close,
             slur_open=slur_open,
             slur_close=slur_close,
+            articulations=articulations,
             next_fallback_duration=(duration_value, dots),
         )
 
@@ -582,6 +597,7 @@ def parse_kern_event(
         tie_close=tie_close,
         slur_open=slur_open,
         slur_close=slur_close,
+        articulations=articulations,
         next_fallback_duration=(duration_value, dots),
     )
 
@@ -607,11 +623,19 @@ def parse_kern_cell(
                 output.extend(_emit_event_tokens(ev))
             return output, active_duration
         # Chord (multiple non-rest pitches sharing the same duration).
-        chord_tokens: List[str] = []
         any_tie_open = any(ev.tie_open for ev in parsed)
         any_tie_close = any(ev.tie_close for ev in parsed)
         any_slur_open = any(ev.slur_open for ev in parsed)
         any_slur_close = any(ev.slur_close for ev in parsed)
+        chord_articulations = []
+        seen_arts: set[str] = set()
+        for ev in parsed:
+            for art in ev.articulations:
+                if art not in seen_arts:
+                    chord_articulations.append(art)
+                    seen_arts.add(art)
+        chord_tokens: List[str] = []
+        chord_tokens.extend(chord_articulations)
         if any_tie_open:
             chord_tokens.append("tie_start")
         if any_slur_open:
@@ -635,6 +659,8 @@ def _emit_event_tokens(ev: KernEvent) -> List[str]:
     [ornaments, articulations, tie_open?, slur_open?, pitches, duration, slur_close?, tie_close?]
     """
     out: List[str] = []
+    out.extend(ev.ornaments)             # ornaments first
+    out.extend(ev.articulations)         # then articulations
     if ev.tie_open:
         out.append("tie_start")
     if ev.slur_open:
