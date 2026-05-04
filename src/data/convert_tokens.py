@@ -555,6 +555,10 @@ def parse_kern_event(
     tie_close = "]" in body
     body_clean = body.replace("[", "").replace("]", "")
 
+    slur_open = "(" in body
+    slur_close = ")" in body
+    body_clean = body_clean.replace("(", "").replace(")", "")
+
     if "r" in body_clean.lower():
         rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
         return KernEvent(
@@ -563,6 +567,8 @@ def parse_kern_event(
             is_rest=True,
             tie_open=tie_open,
             tie_close=tie_close,
+            slur_open=slur_open,
+            slur_close=slur_close,
             next_fallback_duration=(duration_value, dots),
         )
 
@@ -574,6 +580,8 @@ def parse_kern_event(
         duration_tokens=duration_parts,
         tie_open=tie_open,
         tie_close=tie_close,
+        slur_open=slur_open,
+        slur_close=slur_close,
         next_fallback_duration=(duration_value, dots),
     )
 
@@ -602,13 +610,19 @@ def parse_kern_cell(
         chord_tokens: List[str] = []
         any_tie_open = any(ev.tie_open for ev in parsed)
         any_tie_close = any(ev.tie_close for ev in parsed)
+        any_slur_open = any(ev.slur_open for ev in parsed)
+        any_slur_close = any(ev.slur_close for ev in parsed)
         if any_tie_open:
             chord_tokens.append("tie_start")
+        if any_slur_open:
+            chord_tokens.append("slur_start")
         chord_tokens.append("<chord_start>")
         for ev in parsed:
             chord_tokens.extend(ev.pitches)
         chord_tokens.append("<chord_end>")
         chord_tokens.extend(parsed[0].duration_tokens)
+        if any_slur_close:
+            chord_tokens.append("slur_end")
         if any_tie_close:
             chord_tokens.append("tie_end")
         return chord_tokens, active_duration
@@ -623,8 +637,12 @@ def _emit_event_tokens(ev: KernEvent) -> List[str]:
     out: List[str] = []
     if ev.tie_open:
         out.append("tie_start")
+    if ev.slur_open:
+        out.append("slur_start")
     out.extend(ev.pitches)
     out.extend(ev.duration_tokens)
+    if ev.slur_close:
+        out.append("slur_end")
     if ev.tie_close:
         out.append("tie_end")
     return out

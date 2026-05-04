@@ -184,3 +184,13 @@ def test_tie_token_emits_before_pitch(tmp_path: Path) -> None:
     tie_start_idx = tokens.index("tie_start")
     note_c4_first = next(i for i, t in enumerate(tokens) if t == "note-C4")
     assert tie_start_idx < note_c4_first
+
+
+def test_slur_open_close_emit_tokens(tmp_path: Path) -> None:
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c(\n4d)\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    assert "slur_start" in tokens
+    assert "slur_end" in tokens
