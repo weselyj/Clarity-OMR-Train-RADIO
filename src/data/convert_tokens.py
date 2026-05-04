@@ -565,6 +565,53 @@ def kern_duration_components(duration_num: int, dots: int, is_rest: bool) -> Lis
     return [best_tuplet, *quantized_duration]
 
 
+def disambiguate_tuplet_grouping(spine_tokens: List[str]) -> List[str]:
+    """Walk a list of tokens emitted for one spine-and-measure, and rewrite tuplet
+    markers based on grouping context.
+
+    Rule: count consecutive runs where every event has the same tuplet token. If
+    the run length is exactly 3, keep <tuplet_3>. If exactly 6 (and the math also
+    admits it), upgrade to <tuplet_6>. Same idea for tuplet_5 / tuplet_7.
+
+    This operates on already-emitted token lists, so we look for tuplet tokens
+    in their canonical-order position (immediately before duration tokens).
+    """
+    out = list(spine_tokens)
+
+    # Find indices of <tuplet_3> tokens in order.
+    indices = [i for i, t in enumerate(out) if t == "<tuplet_3>"]
+    if not indices:
+        return out
+
+    # Group into contiguous runs (where each <tuplet_3> is "near" the previous one
+    # with only intervening note/duration/articulation tokens — no other tuplet_3).
+    runs: List[List[int]] = []
+    current: List[int] = []
+    for idx in indices:
+        if not current or idx > current[-1]:
+            if current and idx > current[-1] + 6:  # threshold for "too far apart"
+                runs.append(current)
+                current = []
+            current.append(idx)
+    if current:
+        runs.append(current)
+
+    # For each run, if length is exactly 6, rewrite all <tuplet_3> -> <tuplet_6>.
+    for run in runs:
+        if len(run) == 6:
+            for i in run:
+                out[i] = "<tuplet_6>"
+        elif len(run) == 5:
+            for i in run:
+                out[i] = "<tuplet_5>"
+        elif len(run) == 7:
+            for i in run:
+                out[i] = "<tuplet_7>"
+        # Length 3 (or anything else): keep <tuplet_3>
+
+    return out
+
+
 def parse_kern_event(
     event: str, fallback_duration: Optional[Tuple[int, int]]
 ) -> KernEvent:
@@ -904,14 +951,14 @@ def convert_kern_file(path: Path) -> List[str]:
     out: List[str] = ["<bos>"]
     if spine_count == 1:
         out.append("<staff_start>")
-        out.extend(per_spine_tokens[0])
+        out.extend(disambiguate_tuplet_grouping(per_spine_tokens[0]))
         out.append("<staff_end>")
     else:
         for display_idx in range(spine_count):
             kern_spine_id = (spine_count - 1) - display_idx
             out.append("<staff_start>")
             out.append(f"<staff_idx_{display_idx}>")
-            out.extend(per_spine_tokens[kern_spine_id])
+            out.extend(disambiguate_tuplet_grouping(per_spine_tokens[kern_spine_id]))
             out.append("<staff_end>")
     out.append("<eos>")
     return out
