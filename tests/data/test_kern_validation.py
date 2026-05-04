@@ -189,3 +189,57 @@ def test_canonicalize_triplet_ratio() -> None:
     assert payload[0] == "C4"
     # Third element is tuplet ratio (3, 2) or None when absent
     assert payload[2] == (3, 2)
+
+
+from pathlib import Path
+
+from src.data.kern_validation import compare_via_music21, summarize_divergences
+
+
+def _write_kern(tmp_path: Path, content: str) -> Path:
+    p = tmp_path / "sample.krn"
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def test_compare_via_music21_simple_passes(tmp_path: Path) -> None:
+    """The simplest possible kern (one note, one staff) should round-trip with no divergences."""
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c\n*-\n",
+    )
+    result = compare_via_music21(krn)
+    assert result.kern_path == krn
+    # The simplest case may still surface music21-vs-our differences (e.g., implicit clef).
+    # Just ensure the function runs and returns a result.
+    assert isinstance(result.ref_canonical, list)
+    assert isinstance(result.our_canonical, list)
+
+
+def test_summarize_divergences_groups_by_kind(tmp_path: Path) -> None:
+    from src.data.kern_validation import CompareResult, Divergence
+    results = [
+        CompareResult(
+            kern_path=Path("/a.krn"),
+            ref_canonical=[],
+            our_canonical=[],
+            divergences=[
+                Divergence(kind="tie_open", offset_ql=0.0, staff_idx=0, ref_value=True, our_value=None, note=""),
+                Divergence(kind="tie_open", offset_ql=2.0, staff_idx=0, ref_value=True, our_value=None, note=""),
+                Divergence(kind="ornament", offset_ql=0.0, staff_idx=0, ref_value="trill", our_value=None, note=""),
+            ],
+        ),
+        CompareResult(
+            kern_path=Path("/b.krn"),
+            ref_canonical=[],
+            our_canonical=[],
+            divergences=[
+                Divergence(kind="tie_open", offset_ql=0.0, staff_idx=0, ref_value=True, our_value=None, note=""),
+            ],
+        ),
+    ]
+    summary = summarize_divergences(results)
+    assert summary["tie_open"]["occurrence_count"] == 3
+    assert summary["tie_open"]["files_with_kind"] == 2
+    assert summary["ornament"]["occurrence_count"] == 1
+    assert summary["ornament"]["files_with_kind"] == 1

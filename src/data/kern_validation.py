@@ -170,3 +170,125 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
 
     events.sort(key=lambda e: (e.staff_idx, e.offset_ql, e.kind))
     return events
+
+
+def compare_via_music21(kern_path: Path) -> CompareResult:
+    """Round-trip validation:
+      1. Parse kern_path via music21's humdrum subconverter -> reference score.
+      2. Parse kern_path via our convert_kern_file + append_tokens_to_part -> our score.
+      3. Canonicalize both, diff, return CompareResult.
+    """
+    import music21
+    from src.data.convert_tokens import convert_kern_file
+    from src.pipeline.export_musicxml import append_tokens_to_part
+
+    # Reference: music21 humdrum parser.
+    ref_score = music21.converter.parse(str(kern_path), format="humdrum")
+    ref_canonical = canonicalize_score(ref_score)
+
+    # Our path: tokens -> music21 score (one Part per top-level <staff_start>...<staff_end> block).
+    tokens = convert_kern_file(kern_path)
+    our_score = music21.stream.Score()
+    cur_part: List[str] | None = None
+    for tok in tokens:
+        if tok == "<staff_start>":
+            cur_part = []
+        elif tok == "<staff_end>":
+            if cur_part is not None:
+                part = music21.stream.Part()
+                # Skip the optional <staff_idx_N> marker token (it's metadata, not music).
+                staff_tokens = [t for t in cur_part if not t.startswith("<staff_idx_")]
+                try:
+                    append_tokens_to_part(part, staff_tokens)
+                except Exception:
+                    # Conversion failure: still append the empty part so staff_idx alignment holds.
+                    pass
+                our_score.append(part)
+                cur_part = None
+        elif tok in {"<bos>", "<eos>"}:
+            continue
+        elif cur_part is not None:
+            cur_part.append(tok)
+
+    our_canonical = canonicalize_score(our_score)
+
+    # Diff: simple ordered alignment by (staff_idx, offset_ql, kind).
+    divergences: List[Divergence] = []
+    ref_keyed = {(e.staff_idx, round(e.offset_ql, 4), e.kind): e for e in ref_canonical}
+    our_keyed = {(e.staff_idx, round(e.offset_ql, 4), e.kind): e for e in our_canonical}
+
+    all_keys = set(ref_keyed) | set(our_keyed)
+    for key in sorted(all_keys):
+        staff_idx, offset_ql, kind = key
+        ref = ref_keyed.get(key)
+        our = our_keyed.get(key)
+        if ref is not None and our is not None:
+            if ref.payload != our.payload:
+                divergences.append(
+                    Divergence(
+                        kind=kind, offset_ql=offset_ql, staff_idx=staff_idx,
+                        ref_value=ref.payload, our_value=our.payload,
+                        note="payload mismatch",
+                    )
+                )
+        elif ref is not None:
+            divergences.append(
+                Divergence(
+                    kind=kind, offset_ql=offset_ql, staff_idx=staff_idx,
+                    ref_value=ref.payload, our_value=None, note="missing in our output",
+                )
+            )
+        else:
+            divergences.append(
+                Divergence(
+                    kind=kind, offset_ql=offset_ql, staff_idx=staff_idx,
+                    ref_value=None, our_value=our.payload, note="extra in our output",
+                )
+            )
+
+    return CompareResult(
+        kern_path=kern_path,
+        ref_canonical=ref_canonical,
+        our_canonical=our_canonical,
+        divergences=divergences,
+    )
+
+
+def summarize_divergences(results: List[CompareResult]) -> dict:
+    """Frequency-sorted divergence-category report."""
+    from collections import defaultdict
+
+    per_kind_count: dict = defaultdict(int)
+    per_kind_files: dict = defaultdict(set)
+    per_kind_samples: dict = defaultdict(list)
+
+    for r in results:
+        kinds_in_file: set = set()
+        for d in r.divergences:
+            per_kind_count[d.kind] += 1
+            kinds_in_file.add(d.kind)
+            if len(per_kind_samples[d.kind]) < 5:
+                per_kind_samples[d.kind].append(
+                    {
+                        "kern_path": str(r.kern_path),
+                        "offset_ql": d.offset_ql,
+                        "staff_idx": d.staff_idx,
+                        "ref_value": str(d.ref_value),
+                        "our_value": str(d.our_value),
+                        "note": d.note,
+                    }
+                )
+        for kind in kinds_in_file:
+            per_kind_files[kind].add(str(r.kern_path))
+
+    total_files = len(results)
+    summary: dict = {}
+    for kind in per_kind_count:
+        summary[kind] = {
+            "occurrence_count": per_kind_count[kind],
+            "files_with_kind": len(per_kind_files[kind]),
+            "files_with_kind_pct": (len(per_kind_files[kind]) / total_files * 100.0) if total_files else 0.0,
+            "sample_divergences": per_kind_samples[kind],
+        }
+    # Sort by files_with_kind_pct descending.
+    return dict(sorted(summary.items(), key=lambda item: -item[1]["files_with_kind_pct"]))
