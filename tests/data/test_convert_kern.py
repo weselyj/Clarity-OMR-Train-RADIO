@@ -146,3 +146,19 @@ def test_malformed_no_kern_header_returns_empty(tmp_path: Path) -> None:
 def test_empty_file_returns_empty(tmp_path: Path) -> None:
     krn = _write_kern(tmp_path, "")
     assert convert_kern_file(krn) == []
+
+
+def test_simple_kern_token_output_unchanged_after_refactor(tmp_path: Path) -> None:
+    """Regression baseline: the simplest 1-note kern produces a known token list."""
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    # Expected: <bos> <staff_start> clef-G2 keySignature-CM timeSignature-4/4 <measure_start> note-C4 _quarter <measure_end> <staff_end> <eos>
+    assert tokens[0] == "<bos>"
+    assert tokens[-1] == "<eos>"
+    assert "<staff_start>" in tokens
+    assert "<staff_end>" in tokens
+    assert "note-C4" in tokens
+    assert "_quarter" in tokens

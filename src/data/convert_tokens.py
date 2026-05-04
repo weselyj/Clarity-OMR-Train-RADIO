@@ -8,6 +8,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -97,6 +98,22 @@ SUPPORTED_TIME_SIGNATURE_TOKENS = set(TIME_SIGNATURE_TOKENS)
 SUPPORTED_NOTE_TOKENS = {token for token in build_pitch_tokens() if token.startswith("note-")}
 SUPPORTED_GRACE_TOKENS = set(build_gracenote_tokens())
 MAX_SUPPORTED_VOICE_INDEX = 4
+
+
+@dataclass
+class KernEvent:
+    """One parsed kern event: pitches + duration + every musical marking we extract."""
+    pitches: List[str]                 # ['note-C4'] or ['note-C4', 'note-E4'] for chords
+    duration_tokens: List[str]          # ['_quarter'] or ['_eighth', '_dot']
+    is_rest: bool = False
+    is_grace: bool = False
+    tie_open: bool = False
+    tie_close: bool = False
+    slur_open: bool = False
+    slur_close: bool = False
+    articulations: List[str] = field(default_factory=list)
+    ornaments: List[str] = field(default_factory=list)
+    next_fallback_duration: Optional[Tuple[int, int]] = None
 
 
 def relpath(project_root: Path, target: Path) -> str:
@@ -520,7 +537,7 @@ def kern_duration_components(duration_num: int, dots: int, is_rest: bool) -> Lis
 
 def parse_kern_event(
     event: str, fallback_duration: Optional[Tuple[int, int]]
-) -> Tuple[List[str], List[str], bool, Tuple[int, int]]:
+) -> KernEvent:
     match = re.match(r"^(\d+)(\.*)(.*)$", event)
     if match:
         duration_num, dot_group, body = match.groups()
@@ -536,12 +553,21 @@ def parse_kern_event(
 
     if "r" in body.lower():
         rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
-        return ["rest"], rest_duration_parts, True, (duration_value, dots)
+        return KernEvent(
+            pitches=["rest"],
+            duration_tokens=rest_duration_parts,
+            is_rest=True,
+            next_fallback_duration=(duration_value, dots),
+        )
 
     prefer_flats = "-" in body and "#" not in body
     normalized = _normalize_pitch_symbol(kern_pitch_token(body), prefer_flats=prefer_flats)
     pitch = _normalize_note_pitch_symbol(normalized)
-    return [f"note-{pitch}"], duration_parts, False, (duration_value, dots)
+    return KernEvent(
+        pitches=[f"note-{pitch}"],
+        duration_tokens=duration_parts,
+        next_fallback_duration=(duration_value, dots),
+    )
 
 
 def parse_kern_cell(
@@ -551,28 +577,37 @@ def parse_kern_cell(
     if not events:
         return [], fallback_duration
 
-    parsed = []
+    parsed: List[KernEvent] = []
     active_duration = fallback_duration
     for event in events:
-        pitches, duration, is_rest, active_duration = parse_kern_event(event, active_duration)
-        parsed.append((pitches, duration, is_rest))
+        ev = parse_kern_event(event, active_duration)
+        parsed.append(ev)
+        active_duration = ev.next_fallback_duration
 
     if len(parsed) > 1:
-        if any(is_rest for _, _, is_rest in parsed):
+        if any(ev.is_rest for ev in parsed):
             output: List[str] = []
-            for pitches, duration, _ in parsed:
-                output.extend(pitches)
-                output.extend(duration)
+            for ev in parsed:
+                output.extend(_emit_event_tokens(ev))
             return output, active_duration
+        # Chord (multiple non-rest pitches sharing the same duration).
         chord_tokens: List[str] = ["<chord_start>"]
-        duration_tokens_out = parsed[0][1]
-        for pitches, _, _ in parsed:
-            chord_tokens.extend(pitches)
-        chord_tokens.extend(["<chord_end>", *duration_tokens_out])
+        for ev in parsed:
+            chord_tokens.extend(ev.pitches)
+        chord_tokens.append("<chord_end>")
+        chord_tokens.extend(parsed[0].duration_tokens)
         return chord_tokens, active_duration
 
-    pitches, duration, _ = parsed[0]
-    return [*pitches, *duration], active_duration
+    return _emit_event_tokens(parsed[0]), active_duration
+
+
+def _emit_event_tokens(ev: KernEvent) -> List[str]:
+    """Flatten a single KernEvent to the canonical token order.
+    Future tasks will add tie/slur/articulation/ornament emissions here."""
+    out: List[str] = []
+    out.extend(ev.pitches)
+    out.extend(ev.duration_tokens)
+    return out
 
 
 # Known limitations (deferred — affect non-existent corpora as of 2026-05-04):
