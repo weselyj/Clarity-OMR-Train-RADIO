@@ -575,94 +575,208 @@ def parse_kern_cell(
     return [*pitches, *duration], active_duration
 
 
+# Known limitations (deferred — affect non-existent corpora as of 2026-05-04):
+# 1. Mixed-spine headers with non-kern columns first (e.g. `**dynam\t**kern`):
+#    column_to_spine init assumes the first N columns are the kern spines;
+#    a non-kern-first layout silently drops the kern data. All current
+#    kern corpora are kern-first or all-kern, so this path is dead.
+# 2. Three-way `*v` merges (`*v *v *v` collapsing 3 sub-spines to 1): the
+#    paired-merge loop only collapses pairs; a third `*v` retains a stale
+#    column entry. Vanishingly rare in piano kern (not seen in GrandStaff).
+# 3. `*-` spine terminators don't remove the terminated column from
+#    column_to_spine. Stale entries are harmless (subsequent data lines
+#    won't have content in the terminated column) but the per_spine_state
+#    bookkeeping for that spine continues until end-of-file.
 def convert_kern_file(path: Path) -> List[str]:
+    """Convert a kern file to OMR tokens.
+
+    Top-level **kern spines map to staves (emit <staff_start>...<staff_end> per spine,
+    with <staff_idx_N> markers in top-down display order when N>=2 spines).
+    Sub-spines from `*^` operators within a single spine map to <voice_N> tokens.
+    """
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    tokens: List[str] = ["<bos>", "<staff_start>"]
-    current_voice: Optional[int] = None
-    duration_by_voice: Dict[int, Tuple[int, int]] = {}
-    measure_open = False
-    has_clef = False
-    has_time = False
 
-    def _ensure_header_defaults() -> None:
-        nonlocal has_clef, has_time
-        if not has_clef:
-            tokens.append("clef-G2")
-            has_clef = True
-        if not has_time:
-            tokens.append("timeSignature-4/4")
-            has_time = True
-
-    def ensure_measure_open() -> None:
-        nonlocal measure_open, current_voice
-        if measure_open:
-            return
-        _ensure_header_defaults()
-        tokens.append("<measure_start>")
-        measure_open = True
-        current_voice = None
-
-    def close_measure_if_open() -> None:
-        nonlocal measure_open, current_voice
-        if not measure_open:
-            return
-        if tokens[-1] != "<measure_end>":
-            tokens.append("<measure_end>")
-        measure_open = False
-        current_voice = None
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("!"):
+    # Discover the **kern header line and count top-level spines.
+    spine_count = 0
+    header_idx = -1
+    for i, line in enumerate(lines):
+        if not line.strip() or line.startswith("!"):
             continue
         cells = line.split("\t")
-        if any(cell.startswith("=") for cell in cells):
-            close_measure_if_open()
+        kern_cells = [c for c in cells if c == "**kern"]
+        if kern_cells and len(kern_cells) == len(cells):
+            spine_count = len(cells)
+            header_idx = i
+            break
+        if line.startswith("**"):
+            # Mixed-spine header (e.g. **kern\t**dynam) — count only **kern columns.
+            spine_count = len(kern_cells)
+            header_idx = i
+            break
+    if spine_count == 0:
+        return []
+
+    # Per-spine accumulators.
+    per_spine_tokens: List[List[str]] = [[] for _ in range(spine_count)]
+    per_spine_state = [
+        {
+            "current_voice": None,
+            "measure_open": False,
+            "duration_by_voice": {},
+            "has_clef": False,
+            "has_time": False,
+        }
+        for _ in range(spine_count)
+    ]
+    # column -> spine_id mapping. Updates on *^ (split) and *v (merge).
+    column_to_spine = list(range(spine_count))
+
+    def ensure_measure_open(spine_id: int) -> None:
+        st = per_spine_state[spine_id]
+        if st["measure_open"]:
+            return
+        if not st["has_clef"]:
+            per_spine_tokens[spine_id].append("clef-G2")
+            st["has_clef"] = True
+        if not st["has_time"]:
+            per_spine_tokens[spine_id].append("timeSignature-4/4")
+            st["has_time"] = True
+        per_spine_tokens[spine_id].append("<measure_start>")
+        st["measure_open"] = True
+        st["current_voice"] = None
+
+    def close_measure_if_open(spine_id: int) -> None:
+        st = per_spine_state[spine_id]
+        if not st["measure_open"]:
+            return
+        if per_spine_tokens[spine_id][-1] != "<measure_end>":
+            per_spine_tokens[spine_id].append("<measure_end>")
+        st["measure_open"] = False
+        st["current_voice"] = None
+
+    # Walk lines after the header.
+    for raw_line in lines[header_idx + 1 :]:
+        line = raw_line.rstrip("\n")
+        if not line.strip() or line.startswith("!"):
             continue
+        cells = line.split("\t")
+
+        # Barline lines apply to every column.
+        if any(cell.startswith("=") for cell in cells):
+            for spine_id in range(spine_count):
+                close_measure_if_open(spine_id)
+            continue
+
+        # Spine-manipulation operators (*^, *v) — update column_to_spine map.
         if line.startswith("*"):
-            interpretation_tokens: List[str] = []
-            for idx, cell in enumerate(cells, start=1):
+            new_column_to_spine: List[int] = []
+            i = 0
+            while i < len(cells):
+                cell = cells[i]
+                col_spine = column_to_spine[i] if i < len(column_to_spine) else None
+                if cell == "*^" and col_spine is not None:
+                    new_column_to_spine.append(col_spine)
+                    new_column_to_spine.append(col_spine)
+                    i += 1
+                elif cell == "*v" and col_spine is not None:
+                    if (
+                        i + 1 < len(cells)
+                        and cells[i + 1] == "*v"
+                        and i + 1 < len(column_to_spine)
+                        and column_to_spine[i + 1] == col_spine
+                    ):
+                        new_column_to_spine.append(col_spine)
+                        per_spine_state[col_spine]["current_voice"] = None
+                        i += 2
+                    else:
+                        new_column_to_spine.append(col_spine)
+                        i += 1
+                elif col_spine is None:
+                    i += 1
+                else:
+                    new_column_to_spine.append(col_spine)
+                    i += 1
+            if any(c in {"*^", "*v"} for c in cells):
+                column_to_spine = new_column_to_spine
+                continue
+
+            # Other interpretation tokens (clef, key, time) — emit per spine.
+            interpretation_by_spine: Dict[int, List[str]] = {}
+            for col_idx, cell in enumerate(cells):
+                if col_idx >= len(column_to_spine):
+                    continue
+                spine_id = column_to_spine[col_idx]
                 if cell in {"*", "*-"}:
                     continue
                 for parser in (kern_clef_token, kern_key_signature_token, kern_time_signature_token):
                     parsed = parser(cell)
                     if parsed:
-                        interpretation_tokens.append(parsed)
-            if interpretation_tokens:
-                close_measure_if_open()
-                deduped = _dedupe_preserve(interpretation_tokens)
-                for token in deduped:
-                    if token.startswith("clef-"):
-                        has_clef = True
-                    elif token.startswith("timeSignature-"):
-                        has_time = True
-                tokens.extend(deduped)
+                        interpretation_by_spine.setdefault(spine_id, []).append(parsed)
+            for spine_id, parsed_tokens in interpretation_by_spine.items():
+                close_measure_if_open(spine_id)
+                deduped = _dedupe_preserve(parsed_tokens)
+                for tok in deduped:
+                    if tok.startswith("clef-"):
+                        per_spine_state[spine_id]["has_clef"] = True
+                    elif tok.startswith("timeSignature-"):
+                        per_spine_state[spine_id]["has_time"] = True
+                per_spine_tokens[spine_id].extend(deduped)
             continue
 
-        for idx, cell in enumerate(cells, start=1):
-            if cell in {"", "."}:
+        # Data lines — group cells by spine and per-spine sub-spine voice.
+        cells_by_spine: Dict[int, List[Tuple[int, str]]] = {}
+        for col_idx, cell in enumerate(cells):
+            if col_idx >= len(column_to_spine):
                 continue
-            canonical_voice = min(idx, MAX_SUPPORTED_VOICE_INDEX)
-            if canonical_voice < 1 or canonical_voice > MAX_SUPPORTED_VOICE_INDEX:
-                continue
-            if idx > MAX_SUPPORTED_VOICE_INDEX:
-                # Our locked vocabulary supports four voices max; drop excess spines.
-                continue
+            spine_id = column_to_spine[col_idx]
+            cells_by_spine.setdefault(spine_id, []).append((col_idx, cell))
 
-            cell_tokens, duration_state = parse_kern_cell(cell, duration_by_voice.get(canonical_voice))
-            if not cell_tokens:
-                continue
-            ensure_measure_open()
-            if current_voice != canonical_voice:
-                tokens.append(f"<voice_{canonical_voice}>")
-                current_voice = canonical_voice
-            if duration_state is not None:
-                duration_by_voice[canonical_voice] = duration_state
-            tokens.extend(cell_tokens)
+        for spine_id, spine_cells in cells_by_spine.items():
+            sub_spine_count = len(spine_cells)
+            for sub_idx, (_, cell) in enumerate(spine_cells, start=1):
+                if cell in {"", "."}:
+                    continue
+                # Drop sub-spines beyond the supported voice cap (mirrors line-648 of the prior converter).
+                if sub_idx > MAX_SUPPORTED_VOICE_INDEX:
+                    continue
+                # Per-spine voice: 1 when only one sub-spine, else the sub-spine index.
+                canonical_voice = 1 if sub_spine_count == 1 else sub_idx
+                cell_tokens, duration_state = parse_kern_cell(
+                    cell, per_spine_state[spine_id]["duration_by_voice"].get(canonical_voice)
+                )
+                if not cell_tokens:
+                    continue
+                ensure_measure_open(spine_id)
+                # Emit <voice_N> only when there are multiple sub-spines AND the active voice changes.
+                if (
+                    sub_spine_count > 1
+                    and per_spine_state[spine_id]["current_voice"] != canonical_voice
+                ):
+                    per_spine_tokens[spine_id].append(f"<voice_{canonical_voice}>")
+                    per_spine_state[spine_id]["current_voice"] = canonical_voice
+                if duration_state is not None:
+                    per_spine_state[spine_id]["duration_by_voice"][canonical_voice] = duration_state
+                per_spine_tokens[spine_id].extend(cell_tokens)
 
-    close_measure_if_open()
-    tokens.extend(["<staff_end>", "<eos>"])
-    return tokens
+    # Close any open measure on each spine.
+    for spine_id in range(spine_count):
+        close_measure_if_open(spine_id)
+
+    # Assemble final token list — top-down order: spine N-1 first, spine 0 last.
+    out: List[str] = ["<bos>"]
+    if spine_count == 1:
+        out.append("<staff_start>")
+        out.extend(per_spine_tokens[0])
+        out.append("<staff_end>")
+    else:
+        for display_idx in range(spine_count):
+            kern_spine_id = (spine_count - 1) - display_idx
+            out.append("<staff_start>")
+            out.append(f"<staff_idx_{display_idx}>")
+            out.extend(per_spine_tokens[kern_spine_id])
+            out.append("<staff_end>")
+    out.append("<eos>")
+    return out
 
 
 _NATURAL_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
