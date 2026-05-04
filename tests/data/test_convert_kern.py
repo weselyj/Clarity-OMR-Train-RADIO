@@ -221,3 +221,23 @@ def test_articulation_emits_before_pitch(tmp_path: Path) -> None:
     accent_idx = tokens.index("accent")
     note_idx = tokens.index("note-C4")
     assert accent_idx < note_idx
+
+
+def test_trill_emits_trill_token(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4ct\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "trill" in tokens
+
+
+def test_mordent_emits_mordent_token(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4cm\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "mordent" in tokens
+
+
+def test_ornament_emits_before_articulation(tmp_path: Path) -> None:
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4ct^\n*-\n")
+    tokens = convert_kern_file(krn)
+    trill_idx = tokens.index("trill")
+    accent_idx = tokens.index("accent")
+    assert trill_idx < accent_idx

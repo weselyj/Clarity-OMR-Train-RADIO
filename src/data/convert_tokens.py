@@ -91,6 +91,16 @@ KERN_ARTICULATION_MAP = {
     ";": "fermata",
 }
 
+KERN_ORNAMENT_MAP = {
+    "T": "trill",      # uppercase = trill (no terminator)
+    "t": "trill",      # lowercase = trill (with main note attached)
+    "M": "mordent",    # uppercase = mordent (no main-note marker)
+    "m": "mordent",    # lowercase = mordent
+}
+# Note: tokens 't', 'T', 'm', 'M' would collide with pitch letters if not extracted carefully.
+# Pitches are A-G (uppercase) and a-g (lowercase). 'T', 'M', 't', 'm' are NOT pitch letters
+# (no T or M pitch class), so co-occurrence in a single body is safe to detect.
+
 DYNAMIC_VALUE_TO_TOKEN = {
     token[len("dynamic-") :].lower(): token for token in DYNAMIC_TOKENS if token.startswith("dynamic-")
 }
@@ -573,6 +583,13 @@ def parse_kern_event(
             articulations.append(name)
             body_clean = body_clean.replace(sym, "")
 
+    ornaments: List[str] = []
+    for sym, name in KERN_ORNAMENT_MAP.items():
+        if sym in body_clean:
+            if name not in ornaments:
+                ornaments.append(name)
+            body_clean = body_clean.replace(sym, "")
+
     if "r" in body_clean.lower():
         rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
         return KernEvent(
@@ -584,6 +601,7 @@ def parse_kern_event(
             slur_open=slur_open,
             slur_close=slur_close,
             articulations=articulations,
+            ornaments=ornaments,
             next_fallback_duration=(duration_value, dots),
         )
 
@@ -598,6 +616,7 @@ def parse_kern_event(
         slur_open=slur_open,
         slur_close=slur_close,
         articulations=articulations,
+        ornaments=ornaments,
         next_fallback_duration=(duration_value, dots),
     )
 
@@ -627,6 +646,13 @@ def parse_kern_cell(
         any_tie_close = any(ev.tie_close for ev in parsed)
         any_slur_open = any(ev.slur_open for ev in parsed)
         any_slur_close = any(ev.slur_close for ev in parsed)
+        chord_ornaments: List[str] = []
+        seen_orns: set[str] = set()
+        for ev in parsed:
+            for orn in ev.ornaments:
+                if orn not in seen_orns:
+                    chord_ornaments.append(orn)
+                    seen_orns.add(orn)
         chord_articulations = []
         seen_arts: set[str] = set()
         for ev in parsed:
@@ -635,6 +661,7 @@ def parse_kern_cell(
                     chord_articulations.append(art)
                     seen_arts.add(art)
         chord_tokens: List[str] = []
+        chord_tokens.extend(chord_ornaments)
         chord_tokens.extend(chord_articulations)
         if any_tie_open:
             chord_tokens.append("tie_start")
