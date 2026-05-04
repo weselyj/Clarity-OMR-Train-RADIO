@@ -551,21 +551,29 @@ def parse_kern_event(
         body = event
     duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=False)
 
-    if "r" in body.lower():
+    tie_open = "[" in body
+    tie_close = "]" in body
+    body_clean = body.replace("[", "").replace("]", "")
+
+    if "r" in body_clean.lower():
         rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
         return KernEvent(
             pitches=["rest"],
             duration_tokens=rest_duration_parts,
             is_rest=True,
+            tie_open=tie_open,
+            tie_close=tie_close,
             next_fallback_duration=(duration_value, dots),
         )
 
-    prefer_flats = "-" in body and "#" not in body
-    normalized = _normalize_pitch_symbol(kern_pitch_token(body), prefer_flats=prefer_flats)
+    prefer_flats = "-" in body_clean and "#" not in body_clean
+    normalized = _normalize_pitch_symbol(kern_pitch_token(body_clean), prefer_flats=prefer_flats)
     pitch = _normalize_note_pitch_symbol(normalized)
     return KernEvent(
         pitches=[f"note-{pitch}"],
         duration_tokens=duration_parts,
+        tie_open=tie_open,
+        tie_close=tie_close,
         next_fallback_duration=(duration_value, dots),
     )
 
@@ -591,22 +599,34 @@ def parse_kern_cell(
                 output.extend(_emit_event_tokens(ev))
             return output, active_duration
         # Chord (multiple non-rest pitches sharing the same duration).
-        chord_tokens: List[str] = ["<chord_start>"]
+        chord_tokens: List[str] = []
+        any_tie_open = any(ev.tie_open for ev in parsed)
+        any_tie_close = any(ev.tie_close for ev in parsed)
+        if any_tie_open:
+            chord_tokens.append("tie_start")
+        chord_tokens.append("<chord_start>")
         for ev in parsed:
             chord_tokens.extend(ev.pitches)
         chord_tokens.append("<chord_end>")
         chord_tokens.extend(parsed[0].duration_tokens)
+        if any_tie_close:
+            chord_tokens.append("tie_end")
         return chord_tokens, active_duration
 
     return _emit_event_tokens(parsed[0]), active_duration
 
 
 def _emit_event_tokens(ev: KernEvent) -> List[str]:
-    """Flatten a single KernEvent to the canonical token order.
-    Future tasks will add tie/slur/articulation/ornament emissions here."""
+    """Flatten a KernEvent to canonical token order:
+    [ornaments, articulations, tie_open?, slur_open?, pitches, duration, slur_close?, tie_close?]
+    """
     out: List[str] = []
+    if ev.tie_open:
+        out.append("tie_start")
     out.extend(ev.pitches)
     out.extend(ev.duration_tokens)
+    if ev.tie_close:
+        out.append("tie_end")
     return out
 
 

@@ -162,3 +162,25 @@ def test_simple_kern_token_output_unchanged_after_refactor(tmp_path: Path) -> No
     assert "<staff_end>" in tokens
     assert "note-C4" in tokens
     assert "_quarter" in tokens
+
+
+def test_tie_open_emits_tie_start(tmp_path: Path) -> None:
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c[\n=2\n4c]\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    assert "tie_start" in tokens
+    assert "tie_end" in tokens
+
+
+def test_tie_token_emits_before_pitch(tmp_path: Path) -> None:
+    """Canonical order: tie_start emitted before the note tokens it ties to."""
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c[\n=2\n4c]\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    tie_start_idx = tokens.index("tie_start")
+    note_c4_first = next(i for i, t in enumerate(tokens) if t == "note-C4")
+    assert tie_start_idx < note_c4_first
