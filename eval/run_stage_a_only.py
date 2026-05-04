@@ -13,6 +13,8 @@ from typing import List
 from PIL import Image
 from ultralytics import YOLO
 
+from src.models.system_postprocess import extend_left_for_brace
+
 
 def _render_pages(pdf_path: Path, dpi: int) -> List[Image.Image]:
     """Render all pages of a PDF to PIL images at the given DPI.
@@ -37,11 +39,18 @@ def run_stage_a(
     dpi: int = 300,
     conf: float = 0.25,
     imgsz: int = 1920,
+    apply_brace_margin: bool = True,
 ) -> None:
     """Render a PDF, run YOLO on each page, write a JSONL manifest of bboxes.
 
     Output file: out_dir / f"{pdf_path.stem}_stage_a.jsonl"
     Each line: {"piece", "page", "bbox_xyxy", "conf", "page_width", "page_height"}
+
+    By default, the v15 leftward bracket margin is restored on each predicted
+    box (see ``src.models.system_postprocess.extend_left_for_brace`` and
+    ``docs/stage_a_brace_margin_known_gap.md``). Pass ``apply_brace_margin=False``
+    to disable the post-processing and emit raw model predictions (useful for
+    analysing the model's underlying behavior).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     model = YOLO(str(yolo_weights))
@@ -54,6 +63,8 @@ def run_stage_a(
             for r in results:
                 xyxy = r.boxes.xyxy.tolist() if hasattr(r.boxes.xyxy, "tolist") else list(r.boxes.xyxy)
                 confs = r.boxes.conf.tolist() if hasattr(r.boxes.conf, "tolist") else list(r.boxes.conf)
+                if apply_brace_margin and xyxy:
+                    xyxy = extend_left_for_brace(xyxy, page_w=img.width).tolist()
                 for box, conf_score in zip(xyxy, confs):
                     x1, y1, x2, y2 = box
                     record = {
@@ -75,6 +86,11 @@ def main() -> None:
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--imgsz", type=int, default=1920)
+    parser.add_argument(
+        "--no-brace-margin",
+        action="store_true",
+        help="Disable v15 leftward-bracket margin post-processing (emit raw model boxes).",
+    )
     args = parser.parse_args()
 
     pdfs = sorted(args.pdf_dir.glob("*.pdf"))
@@ -83,6 +99,7 @@ def main() -> None:
         run_stage_a(
             pdf, args.yolo_weights, args.out_dir,
             dpi=args.dpi, conf=args.conf, imgsz=args.imgsz,
+            apply_brace_margin=not args.no_brace_margin,
         )
         print(f"  done: {pdf.stem}")
 
