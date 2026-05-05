@@ -398,3 +398,19 @@ def test_kern_f_double_sharp_emits_Fsharpsharp4(tmp_path: Path) -> None:
     tokens = convert_kern_file(krn)
     assert "note-F##4" in tokens
     assert "note-G4" not in tokens
+
+
+def test_kern_tie_continuation_marker(tmp_path: Path) -> None:
+    """kern _ on a note marks tie continuation (closes incoming, opens outgoing)."""
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M3/4\n=1\n2.c[\n=2\n2.c_\n=3\n2.c]\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    # Each measure has its own dotted-half C, with tie markers connecting them.
+    # Measure 1: tie_start ... C4 ... (no tie_end)
+    # Measure 2: tie_start ... C4 ... tie_end (continuation: both)
+    # Measure 3: ... C4 ... tie_end
+    assert tokens.count("tie_start") == 2
+    assert tokens.count("tie_end") == 2
+    # The tie_start/tie_end positions should bookend each note correctly.

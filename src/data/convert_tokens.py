@@ -596,9 +596,10 @@ def parse_kern_event(
     is_grace = "q" in body or "Q" in body
     body_clean_temp = body.replace("q", "").replace("Q", "")
 
-    tie_open = "[" in body_clean_temp
-    tie_close = "]" in body_clean_temp
-    body_clean = body_clean_temp.replace("[", "").replace("]", "")
+    tie_continue = "_" in body_clean_temp
+    tie_open = "[" in body_clean_temp or tie_continue   # _ acts as both close + open
+    tie_close = "]" in body_clean_temp or tie_continue
+    body_clean = body_clean_temp.replace("[", "").replace("]", "").replace("_", "")
 
     slur_open = "(" in body_clean
     slur_close = ")" in body_clean
