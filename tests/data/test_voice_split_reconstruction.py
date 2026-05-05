@@ -99,6 +99,78 @@ def test_voice_split_at_measure_start_unaffected(tmp_path: Path) -> None:
     )
 
 
+def test_header_level_voice_split_reconstructs_correctly(tmp_path: Path) -> None:
+    """Header-level *^ (immediately after spine declarations) must not drop staff-1 content.
+
+    When *^ appears in the header before any body events, both sub-spines should
+    reconstruct without missing notes.  This covers the bug where an
+    AccidentalException in _parse_pitch_token (double-flat bb notation) caused
+    append_tokens_to_part to silently bail, producing an empty Part for staff 1.
+
+    Kern structure (grand staff, 3/4): spine 1 splits *^ at the header level.
+      Bass staff voices: voice1=quarter chord + half, voice2=half + quarter
+    """
+    krn = _write_kern(
+        tmp_path,
+        "**kern\t**kern\n"
+        "*^\t*\n"                          # header-level split on bass spine
+        "*clefF4\t*clefF4\t*clefG2\n"
+        "*k[]\t*k[]\t*k[]\n"
+        "*M3/4\t*M3/4\t*M3/4\n"
+        "=1\t=1\t=1\n"
+        "4C 4E\t2G\t4c\n"                  # bass voice1: chord C3/E3 q | bass voice2: G2 half | treble: C4 q
+        "4D\t.\t4d\n"                       # bass voice1: D3 q       |             (continues) | treble: D4 q
+        "4E\t4F\t4e\n"                      # bass voice1: E3 q       | bass voice2: F2 q       | treble: E4 q
+        "*v\t*v\t*\n"                       # merge bass voices
+        "=2\t=2\n"
+        "*-\t*-\n",
+    )
+    result = compare_via_music21(krn)
+    note_rest_divs = [d for d in result.divergences if d.kind in ("note", "rest", "chord")]
+    assert len(note_rest_divs) == 0, (
+        f"divergences with header-level *^:\n"
+        + "\n".join(
+            f"  staff={d.staff_idx} offset={d.offset_ql} kind={d.kind} "
+            f"ref={d.ref_value!r} our={d.our_value!r}"
+            for d in note_rest_divs
+        )
+    )
+
+
+def test_double_flat_pitch_roundtrip(tmp_path: Path) -> None:
+    """Double-flat pitch tokens (e.g. Bbb2) must survive the token→music21 round-trip.
+
+    The RADIO vocab encodes double-flats as ``bb`` (e.g. ``Bbb2``) but music21
+    requires ``--`` (e.g. ``B--2``).  The _parse_pitch_token helper must translate
+    between the two formats.  A note encoded as ``Bbb2`` in kern (B double-flat)
+    should round-trip to the same canonical event.
+    """
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n"
+        "*clefF4\n"
+        "*k[b-e-a-d-g-]\n"
+        "*M4/4\n"
+        "=1\n"
+        "4BB--\n"    # B double-flat 2 (kern: BB--)
+        "4BB-\n"
+        "4BB\n"
+        "4BB-\n"
+        "=2\n"
+        "*-\n",
+    )
+    result = compare_via_music21(krn)
+    note_rest_divs = [d for d in result.divergences if d.kind in ("note", "rest")]
+    assert len(note_rest_divs) == 0, (
+        f"double-flat pitch divergences:\n"
+        + "\n".join(
+            f"  staff={d.staff_idx} offset={d.offset_ql} kind={d.kind} "
+            f"ref={d.ref_value!r} our={d.our_value!r}"
+            for d in note_rest_divs
+        )
+    )
+
+
 def test_sample_div_krn_divergences_drop(tmp_path: Path) -> None:
     """The concrete beethoven sample file that triggered this bug must have 0 note/rest divergences."""
     sample = Path("/tmp/sample_div.krn")

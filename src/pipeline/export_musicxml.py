@@ -192,16 +192,38 @@ def _validate_musicxml_schema_file(musicxml_path: Path) -> Dict[str, object]:
     }
 
 
+def _vocab_pitch_to_music21(symbol: str) -> str:
+    """Convert a RADIO vocab pitch symbol to music21-compatible notation.
+
+    The RADIO vocab encodes double-flats as ``bb`` (e.g. ``Bbb2``) following
+    the kern ``--`` → ``b`` substitution used in ``token_from_music21_pitch``.
+    music21's ``Pitch`` / ``Note`` constructors require ``--`` for double-flats
+    (e.g. ``B--2``).  This function performs that one translation; single-flat
+    ``b``, single-sharp ``#``, and double-sharp ``##`` are already valid in
+    both systems.
+    """
+    import re
+
+    # Match [Letter][accidentals][octave] — accidentals may be bb, ##, b, or #
+    m = re.fullmatch(r"([A-G])(bb|##|b|#)?(-?\d+)", symbol)
+    if m is None:
+        return symbol  # pass through unrecognised tokens unchanged
+    letter, acc, octave = m.groups()
+    if acc == "bb":
+        acc = "--"
+    return f"{letter}{acc or ''}{octave}"
+
+
 def _parse_pitch_token(token: str) -> str:
     if not token.startswith("note-"):
         raise ValueError(f"Expected note token, got '{token}'")
-    return token[len("note-") :]
+    return _vocab_pitch_to_music21(token[len("note-") :])
 
 
 def _parse_grace_pitch_token(token: str) -> str:
     if not token.startswith("gracenote-"):
         raise ValueError(f"Expected gracenote token, got '{token}'")
-    return token[len("gracenote-") :]
+    return _vocab_pitch_to_music21(token[len("gracenote-") :])
 
 
 def _decode_duration(tokens: Sequence[str], start_index: int) -> Tuple[float, int]:
