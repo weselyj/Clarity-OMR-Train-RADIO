@@ -1017,7 +1017,9 @@ def _normalize_pitch_symbol(symbol: str, prefer_flats: Optional[bool] = None) ->
 
 def _normalize_grace_pitch_symbol(symbol: str) -> str:
     normalized = _normalize_pitch_symbol(symbol)
-    match = re.fullmatch(r"([A-G])(?:[#b]?)(-?\d+)", normalized)
+    # Match optional single OR double accidental (the v3 phase-3 extension
+    # introduced Xbb / X## tokens that the old regex didn't handle).
+    match = re.fullmatch(r"([A-G])(?:##|bb|#|b)?(-?\d+)", normalized)
     if match is None:
         raise ValueError(f"Unsupported grace pitch symbol '{symbol}'")
     letter, octave_text = match.groups()
