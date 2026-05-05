@@ -4,10 +4,10 @@ from __future__ import annotations
 from src.tokenizer.vocab import build_default_vocabulary, build_default_token_list
 
 
-def test_vocab_size_is_408() -> None:
-    """v3 extension adds 20 enharmonic tokens (Cb/Fb/B#/E# × octaves 2-6)."""
+def test_vocab_size_is_429() -> None:
+    """v3 phase 2 adds 21 octave-1 sub-bass tokens on top of the 408 from v3 phase 1."""
     vocab = build_default_vocabulary()
-    assert vocab.size == 408
+    assert vocab.size == 429
 
 
 def test_marker_tokens_present() -> None:

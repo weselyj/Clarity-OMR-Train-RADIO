@@ -17,6 +17,7 @@ from src.tokenizer.vocab import (
     DYNAMIC_TOKENS,
     EXTENDED_NOTE_TOKENS,
     EXPRESSION_TOKENS,
+    OCTAVE_1_NOTE_TOKENS,
     TEMPO_TOKENS,
     TIME_SIGNATURE_TOKENS,
     build_pitch_tokens,
@@ -117,6 +118,7 @@ SUPPORTED_TIME_SIGNATURE_TOKENS = set(TIME_SIGNATURE_TOKENS)
 SUPPORTED_NOTE_TOKENS = (
     {token for token in build_pitch_tokens() if token.startswith("note-")}
     | set(EXTENDED_NOTE_TOKENS)
+    | set(OCTAVE_1_NOTE_TOKENS)
 )
 SUPPORTED_GRACE_TOKENS = set(build_gracenote_tokens())
 MAX_SUPPORTED_VOICE_INDEX = 4

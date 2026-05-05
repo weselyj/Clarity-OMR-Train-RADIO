@@ -333,3 +333,35 @@ def test_esharp_preserved_in_token_output(tmp_path: Path) -> None:
     tokens = convert_kern_file(krn)
     assert "note-E#4" in tokens
     assert "note-F4" not in tokens
+
+
+# ---------------------------------------------------------------------------
+# octave-1 sub-bass clamping bug fix tests
+# ---------------------------------------------------------------------------
+
+
+def test_kern_FFF_emits_F1_not_C2(tmp_path: Path) -> None:
+    """kern FFF (3 F's = F1) should emit note-F1, not note-C2 (clamping bug).
+
+    Kern octave encoding for uppercase: octave = 3 - (count - 1), so
+    3 uppercase letters → octave 1.  FFFF would be F0 (sub-contrabass).
+    """
+    krn = _write_kern(tmp_path, "**kern\n*clefF4\n*k[]\n*M4/4\n=1\n4FFF\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-F1" in tokens
+    assert "note-C2" not in tokens
+
+
+def test_kern_AAA_emits_A1(tmp_path: Path) -> None:
+    """kern AAA (3 A's = A1) should emit note-A1."""
+    krn = _write_kern(tmp_path, "**kern\n*clefF4\n*k[]\n*M4/4\n=1\n4AAA\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-A1" in tokens
+
+
+def test_kern_BBB_minus_emits_Bb1(tmp_path: Path) -> None:
+    """kern BBB- (3 B's with flat = Bb1) should emit note-Bb1."""
+    krn = _write_kern(tmp_path, "**kern\n*clefF4\n*k[]\n*M4/4\n=1\n4BBB-\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-Bb1" in tokens
+    assert "note-A1" not in tokens  # would be the enharmonic equivalent

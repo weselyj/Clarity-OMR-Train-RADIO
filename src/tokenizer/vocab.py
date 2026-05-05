@@ -40,6 +40,21 @@ EXTENDED_NOTE_TOKENS: list[str] = (
     + [f"note-E#{o}" for o in range(2, 7)]
 )
 
+# v3 phase 2: octave-1 sub-bass notes (F1, G1, A1, Bb1 etc.) were previously
+# absent from the vocab, causing _normalize_note_pitch_symbol to clamp them all
+# to note-C2 (the lowest available token).  Add the full 21-token set covering
+# the same pitch/accidental combinations as octaves 2-6.
+# APPEND-ONLY: keep after EXTENDED_NOTE_TOKENS to preserve all prior IDs.
+OCTAVE_1_NOTE_TOKENS: list[str] = [
+    "note-A1", "note-Ab1", "note-A#1",
+    "note-B1", "note-Bb1", "note-B#1",
+    "note-C1", "note-Cb1", "note-C#1",
+    "note-D1", "note-Db1", "note-D#1",
+    "note-E1", "note-Eb1", "note-E#1",
+    "note-F1", "note-Fb1", "note-F#1",
+    "note-G1", "note-Gb1", "note-G#1",
+]
+
 DURATION_TOKENS = [
     "_whole",
     "_half",
@@ -396,8 +411,10 @@ def build_default_token_list() -> List[str]:
             *TEMPO_TOKENS,
             *EXPRESSION_TOKENS,
             *STAFF_INDEX_MARKER_TOKENS,
-            # v3 extension: enharmonic spelling tokens — always appended last
+            # v3 extension: enharmonic spelling tokens (Cb/Fb/B#/E# × octaves 2-6)
             *EXTENDED_NOTE_TOKENS,
+            # v3 phase 2: octave-1 sub-bass notes — always appended last
+            *OCTAVE_1_NOTE_TOKENS,
         ]
     )
 

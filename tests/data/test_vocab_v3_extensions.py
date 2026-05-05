@@ -49,3 +49,20 @@ def test_v3_tokens_in_note_tokens_set() -> None:
         assert tok in v.note_tokens, f"{tok} missing from note_tokens set"
     for tok in [f"note-E#{o}" for o in range(2, 7)]:
         assert tok in v.note_tokens, f"{tok} missing from note_tokens set"
+
+
+def test_octave_1_note_tokens_present() -> None:
+    """v3 phase 2: octave-1 sub-bass notes are now in vocab."""
+    v = build_default_vocabulary()
+    expected = [
+        "note-A1", "note-Ab1", "note-A#1",
+        "note-B1", "note-Bb1", "note-B#1",
+        "note-C1", "note-Cb1", "note-C#1",
+        "note-D1", "note-Db1", "note-D#1",
+        "note-E1", "note-Eb1", "note-E#1",
+        "note-F1", "note-Fb1", "note-F#1",
+        "note-G1", "note-Gb1", "note-G#1",
+    ]
+    for tok in expected:
+        assert tok in v.token_to_id, f"{tok} missing from vocab"
+    assert len(v.token_to_id) == 408 + 21  # was 408 after v3 enharmonic extension
