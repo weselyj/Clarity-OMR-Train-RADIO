@@ -470,6 +470,10 @@ def _append_tokens_to_part_impl(
             measure_number += 1
             voices = {1: stream.Voice(id="voice_1")}
             active_voice = 1
+            # Tracks the highestTime of all existing voices at the moment the
+            # most-recent <voice_N> token fired.  Used to pad new voices so that
+            # their first event lands at the correct elapsed measure offset.
+            last_voice_switch_elapsed: float = 0.0
             if pending_clef is not None:
                 current_measure.insert(0, pending_clef)
                 pending_clef = None
@@ -503,7 +507,29 @@ def _append_tokens_to_part_impl(
         if token.startswith("<voice_"):
             raw = token.strip("<>").split("_")[-1]
             active_voice = int(raw)
-            voices.setdefault(active_voice, stream.Voice(id=f"voice_{active_voice}"))
+            if active_voice not in voices:
+                new_voice = stream.Voice(id=f"voice_{active_voice}")
+                # Mid-measure split: pad new voice with a hidden rest so its first
+                # event lands at the correct elapsed offset within the measure.
+                # We use last_voice_switch_elapsed — the highestTime of existing
+                # voices recorded when the most-recent <voice_N> token fired —
+                # rather than the current highestTime, because voice_1 may have
+                # accumulated notes for the current row between its <voice_1> token
+                # and this <voice_N> token.
+                if last_voice_switch_elapsed > 0.0:
+                    from music21 import note as m21note
+                    pad = m21note.Rest(quarterLength=last_voice_switch_elapsed)
+                    pad.style.hideObjectOnPrint = True
+                    new_voice.append(pad)
+                voices[active_voice] = new_voice
+            else:
+                # Record elapsed for use when a new voice is created in this row.
+                last_voice_switch_elapsed = float(
+                    max(
+                        (getattr(v, "highestTime", None) or 0.0)
+                        for v in voices.values()
+                    )
+                )
             idx += 1
             continue
 

@@ -95,6 +95,12 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     )
                 )
             elif isinstance(elem, music21.note.Rest):
+                # Skip hidden rests used as voice-split timing padding in our
+                # reconstruction path (append_tokens_to_part). These do not
+                # appear in the reference score so must not be compared.
+                style = getattr(elem, "style", None)
+                if style is not None and getattr(style, "hideObjectOnPrint", False):
+                    continue
                 events.append(
                     CanonicalEvent(
                         offset_ql=offset_ql,
