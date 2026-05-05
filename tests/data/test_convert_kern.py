@@ -296,3 +296,40 @@ def test_three_kern_24s_in_an_eighth_emit_tuplet_3(tmp_path: Path) -> None:
     tokens = convert_kern_file(krn)
     assert tokens.count("<tuplet_3>") == 3
     assert tokens.count("<tuplet_6>") == 0
+
+
+# ---------------------------------------------------------------------------
+# v3 enharmonic spelling preservation tests
+# ---------------------------------------------------------------------------
+
+
+def test_cflat_preserved_in_token_output(tmp_path: Path) -> None:
+    """kern c- (C-flat) should emit note-Cb4, not note-B3 (enharmonic collapse)."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c-\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-Cb4" in tokens
+    assert "note-B3" not in tokens
+
+
+def test_fflat_preserved_in_token_output(tmp_path: Path) -> None:
+    """kern f- (F-flat) should emit note-Fb4, not note-E4 (enharmonic collapse)."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4f-\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-Fb4" in tokens
+    assert "note-E4" not in tokens
+
+
+def test_bsharp_preserved_in_token_output(tmp_path: Path) -> None:
+    """kern b# (B-sharp) should emit note-B#4, not note-C5 (enharmonic collapse)."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4b#\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-B#4" in tokens
+    assert "note-C5" not in tokens
+
+
+def test_esharp_preserved_in_token_output(tmp_path: Path) -> None:
+    """kern e# (E-sharp) should emit note-E#4, not note-F4 (enharmonic collapse)."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4e#\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-E#4" in tokens
+    assert "note-F4" not in tokens

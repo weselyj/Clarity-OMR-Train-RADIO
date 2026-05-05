@@ -4,21 +4,24 @@ from __future__ import annotations
 from src.tokenizer.vocab import build_default_vocabulary, build_default_token_list
 
 
-def test_vocab_size_is_388() -> None:
+def test_vocab_size_is_408() -> None:
+    """v3 extension adds 20 enharmonic tokens (Cb/Fb/B#/E# × octaves 2-6)."""
     vocab = build_default_vocabulary()
-    assert vocab.size == 388
+    assert vocab.size == 408
 
 
-def test_marker_tokens_present_at_end() -> None:
+def test_marker_tokens_present() -> None:
     vocab = build_default_vocabulary()
     for i in range(8):
         token = f"<staff_idx_{i}>"
         assert token in vocab.token_to_id, f"{token} missing from vocab"
-    # New tokens are at the end (highest IDs).
+    # Staff-idx tokens must be in ascending ID order and occupy a contiguous block.
     new_ids = [vocab.token_to_id[f"<staff_idx_{i}>"] for i in range(8)]
     assert new_ids == sorted(new_ids), "marker tokens not in ascending ID order"
-    assert max(new_ids) == vocab.size - 1
-    assert min(new_ids) == vocab.size - 8
+    assert new_ids == list(range(new_ids[0], new_ids[0] + 8)), "marker token IDs not contiguous"
+    # IDs 380-387 (the v2 block) must still be the staff_idx tokens.
+    assert min(new_ids) == 380
+    assert max(new_ids) == 387
 
 
 def test_existing_token_ids_unchanged() -> None:

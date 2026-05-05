@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from src.tokenizer.vocab import (
     CLEF_TOKENS,
     DYNAMIC_TOKENS,
+    EXTENDED_NOTE_TOKENS,
     EXPRESSION_TOKENS,
     TEMPO_TOKENS,
     TIME_SIGNATURE_TOKENS,
@@ -113,7 +114,10 @@ EXPRESSION_TEXT_TO_TOKEN = {
 SUPPORTED_CLEF_TOKENS = set(CLEF_TOKENS)
 SUPPORTED_KEY_SIGNATURE_TOKENS = set(build_key_signature_tokens())
 SUPPORTED_TIME_SIGNATURE_TOKENS = set(TIME_SIGNATURE_TOKENS)
-SUPPORTED_NOTE_TOKENS = {token for token in build_pitch_tokens() if token.startswith("note-")}
+SUPPORTED_NOTE_TOKENS = (
+    {token for token in build_pitch_tokens() if token.startswith("note-")}
+    | set(EXTENDED_NOTE_TOKENS)
+)
 SUPPORTED_GRACE_TOKENS = set(build_gracenote_tokens())
 MAX_SUPPORTED_VOICE_INDEX = 4
 
@@ -987,6 +991,16 @@ def _normalize_pitch_symbol(symbol: str, prefer_flats: Optional[bool] = None) ->
 
     letter, accidental_group, octave_text = match.groups()
     octave = int(octave_text)
+
+    # Preserve natural-key flat/sharp spellings (Cb, Fb, B#, E#) — these would
+    # otherwise be collapsed to their enharmonic naturals (B, E, C, F) via the
+    # semitone-math normalisation below, losing spelling fidelity. The vocab
+    # carries explicit Cb/Fb/B#/E# tokens for these cases.
+    if accidental_group == "b" and letter in ("C", "F"):
+        return f"{letter}b{octave}"
+    if accidental_group == "#" and letter in ("B", "E"):
+        return f"{letter}#{octave}"
+
     semitone = _NATURAL_SEMITONES[letter] + accidental_group.count("#") - accidental_group.count("b")
     while semitone < 0:
         semitone += 12

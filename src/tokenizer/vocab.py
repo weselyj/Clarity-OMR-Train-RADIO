@@ -29,6 +29,17 @@ STRUCTURAL_TOKENS = [
 
 STAFF_INDEX_MARKER_TOKENS = [f"<staff_idx_{i}>" for i in range(8)]
 
+# v3 enharmonic extension: Cb/Fb/B#/E# × octaves 2-6 = 20 tokens.
+# These would otherwise collapse to B/E/C/F via semitone normalisation, losing
+# spelling fidelity that music21 preserves when parsing kern files.
+# APPEND-ONLY: keep after STAFF_INDEX_MARKER_TOKENS to preserve all prior IDs.
+EXTENDED_NOTE_TOKENS: list[str] = (
+    [f"note-Cb{o}" for o in range(2, 7)]
+    + [f"note-Fb{o}" for o in range(2, 7)]
+    + [f"note-B#{o}" for o in range(2, 7)]
+    + [f"note-E#{o}" for o in range(2, 7)]
+)
+
 DURATION_TOKENS = [
     "_whole",
     "_half",
@@ -385,6 +396,8 @@ def build_default_token_list() -> List[str]:
             *TEMPO_TOKENS,
             *EXPRESSION_TOKENS,
             *STAFF_INDEX_MARKER_TOKENS,
+            # v3 extension: enharmonic spelling tokens — always appended last
+            *EXTENDED_NOTE_TOKENS,
         ]
     )
 
