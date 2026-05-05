@@ -1,7 +1,18 @@
 """Tests for src/data/kern_validation.py."""
 from __future__ import annotations
 
-from src.data.kern_validation import CanonicalEvent, Divergence, CompareResult
+from pathlib import Path
+
+import music21
+
+from src.data.kern_validation import (
+    CanonicalEvent,
+    CompareResult,
+    Divergence,
+    canonicalize_score,
+    compare_via_music21,
+    summarize_divergences,
+)
 
 
 def test_canonical_event_dataclass() -> None:
@@ -25,7 +36,7 @@ def test_divergence_dataclass() -> None:
 
 def test_compare_result_passed_when_no_divergences() -> None:
     r = CompareResult(
-        kern_path=__import__("pathlib").Path("/x.krn"),
+        kern_path=Path("/x.krn"),
         ref_canonical=[],
         our_canonical=[],
         divergences=[],
@@ -34,7 +45,6 @@ def test_compare_result_passed_when_no_divergences() -> None:
 
 
 def test_compare_result_not_passed_when_divergences_exist() -> None:
-    from pathlib import Path
     r = CompareResult(
         kern_path=Path("/x.krn"),
         ref_canonical=[],
@@ -44,11 +54,6 @@ def test_compare_result_not_passed_when_divergences_exist() -> None:
         ],
     )
     assert r.passed is False
-
-
-import music21
-
-from src.data.kern_validation import canonicalize_score
 
 
 def test_canonicalize_simple_quarter_note() -> None:
@@ -191,11 +196,6 @@ def test_canonicalize_triplet_ratio() -> None:
     assert payload[2] == (3, 2)
 
 
-from pathlib import Path
-
-from src.data.kern_validation import compare_via_music21, summarize_divergences
-
-
 def _write_kern(tmp_path: Path, content: str) -> Path:
     p = tmp_path / "sample.krn"
     p.write_text(content, encoding="utf-8")
@@ -217,7 +217,6 @@ def test_compare_via_music21_simple_passes(tmp_path: Path) -> None:
 
 
 def test_summarize_divergences_groups_by_kind(tmp_path: Path) -> None:
-    from src.data.kern_validation import CompareResult, Divergence
     results = [
         CompareResult(
             kern_path=Path("/a.krn"),

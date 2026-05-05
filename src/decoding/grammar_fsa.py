@@ -22,7 +22,7 @@ DURATION_TO_BEATS: Dict[str, float] = {
 TUPLET_BEAT_SCALE: Dict[str, float] = {
     "<tuplet_3>": 2.0 / 3.0,
     "<tuplet_5>": 4.0 / 5.0,
-    "<tuplet_6>": 5.0 / 6.0,
+    "<tuplet_6>": 4.0 / 6.0,
     "<tuplet_7>": 6.0 / 7.0,
 }
 

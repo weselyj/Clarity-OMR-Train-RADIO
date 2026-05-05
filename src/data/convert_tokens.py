@@ -519,7 +519,9 @@ def kern_pitch_token(body: str) -> str:
 TUPLET_RATIOS = {
     "<tuplet_3>": (3, 2),  # 3 in time of 2 (triplet)
     "<tuplet_5>": (5, 4),  # 5 in time of 4 (quintuplet)
-    "<tuplet_6>": (6, 4),  # 6 in time of 4 (sextuplet — same ratio as tuplet_3 in arithmetic)
+    # <tuplet_6> omitted: 6:4 reduces to 3:2 arithmetically, so <tuplet_3> always matches first.
+    # Re-add here (and update grammar_fsa.py to 4/6) only if the converter ever needs to
+    # distinguish sextuplets from triplets by context.
     "<tuplet_7>": (7, 4),  # 7 in time of 4 (septuplet)
 }
 
@@ -570,23 +572,6 @@ def kern_duration_components(duration_num: int, dots: int, is_rest: bool) -> Lis
         return quantized_duration
     return [best_tuplet, *quantized_duration]
 
-
-def disambiguate_tuplet_grouping(spine_tokens: List[str]) -> List[str]:
-    """Walk a list of tokens emitted for one spine-and-measure, and rewrite tuplet
-    markers based on grouping context.
-
-    Rule: count consecutive runs where every event has the same tuplet token. If
-    the run length is exactly 3, keep <tuplet_3>. Runs of other lengths also keep
-    <tuplet_3> — kern always encodes triplets as 3:2, never as 6:4 or other groupings.
-
-    <tuplet_5> and <tuplet_7> are emitted directly by kern_duration_components when
-    the kern code maps to a 5:4 or 7:4 ratio (e.g. kern 20 → <tuplet_5> _sixteenth).
-    They are never upgraded from <tuplet_3> here.
-
-    This operates on already-emitted token lists, so we look for tuplet tokens
-    in their canonical-order position (immediately before duration tokens).
-    """
-    return list(spine_tokens)
 
 
 def parse_kern_event(
@@ -949,14 +934,14 @@ def convert_kern_file(path: Path) -> List[str]:
     out: List[str] = ["<bos>"]
     if spine_count == 1:
         out.append("<staff_start>")
-        out.extend(disambiguate_tuplet_grouping(per_spine_tokens[0]))
+        out.extend(list(per_spine_tokens[0]))
         out.append("<staff_end>")
     else:
         for display_idx in range(spine_count):
             kern_spine_id = (spine_count - 1) - display_idx
             out.append("<staff_start>")
             out.append(f"<staff_idx_{display_idx}>")
-            out.extend(disambiguate_tuplet_grouping(per_spine_tokens[kern_spine_id]))
+            out.extend(list(per_spine_tokens[kern_spine_id]))
             out.append("<staff_end>")
     out.append("<eos>")
     return out

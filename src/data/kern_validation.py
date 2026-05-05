@@ -45,6 +45,31 @@ class CompareResult:
         return len(self.divergences) == 0
 
 
+_ARTICULATION_NAME_MAP = {
+    "Accent": "accent",
+    "Staccato": "staccato",
+    "Staccatissimo": "staccatissimo",
+    "Tenuto": "tenuto",
+    "StrongAccent": "marcato",
+}
+
+_ORNAMENT_NAME_MAP = {
+    "Trill": "trill",
+    "HalfStepTrill": "trill",
+    "WholeStepTrill": "trill",
+    "InvertedTrill": "trill",
+    "Mordent": "mordent",
+    "HalfStepMordent": "mordent",
+    "WholeStepMordent": "mordent",
+    "GeneralMordent": "mordent",
+    "InvertedMordent": "inverted_mordent",
+    "HalfStepInvertedMordent": "inverted_mordent",
+    "WholeStepInvertedMordent": "inverted_mordent",
+    "Turn": "turn",
+    "Fermata": "fermata",
+}
+
+
 def _tuplet_ratio(elem) -> tuple | None:
     """Return (numNotesActual, numNotesNormal) of the outermost tuplet on this element, or None."""
     tuplets = list(getattr(elem.duration, "tuplets", []) or [])
@@ -142,15 +167,8 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     )
 
             # Articulations (each maps to a name like 'accent', 'staccato')
-            articulation_name_map = {
-                "Accent": "accent",
-                "Staccato": "staccato",
-                "Staccatissimo": "staccatissimo",
-                "Tenuto": "tenuto",
-                "StrongAccent": "marcato",
-            }
             for art in getattr(elem, "articulations", []) or []:
-                name = articulation_name_map.get(type(art).__name__)
+                name = _ARTICULATION_NAME_MAP.get(type(art).__name__)
                 if name is not None:
                     events.append(
                         CanonicalEvent(
@@ -164,23 +182,8 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
             # Ornaments + fermata (live in .expressions)
             # music21's humdrum parser may return subclasses (HalfStepTrill, WholeStepMordent, etc.)
             # rather than the base Trill/Mordent classes. Map all variants to the same canonical name.
-            ornament_name_map = {
-                "Trill": "trill",
-                "HalfStepTrill": "trill",
-                "WholeStepTrill": "trill",
-                "InvertedTrill": "trill",
-                "Mordent": "mordent",
-                "HalfStepMordent": "mordent",
-                "WholeStepMordent": "mordent",
-                "GeneralMordent": "mordent",
-                "InvertedMordent": "inverted_mordent",
-                "HalfStepInvertedMordent": "inverted_mordent",
-                "WholeStepInvertedMordent": "inverted_mordent",
-                "Turn": "turn",
-                "Fermata": "fermata",
-            }
             for expr in getattr(elem, "expressions", []) or []:
-                name = ornament_name_map.get(type(expr).__name__)
+                name = _ORNAMENT_NAME_MAP.get(type(expr).__name__)
                 if name is not None:
                     events.append(
                         CanonicalEvent(
