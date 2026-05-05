@@ -55,6 +55,30 @@ OCTAVE_1_NOTE_TOKENS: list[str] = [
     "note-G1", "note-Gb1", "note-G#1",
 ]
 
+# v3 phase 3: double-flat and double-sharp tokens (14 spellings × 6 octaves = 84 tokens).
+# Music21 preserves these spellings when parsing kern `--` / `##` accidentals;
+# _normalize_pitch_symbol previously collapsed them to enharmonic naturals
+# (e.g. Bbb → A, F## → G), corrupting ~13% of training labels.
+# APPEND-ONLY: always kept after OCTAVE_1_NOTE_TOKENS to preserve all prior IDs.
+DOUBLE_ACCIDENTAL_NOTE_TOKENS: list[str] = [
+    # Double-flats
+    *[f"note-Abb{o}" for o in range(1, 7)],
+    *[f"note-Bbb{o}" for o in range(1, 7)],
+    *[f"note-Cbb{o}" for o in range(1, 7)],
+    *[f"note-Dbb{o}" for o in range(1, 7)],
+    *[f"note-Ebb{o}" for o in range(1, 7)],
+    *[f"note-Fbb{o}" for o in range(1, 7)],
+    *[f"note-Gbb{o}" for o in range(1, 7)],
+    # Double-sharps
+    *[f"note-A##{o}" for o in range(1, 7)],
+    *[f"note-B##{o}" for o in range(1, 7)],
+    *[f"note-C##{o}" for o in range(1, 7)],
+    *[f"note-D##{o}" for o in range(1, 7)],
+    *[f"note-E##{o}" for o in range(1, 7)],
+    *[f"note-F##{o}" for o in range(1, 7)],
+    *[f"note-G##{o}" for o in range(1, 7)],
+]
+
 DURATION_TOKENS = [
     "_whole",
     "_half",
@@ -413,8 +437,10 @@ def build_default_token_list() -> List[str]:
             *STAFF_INDEX_MARKER_TOKENS,
             # v3 extension: enharmonic spelling tokens (Cb/Fb/B#/E# × octaves 2-6)
             *EXTENDED_NOTE_TOKENS,
-            # v3 phase 2: octave-1 sub-bass notes — always appended last
+            # v3 phase 2: octave-1 sub-bass notes
             *OCTAVE_1_NOTE_TOKENS,
+            # v3 phase 3: double-flat/double-sharp tokens — always appended last
+            *DOUBLE_ACCIDENTAL_NOTE_TOKENS,
         ]
     )
 

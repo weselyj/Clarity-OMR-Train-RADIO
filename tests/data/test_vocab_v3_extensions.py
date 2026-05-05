@@ -65,4 +65,18 @@ def test_octave_1_note_tokens_present() -> None:
     ]
     for tok in expected:
         assert tok in v.token_to_id, f"{tok} missing from vocab"
-    assert len(v.token_to_id) == 408 + 21  # was 408 after v3 enharmonic extension
+    assert len(v.token_to_id) == 408 + 21 + 84  # was 408 after v3 enharmonic extension; +84 for v3 phase 3 double-accidentals
+
+
+def test_double_accidental_tokens_present() -> None:
+    """v3 phase 3: double-flats and double-sharps are now in vocab."""
+    v = build_default_vocabulary()
+    expected = []
+    for letter in "ABCDEFG":
+        for octave in range(1, 7):
+            expected.append(f"note-{letter}bb{octave}")
+            expected.append(f"note-{letter}##{octave}")
+    assert len(expected) == 84
+    for tok in expected:
+        assert tok in v.token_to_id, f"{tok} missing from vocab"
+    assert len(v.token_to_id) == 429 + 84

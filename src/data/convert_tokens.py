@@ -14,6 +14,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from src.tokenizer.vocab import (
     CLEF_TOKENS,
+    DOUBLE_ACCIDENTAL_NOTE_TOKENS,
     DYNAMIC_TOKENS,
     EXTENDED_NOTE_TOKENS,
     EXPRESSION_TOKENS,
@@ -119,6 +120,7 @@ SUPPORTED_NOTE_TOKENS = (
     {token for token in build_pitch_tokens() if token.startswith("note-")}
     | set(EXTENDED_NOTE_TOKENS)
     | set(OCTAVE_1_NOTE_TOKENS)
+    | set(DOUBLE_ACCIDENTAL_NOTE_TOKENS)
 )
 SUPPORTED_GRACE_TOKENS = set(build_gracenote_tokens())
 MAX_SUPPORTED_VOICE_INDEX = 4
@@ -979,6 +981,14 @@ def _normalize_pitch_symbol(symbol: str, prefer_flats: Optional[bool] = None) ->
     letter, accidental_group, octave_text = match.groups()
     octave = int(octave_text)
 
+    # Preserve double-accidentals: vocab now carries all 14 spellings × 6 octaves.
+    # Collapsing them (e.g. Bbb → A, F## → G) loses musically-meaningful spelling
+    # information carried through from kern `--` / `##` accidentals via music21.
+    if accidental_group == "bb":
+        return f"{letter}bb{octave}"
+    if accidental_group == "##":
+        return f"{letter}##{octave}"
+
     # Preserve natural-key flat/sharp spellings (Cb, Fb, B#, E#) — these would
     # otherwise be collapsed to their enharmonic naturals (B, E, C, F) via the
     # semitone-math normalisation below, losing spelling fidelity. The vocab
@@ -1021,7 +1031,9 @@ def _normalize_grace_pitch_symbol(symbol: str) -> str:
 
 def _normalize_note_pitch_symbol(symbol: str) -> str:
     normalized = _normalize_pitch_symbol(symbol)
-    match = re.fullmatch(r"([A-G](?:#|b)?)(-?\d+)", normalized)
+    # Pattern accepts single OR double accidentals (##, bb) produced by the
+    # double-accidental preservation path in _normalize_pitch_symbol.
+    match = re.fullmatch(r"([A-G](?:##|bb|#|b)?)(-?\d+)", normalized)
     if match is None:
         raise ValueError(f"Unsupported pitch symbol '{symbol}'")
     pitch_class, octave_text = match.groups()
@@ -1039,7 +1051,7 @@ def _normalize_note_pitch_symbol(symbol: str) -> str:
     best_key: Tuple[int, int, str] | None = None
     for note_token in SUPPORTED_NOTE_TOKENS:
         note_symbol = note_token[len("note-") :]
-        parsed = re.fullmatch(r"([A-G](?:#|b)?)(-?\d+)", note_symbol)
+        parsed = re.fullmatch(r"([A-G](?:##|bb|#|b)?)(-?\d+)", note_symbol)
         if parsed is None:
             continue
         cand_pitch_class, cand_octave_text = parsed.groups()

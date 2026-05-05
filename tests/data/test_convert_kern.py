@@ -365,3 +365,36 @@ def test_kern_BBB_minus_emits_Bb1(tmp_path: Path) -> None:
     tokens = convert_kern_file(krn)
     assert "note-Bb1" in tokens
     assert "note-A1" not in tokens  # would be the enharmonic equivalent
+
+
+# ---------------------------------------------------------------------------
+# double-accidental (-- / ##) preservation tests
+# ---------------------------------------------------------------------------
+
+
+def test_kern_BBB_double_flat_emits_Bbb1(tmp_path: Path) -> None:
+    """kern BBB-- (3 uppercase B's = octave 1, -- = double-flat) → note-Bbb1, not note-A1.
+
+    Kern octave encoding for uppercase: octave = 3 - (count - 1), so
+    3 uppercase letters → octave 1.
+    """
+    krn = _write_kern(tmp_path, "**kern\n*clefF4\n*k[]\n*M4/4\n=1\n4BBB--\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-Bbb1" in tokens
+    assert "note-A1" not in tokens
+
+
+def test_kern_ee_double_flat_emits_Ebb5(tmp_path: Path) -> None:
+    """kern ee-- (2 e's = octave 5, -- = double-flat) → note-Ebb5, not note-D5."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4ee--\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-Ebb5" in tokens
+    assert "note-D5" not in tokens
+
+
+def test_kern_f_double_sharp_emits_Fsharpsharp4(tmp_path: Path) -> None:
+    """kern f## (octave 4, ## = double-sharp) → note-F##4, not note-G4."""
+    krn = _write_kern(tmp_path, "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4f##\n*-\n")
+    tokens = convert_kern_file(krn)
+    assert "note-F##4" in tokens
+    assert "note-G4" not in tokens

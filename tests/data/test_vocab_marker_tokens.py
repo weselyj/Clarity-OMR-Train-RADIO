@@ -4,10 +4,10 @@ from __future__ import annotations
 from src.tokenizer.vocab import build_default_vocabulary, build_default_token_list
 
 
-def test_vocab_size_is_429() -> None:
-    """v3 phase 2 adds 21 octave-1 sub-bass tokens on top of the 408 from v3 phase 1."""
+def test_vocab_size_is_513() -> None:
+    """v3 phase 3 adds 84 double-accidental tokens on top of the 429 from v3 phase 2."""
     vocab = build_default_vocabulary()
-    assert vocab.size == 429
+    assert vocab.size == 513
 
 
 def test_marker_tokens_present() -> None:
