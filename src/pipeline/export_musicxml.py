@@ -442,6 +442,26 @@ def _append_tokens_to_part_impl(
         except ValueError:
             return None
 
+    def _consume_post_duration_modifiers(start_index: int) -> int:
+        """Consume any tie_end / slur_end tokens immediately after a duration,
+        updating the pending flags so _apply_tie / _apply_slur_links see them.
+
+        Returns the index of the first token that is NOT a post-duration modifier.
+        """
+        nonlocal pending_tie_end, pending_slur_ends
+        idx2 = start_index
+        while idx2 < len(tokens):
+            tok2 = tokens[idx2]
+            if tok2 == "tie_end":
+                pending_tie_end = True
+                idx2 += 1
+            elif tok2 == "slur_end":
+                pending_slur_ends += 1
+                idx2 += 1
+            else:
+                break
+        return idx2
+
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
@@ -587,7 +607,10 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
-            _append_event_to_voice(current_voice, note.Rest(quarterLength=duration_q))
+            next_idx = _consume_post_duration_modifiers(next_idx)
+            rest_event = note.Rest(quarterLength=duration_q)
+            _apply_tie(rest_event)
+            _append_event_to_voice(current_voice, rest_event)
             idx = next_idx
             continue
 
@@ -620,6 +643,7 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
+            next_idx = _consume_post_duration_modifiers(next_idx)
             if chord_pitches:
                 chord_event = chord.Chord(chord_pitches, quarterLength=duration_q)
                 _apply_articulations_and_expressions(chord_event)
@@ -647,6 +671,7 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
+            next_idx = _consume_post_duration_modifiers(next_idx)
             note_event = note.Note(pitch, quarterLength=duration_q)
             _apply_articulations_and_expressions(note_event)
             _apply_tie(note_event)
@@ -666,6 +691,7 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
+            next_idx = _consume_post_duration_modifiers(next_idx)
             grace_event = note.Note(pitch, quarterLength=duration_q).getGrace()
             _apply_articulations_and_expressions(grace_event)
             _apply_tie(grace_event)

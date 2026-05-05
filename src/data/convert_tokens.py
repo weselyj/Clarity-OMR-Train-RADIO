@@ -570,46 +570,17 @@ def disambiguate_tuplet_grouping(spine_tokens: List[str]) -> List[str]:
     markers based on grouping context.
 
     Rule: count consecutive runs where every event has the same tuplet token. If
-    the run length is exactly 3, keep <tuplet_3>. If exactly 6 (and the math also
-    admits it), upgrade to <tuplet_6>. Same idea for tuplet_5 / tuplet_7.
+    the run length is exactly 3, keep <tuplet_3>. Runs of other lengths also keep
+    <tuplet_3> — kern always encodes triplets as 3:2, never as 6:4 or other groupings.
+
+    <tuplet_5> and <tuplet_7> are emitted directly by kern_duration_components when
+    the kern code maps to a 5:4 or 7:4 ratio (e.g. kern 20 → <tuplet_5> _sixteenth).
+    They are never upgraded from <tuplet_3> here.
 
     This operates on already-emitted token lists, so we look for tuplet tokens
     in their canonical-order position (immediately before duration tokens).
     """
-    out = list(spine_tokens)
-
-    # Find indices of <tuplet_3> tokens in order.
-    indices = [i for i, t in enumerate(out) if t == "<tuplet_3>"]
-    if not indices:
-        return out
-
-    # Group into contiguous runs (where each <tuplet_3> is "near" the previous one
-    # with only intervening note/duration/articulation tokens — no other tuplet_3).
-    runs: List[List[int]] = []
-    current: List[int] = []
-    for idx in indices:
-        if not current or idx > current[-1]:
-            if current and idx > current[-1] + 6:  # threshold for "too far apart"
-                runs.append(current)
-                current = []
-            current.append(idx)
-    if current:
-        runs.append(current)
-
-    # For each run, if length is exactly 6, rewrite all <tuplet_3> -> <tuplet_6>.
-    for run in runs:
-        if len(run) == 6:
-            for i in run:
-                out[i] = "<tuplet_6>"
-        elif len(run) == 5:
-            for i in run:
-                out[i] = "<tuplet_5>"
-        elif len(run) == 7:
-            for i in run:
-                out[i] = "<tuplet_7>"
-        # Length 3 (or anything else): keep <tuplet_3>
-
-    return out
+    return list(spine_tokens)
 
 
 def parse_kern_event(
@@ -628,12 +599,16 @@ def parse_kern_event(
         body = event
     duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=False)
 
-    tie_open = "[" in body
-    tie_close = "]" in body
-    body_clean = body.replace("[", "").replace("]", "")
+    # Detect grace note flag 'q' (acciaccatura) or 'Q' (appoggiatura).
+    is_grace = "q" in body or "Q" in body
+    body_clean_temp = body.replace("q", "").replace("Q", "")
 
-    slur_open = "(" in body
-    slur_close = ")" in body
+    tie_open = "[" in body_clean_temp
+    tie_close = "]" in body_clean_temp
+    body_clean = body_clean_temp.replace("[", "").replace("]", "")
+
+    slur_open = "(" in body_clean
+    slur_close = ")" in body_clean
     body_clean = body_clean.replace("(", "").replace(")", "")
 
     articulations: List[str] = []
@@ -666,6 +641,23 @@ def parse_kern_event(
 
     prefer_flats = "-" in body_clean and "#" not in body_clean
     normalized = _normalize_pitch_symbol(kern_pitch_token(body_clean), prefer_flats=prefer_flats)
+
+    if is_grace:
+        grace_pitch = _normalize_grace_pitch_symbol(normalized)
+        return KernEvent(
+            pitches=[f"gracenote-{grace_pitch}"],
+            duration_tokens=duration_parts,
+            is_grace=True,
+            tie_open=tie_open,
+            tie_close=tie_close,
+            slur_open=slur_open,
+            slur_close=slur_close,
+            articulations=articulations,
+            ornaments=ornaments,
+            # Grace notes consume no metric time, so don't update fallback duration.
+            next_fallback_duration=fallback_duration,
+        )
+
     pitch = _normalize_note_pitch_symbol(normalized)
     return KernEvent(
         pitches=[f"note-{pitch}"],

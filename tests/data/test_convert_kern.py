@@ -270,16 +270,21 @@ def test_kern_12_is_eighth_triplet(tmp_path: Path) -> None:
     assert "_eighth" in tokens
 
 
-def test_six_kern_48s_in_a_quarter_emit_tuplet_6(tmp_path: Path) -> None:
-    """Six 48-notes in a row spanning a quarter beat = sextuplet (tuplet_6 of 32nds)."""
+def test_six_kern_48s_emit_tuplet_3(tmp_path: Path) -> None:
+    """Six 48-notes in a row are 2 groups of 3 thirty-second triplets (not a sextuplet).
+    kern 48 = 32nd-note triplet (3:2 ratio). 6 × (1/12 QL) = 1/2 QL total,
+    which is half a beat — not one full quarter beat — so they are NOT a sextuplet.
+    The converter emits <tuplet_3> for each and the disambiguator leaves them unchanged.
+    """
     krn = _write_kern(
         tmp_path,
         "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n48c\n48d\n48e\n48f\n48g\n48a\n*-\n",
     )
     tokens = convert_kern_file(krn)
-    # Disambiguation: 6 in a row of the same tuplet base = sextuplet, not triplet.
-    assert tokens.count("<tuplet_6>") == 6
-    assert tokens.count("<tuplet_3>") == 0
+    # Six 32nd triplets stay as tuplet_3 — upgrading to tuplet_6 was incorrect because
+    # TUPLET_NORMAL[6]=5 (6:5 ratio) yields wrong QL. Round-trip test confirms tuplet_3.
+    assert tokens.count("<tuplet_3>") == 6
+    assert tokens.count("<tuplet_6>") == 0
 
 
 def test_three_kern_24s_in_an_eighth_emit_tuplet_3(tmp_path: Path) -> None:

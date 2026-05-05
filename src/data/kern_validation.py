@@ -77,6 +77,13 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                 offset_ql = float(getattr(elem, "offset", 0.0))
             duration_ql = float(elem.duration.quarterLength)
 
+            # Skip grace notes (ql == 0.0) — music21 encodes them as zero-duration
+            # notes and our converter canonicalizes them as gracenote-* tokens;
+            # neither path can express them identically, so we exclude them from the
+            # round-trip comparison (documented limitation).
+            if duration_ql == 0.0:
+                continue
+
             if isinstance(elem, music21.chord.Chord) and not isinstance(elem, music21.note.Note):
                 pitches = tuple(p.nameWithOctave for p in elem.pitches)
                 events.append(
@@ -149,10 +156,20 @@ def canonicalize_score(score) -> List[CanonicalEvent]:
                     )
 
             # Ornaments + fermata (live in .expressions)
+            # music21's humdrum parser may return subclasses (HalfStepTrill, WholeStepMordent, etc.)
+            # rather than the base Trill/Mordent classes. Map all variants to the same canonical name.
             ornament_name_map = {
                 "Trill": "trill",
+                "HalfStepTrill": "trill",
+                "WholeStepTrill": "trill",
+                "InvertedTrill": "trill",
                 "Mordent": "mordent",
+                "HalfStepMordent": "mordent",
+                "WholeStepMordent": "mordent",
+                "GeneralMordent": "mordent",
                 "InvertedMordent": "inverted_mordent",
+                "HalfStepInvertedMordent": "inverted_mordent",
+                "WholeStepInvertedMordent": "inverted_mordent",
                 "Turn": "turn",
                 "Fermata": "fermata",
             }
@@ -203,7 +220,7 @@ def compare_via_music21(kern_path: Path) -> CompareResult:
                 except Exception:
                     # Conversion failure: still append the empty part so staff_idx alignment holds.
                     pass
-                our_score.append(part)
+                our_score.insert(0, part)
                 cur_part = None
         elif tok in {"<bos>", "<eos>"}:
             continue
