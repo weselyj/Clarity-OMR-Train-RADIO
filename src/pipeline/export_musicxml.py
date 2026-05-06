@@ -803,6 +803,16 @@ def _append_tokens_to_part_impl(
                 _target.append(pending_time)
                 pending_time = None
 
+    # Auto-beam: kern's L/J beam markers aren't preserved in our token vocab,
+    # so without makeBeams every eighth/sixteenth/etc. renders as a separate
+    # flagged note. makeBeams uses time-signature beat boundaries to produce
+    # conventional groupings (e.g. 16ths beam in groups of 4 in 4/4 time),
+    # which is what the kern reference shows in nearly all cases.
+    try:
+        part.makeBeams(inPlace=True)
+    except Exception:
+        pass  # fall through silently on rare music21 edge cases
+
     # Multi-voice stem direction fix: in MusicXML convention voice 1 = stems up,
     # voice 2+ = stems down. music21 auto-assigns by pitch height, which leaves
     # both voices with same direction in many cases, causing verovio layer overlap.
