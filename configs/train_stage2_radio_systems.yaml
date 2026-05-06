@@ -9,7 +9,7 @@
 #     venv-cu132\Scripts\python -u src/train/train.py \
 #       --stage-configs configs/train_stage2_radio_systems.yaml \
 #       --mode execute \
-#       --resume-checkpoint checkpoints/full_radio_stage1_v2/_best.pt \
+#       --resume-checkpoint checkpoints/full_radio_stage1_v2/stage1-radio-monophonic-foundation_best.pt \
 #       --start-stage stage2-radio-systems-polyphonic \
 #       --checkpoint-dir checkpoints/full_radio_stage2_systems_v2 \
 #       --token-manifest src/data/manifests/token_manifest_full_systems.jsonl \
