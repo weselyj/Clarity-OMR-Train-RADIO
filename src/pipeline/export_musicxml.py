@@ -847,11 +847,17 @@ def _append_tokens_to_part_impl(
             altered_pitches = list(ks.alteredPitches)
             break
         try:
+            # Use music21 defaults (cautionaryPitchClass=True,
+            # cautionaryNotImmediateRepeat=True). cautionaryNotImmediateRepeat
+            # is what makes music21 ALSO emit naturals on different-octave
+            # notes overriding the key signature within the same measure
+            # (e.g. C-flat key sig must show a natural on BOTH C5 and C6 if
+            # both appear in a measure as naturals). Setting it to False
+            # silently drops those required naturals — worse than the mild
+            # cross-measure courtesy naturals it would also suppress.
             measure.flatten().makeAccidentals(
                 inPlace=True,
                 alteredPitches=altered_pitches,
-                cautionaryPitchClass=False,
-                cautionaryNotImmediateRepeat=False,
             )
         except Exception:
             pass  # fall through silently on rare music21 edge cases
