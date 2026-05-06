@@ -811,7 +811,14 @@ def _append_tokens_to_part_impl(
     # Note: Part.makeAccidentals() automatically reads the key signature from
     # the Part's measures; useKeySignature is a Measure-level parameter only.
     try:
-        part.makeAccidentals(inPlace=True)
+        # cautionaryPitchClass=False, cautionaryNotImmediateRepeat=False:
+        # use strict modern notation rules — don't add courtesy naturals across
+        # measures or octaves. Verovio's direct kern parse uses the same convention.
+        part.makeAccidentals(
+            inPlace=True,
+            cautionaryPitchClass=False,
+            cautionaryNotImmediateRepeat=False,
+        )
     except Exception:
         pass  # makeAccidentals can fail on edge cases; fall through silently.
 
