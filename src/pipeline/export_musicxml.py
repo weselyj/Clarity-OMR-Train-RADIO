@@ -808,19 +808,34 @@ def _append_tokens_to_part_impl(
     # established by a prior note in the same measure. Without this, every
     # explicit pitch token (note-Bb4 etc.) renders an accidental in MusicXML/SVG
     # even when conventional notation would not display it.
-    # Note: Part.makeAccidentals() automatically reads the key signature from
-    # the Part's measures; useKeySignature is a Measure-level parameter only.
-    try:
-        # cautionaryPitchClass=False, cautionaryNotImmediateRepeat=False:
-        # use strict modern notation rules — don't add courtesy naturals across
-        # measures or octaves. Verovio's direct kern parse uses the same convention.
-        part.makeAccidentals(
-            inPlace=True,
-            cautionaryPitchClass=False,
-            cautionaryNotImmediateRepeat=False,
-        )
-    except Exception:
-        pass  # makeAccidentals can fail on edge cases; fall through silently.
+    #
+    # We call makeAccidentals per-measure on a flattened view so notes from
+    # multiple voices are processed in temporal order. Calling on the whole
+    # Part processes voices independently in voice-id order, which can put
+    # the visible accidental on the wrong note when an early-time note in
+    # voice 2 shares pitch class with a later-time note in voice 1.
+    #
+    # cautionaryPitchClass=False, cautionaryNotImmediateRepeat=False: strict
+    # modern notation — accidentals don't carry across measures or octaves.
+    from music21 import stream as _ms_stream
+    from music21 import key as _ms_key
+    # Track the most-recent key signature seen at the part level so per-measure
+    # makeAccidentals on a flattened measure has the right altered-pitch context.
+    altered_pitches = []
+    for measure in part.getElementsByClass(_ms_stream.Measure):
+        # Update altered_pitches if this measure carries a new KeySignature.
+        for ks in measure.recurse().getElementsByClass(_ms_key.KeySignature):
+            altered_pitches = list(ks.alteredPitches)
+            break
+        try:
+            measure.flatten().makeAccidentals(
+                inPlace=True,
+                alteredPitches=altered_pitches,
+                cautionaryPitchClass=False,
+                cautionaryNotImmediateRepeat=False,
+            )
+        except Exception:
+            pass  # fall through silently on rare music21 edge cases
 
 
 def assembled_score_to_music21(score: AssembledScore):
