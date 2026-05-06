@@ -804,6 +804,17 @@ def _append_tokens_to_part_impl(
                 if isinstance(elem, (_note.Note, _chord.Chord)):
                     elem.stemDirection = target_dir
 
+    # Suppress redundant accidentals: ones implied by key signature or already
+    # established by a prior note in the same measure. Without this, every
+    # explicit pitch token (note-Bb4 etc.) renders an accidental in MusicXML/SVG
+    # even when conventional notation would not display it.
+    # Note: Part.makeAccidentals() automatically reads the key signature from
+    # the Part's measures; useKeySignature is a Measure-level parameter only.
+    try:
+        part.makeAccidentals(inPlace=True)
+    except Exception:
+        pass  # makeAccidentals can fail on edge cases; fall through silently.
+
 
 def assembled_score_to_music21(score: AssembledScore):
     _, _, _, _, _, _, stream = _require_music21()
