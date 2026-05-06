@@ -784,6 +784,25 @@ def _append_tokens_to_part_impl(
     for slur in created_spanners:
         part.insert(0, slur)
 
+    # End-of-tokens trailing-pending flush: when callers pass a token list with
+    # <staff_end> stripped (e.g. sp2_render_grandstaff_v2.py's split_staves),
+    # the in-loop <staff_end> handler never fires, so a pending clef/key/time
+    # arriving after the final <measure_end> stays in pending_* and is dropped.
+    # Mirror the in-loop flush as a fallback at end-of-loop.
+    if pending_clef is not None or pending_key is not None or pending_time is not None:
+        _measures = list(part.getElementsByClass(stream.Measure))
+        _target = current_measure if current_measure is not None else (_measures[-1] if _measures else None)
+        if _target is not None:
+            if pending_clef is not None:
+                _target.append(pending_clef)
+                pending_clef = None
+            if pending_key is not None:
+                _target.append(pending_key)
+                pending_key = None
+            if pending_time is not None:
+                _target.append(pending_time)
+                pending_time = None
+
     # Multi-voice stem direction fix: in MusicXML convention voice 1 = stems up,
     # voice 2+ = stems down. music21 auto-assigns by pitch height, which leaves
     # both voices with same direction in many cases, causing verovio layer overlap.
