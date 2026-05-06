@@ -414,3 +414,30 @@ def test_kern_tie_continuation_marker(tmp_path: Path) -> None:
     assert tokens.count("tie_start") == 2
     assert tokens.count("tie_end") == 2
     # The tie_start/tie_end positions should bookend each note correctly.
+
+
+def test_kern_repeat_end_barline_emits_token(tmp_path: Path) -> None:
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c\n4d\n4e\n4f\n=:|!\n4g\n4a\n4b\n4cc\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    assert "repeat_end" in tokens
+
+
+def test_kern_final_barline_emits_token(tmp_path: Path) -> None:
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=1\n4c\n4d\n4e\n4f\n==\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    assert "final_barline" in tokens
+
+
+def test_kern_repeat_start_barline_emits_token(tmp_path: Path) -> None:
+    krn = _write_kern(
+        tmp_path,
+        "**kern\n*clefG2\n*k[]\n*M4/4\n=!|:\n4c\n4d\n4e\n4f\n=\n*-\n",
+    )
+    tokens = convert_kern_file(krn)
+    assert "repeat_start" in tokens

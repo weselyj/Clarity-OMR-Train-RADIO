@@ -499,6 +499,37 @@ def kern_time_signature_token(cell: str) -> Optional[str]:
     return _normalize_time_signature_token(f"timeSignature-{meter}")
 
 
+def kern_barline_token(cell: str) -> Optional[str]:
+    """Return a barline-type vocab token for a kern barline cell, or None for a regular barline.
+
+    Kern barline conventions:
+      =      regular (no token)
+      ==     final / double-thick  → final_barline
+      =||    double light          → double_barline
+      =:|!   end-repeat            → repeat_end
+      =!|:   start-repeat          → repeat_start
+      =:|!|: end-then-start        → repeat_both
+    """
+    if not cell.startswith("="):
+        return None
+    rest = cell[1:]  # strip leading =
+    # Final barline: starts with a second =
+    if rest.startswith("="):
+        return "final_barline"
+    # Double light barline
+    if rest.startswith("||"):
+        return "double_barline"
+    has_end = ":|!" in rest
+    has_start = "!|:" in rest
+    if has_end and has_start:
+        return "repeat_both"
+    if has_end:
+        return "repeat_end"
+    if has_start:
+        return "repeat_start"
+    return None
+
+
 def kern_pitch_token(body: str) -> str:
     match = re.search(r"[A-Ga-g]+", body)
     if not match:
@@ -796,6 +827,7 @@ def convert_kern_file(path: Path) -> List[str]:
             "duration_by_voice": {},
             "has_clef": False,
             "has_time": False,
+            "pending_left_barline": None,  # barline token to emit after next <measure_start>
         }
         for _ in range(spine_count)
     ]
@@ -813,6 +845,11 @@ def convert_kern_file(path: Path) -> List[str]:
             per_spine_tokens[spine_id].append("timeSignature-4/4")
             st["has_time"] = True
         per_spine_tokens[spine_id].append("<measure_start>")
+        # Emit any pending left-barline token (e.g. repeat_start) immediately after
+        # <measure_start> so the export layer can attach it to leftBarline.
+        if st["pending_left_barline"] is not None:
+            per_spine_tokens[spine_id].append(st["pending_left_barline"])
+            st["pending_left_barline"] = None
         st["measure_open"] = True
         st["current_voice"] = None
 
@@ -834,7 +871,25 @@ def convert_kern_file(path: Path) -> List[str]:
 
         # Barline lines apply to every column.
         if any(cell.startswith("=") for cell in cells):
+            # Determine barline type from the first non-regular barline cell found.
+            barline_token: Optional[str] = None
+            for cell in cells:
+                if cell.startswith("="):
+                    t = kern_barline_token(cell)
+                    if t is not None:
+                        barline_token = t
+                        break
             for spine_id in range(spine_count):
+                if barline_token is not None:
+                    if barline_token in ("repeat_start", "repeat_both"):
+                        # Start-repeat and combined barlines: the "start" half belongs
+                        # to the NEXT measure's leftBarline.  Pend it; ensure_measure_open
+                        # will emit it immediately after the next <measure_start>.
+                        per_spine_state[spine_id]["pending_left_barline"] = "repeat_start"
+                    if barline_token in ("repeat_end", "repeat_both", "double_barline", "final_barline"):
+                        # End-type tokens go inside the current measure before <measure_end>.
+                        if per_spine_state[spine_id]["measure_open"]:
+                            per_spine_tokens[spine_id].append(barline_token if barline_token != "repeat_both" else "repeat_end")
                 close_measure_if_open(spine_id)
             continue
 
