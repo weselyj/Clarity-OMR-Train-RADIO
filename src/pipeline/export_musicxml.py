@@ -784,6 +784,26 @@ def _append_tokens_to_part_impl(
     for slur in created_spanners:
         part.insert(0, slur)
 
+    # Multi-voice stem direction fix: in MusicXML convention voice 1 = stems up,
+    # voice 2+ = stems down. music21 auto-assigns by pitch height, which leaves
+    # both voices with same direction in many cases, causing verovio layer overlap.
+    from music21 import stream as _stream
+    from music21 import note as _note
+    from music21 import chord as _chord
+    for measure in part.getElementsByClass(_stream.Measure):
+        measure_voices = list(measure.getElementsByClass(_stream.Voice))
+        if len(measure_voices) <= 1:
+            continue
+        for voice in measure_voices:
+            try:
+                vid = int(voice.id) if voice.id is not None else 1
+            except (ValueError, TypeError):
+                vid = 1
+            target_dir = "up" if vid == 1 else "down"
+            for elem in voice:
+                if isinstance(elem, (_note.Note, _chord.Chord)):
+                    elem.stemDirection = target_dir
+
 
 def assembled_score_to_music21(score: AssembledScore):
     _, _, _, _, _, _, stream = _require_music21()
