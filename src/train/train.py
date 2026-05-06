@@ -2300,7 +2300,10 @@ def run_execute_mode(
                             "grad_alerts": grad_alert_messages,
                             "batch_size": int(images.shape[0]),
                             "max_sequence_length": stage.max_sequence_length,
-                            "non_finite_loss": non_finite_loss,
+                            # window_was_corrupted is always False on the JSONL-write
+                            # path (corrupted windows continue earlier at the opt-step
+                            # boundary check). Keep the field for log-schema continuity.
+                            "non_finite_loss": window_was_corrupted,
                             "non_finite_grad": non_finite_grad,
                             "bf16_enabled": bf16_enabled,
                             "validation": validation_result,
