@@ -1521,6 +1521,20 @@ def _extend_vocab_tensors_for_resume(
     return expanded_state, notes
 
 
+def _apply_cuda_perf_toggles() -> None:
+    """Enable cuDNN auto-tuner and TF32 matmuls when CUDA is available.
+
+    Static input shape (250x2500) makes cudnn.benchmark a free 2-5% win.
+    set_float32_matmul_precision('high') routes any fp32 matmul fallback
+    (e.g. CE-loss reduce) through TF32; bf16 forward path is unaffected.
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+
 def run_execute_mode(
     stages: Sequence[StageTrainingConfig],
     grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
@@ -1620,6 +1634,8 @@ def run_execute_mode(
             torch.cuda.get_device_properties(0)
         except Exception:
             use_cuda = False
+    if use_cuda:
+        _apply_cuda_perf_toggles()
     device = torch.device("cuda" if use_cuda else "cpu")
     if channels_last:
         # Move weights to channels_last memory format before any forward pass.
