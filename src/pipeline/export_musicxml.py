@@ -490,7 +490,7 @@ def _append_tokens_to_part_impl(
         if token == "<measure_start>":
             current_measure = stream.Measure(number=measure_number)
             measure_number += 1
-            voices = {1: stream.Voice(id="voice_1")}
+            voices = {1: stream.Voice(id="1")}
             active_voice = 1
             # Tracks the highestTime of all existing voices at the moment the
             # most-recent <voice_N> token fired.  Used to pad new voices so that
@@ -530,7 +530,7 @@ def _append_tokens_to_part_impl(
             raw = token.strip("<>").split("_")[-1]
             active_voice = int(raw)
             if active_voice not in voices:
-                new_voice = stream.Voice(id=f"voice_{active_voice}")
+                new_voice = stream.Voice(id=str(active_voice))
                 # Mid-measure split: pad new voice with a hidden rest so its first
                 # event lands at the correct elapsed offset within the measure.
                 # We use last_voice_switch_elapsed — the highestTime of existing
@@ -607,7 +607,7 @@ def _append_tokens_to_part_impl(
             continue
         if token in {"cresc_start", "cresc_end", "decresc_start", "decresc_end"}:
             if current_measure is not None:
-                current_voice = voices.setdefault(active_voice, stream.Voice(id=f"voice_{active_voice}"))
+                current_voice = voices.setdefault(active_voice, stream.Voice(id=str(active_voice)))
                 current_voice.append(expressions.TextExpression(token.replace("_", " ")))
             idx += 1
             continue
@@ -629,7 +629,35 @@ def _append_tokens_to_part_impl(
             idx += 1
             continue
 
-        if token in {"<bos>", "<staff_start>", "<staff_end>", "<eos>"}:
+        if token in {"<bos>", "<staff_start>", "<eos>"}:
+            idx += 1
+            continue
+
+        if token == "<staff_end>":
+            # Flush any pending clef/key/time that arrived after the final
+            # <measure_end> (kern sometimes emits *clefF4 after the last barline).
+            # Insert into the last measure in the part; if no measure exists, drop.
+            _trailing_pending = [
+                ("pending_clef", pending_clef),
+                ("pending_key", pending_key),
+                ("pending_time", pending_time),
+            ]
+            _has_trailing = any(v is not None for _, v in _trailing_pending)
+            if _has_trailing:
+                _target = current_measure
+                if _target is None:
+                    _measures = list(part.getElementsByClass(stream.Measure))
+                    _target = _measures[-1] if _measures else None
+                if _target is not None:
+                    if pending_clef is not None:
+                        _target.append(pending_clef)
+                        pending_clef = None
+                    if pending_key is not None:
+                        _target.append(pending_key)
+                        pending_key = None
+                    if pending_time is not None:
+                        _target.append(pending_time)
+                        pending_time = None
             idx += 1
             continue
 
@@ -637,7 +665,7 @@ def _append_tokens_to_part_impl(
             idx += 1
             continue
 
-        current_voice = voices.setdefault(active_voice, stream.Voice(id=f"voice_{active_voice}"))
+        current_voice = voices.setdefault(active_voice, stream.Voice(id=str(active_voice)))
         if pending_dynamic_tokens:
             for dynamic_mark in pending_dynamic_tokens:
                 try:
