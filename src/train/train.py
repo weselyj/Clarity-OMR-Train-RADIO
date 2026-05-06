@@ -1522,6 +1522,22 @@ def _extend_vocab_tensors_for_resume(
     return expanded_state, notes
 
 
+def _step_window_corrupted(prior: "torch.Tensor", loss: "torch.Tensor") -> "torch.Tensor":
+    """OR-accumulate non-finite-loss flag across an accumulation window.
+
+    Returns a torch.bool tensor that is True if `prior` was True OR if `loss`
+    is non-finite. Does NOT call .item() — caller decides when to sync at
+    the opt-step boundary.
+
+    This replaces the per-micro-batch `not bool(torch.isfinite(loss).item())`
+    pattern that was forcing a CPU<>GPU sync 8x per opt-step at
+    grad_accumulation_steps=8, defeating CPU runahead before the backward pass.
+    """
+    import torch
+    is_nonfinite = ~torch.isfinite(loss).all()
+    return prior | is_nonfinite.to(prior.device)
+
+
 def _apply_cuda_perf_toggles() -> None:
     """Enable cuDNN auto-tuner and TF32 matmuls when CUDA is available.
 
@@ -2068,7 +2084,7 @@ def run_execute_mode(
                 is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
                 if (stage_step - 1) % accum_steps == 0:
                     optimizer.zero_grad(set_to_none=True)
-                    accum_window_corrupted = False
+                    accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
                 with timer.gpu("forward"):
                     with torch.autocast(
                         device_type=device.type,
@@ -2087,21 +2103,8 @@ def run_execute_mode(
                         if accum_steps > 1:
                             loss = loss / accum_steps
 
-                non_finite_loss = not bool(torch.isfinite(loss).item())
-                if non_finite_loss:
-                    non_finite_events += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_window_corrupted = True
-                    timer.micro_batch_done()
-                    continue
-
-                if accum_window_corrupted:
-                    # Prior micro-batch in this window had non-finite loss;
-                    # skip remaining backward passes to avoid wrong gradient scale.
-                    if is_accum_step:
-                        optimizer.zero_grad(set_to_none=True)
-                    timer.micro_batch_done()
-                    continue
+                # On-device OR-accumulator: no sync. Boundary-only sync below.
+                accum_corruption = _step_window_corrupted(accum_corruption, loss)
 
                 with timer.gpu("backward"):
                     loss.backward()
@@ -2111,6 +2114,16 @@ def run_execute_mode(
                     # downstream consumer reads from CPU memory rather than re-syncing.
                     _loss_scalar_cache = loss.detach().item() * accum_steps
                     losses.append(_loss_scalar_cache)
+                    timer.micro_batch_done()
+                    continue
+
+                # Opt-step boundary: ONE sync to check whether any micro-batch in
+                # this window had a non-finite loss. If so, throw out accumulated
+                # gradients and skip the optimizer step.
+                window_was_corrupted = bool(accum_corruption.item())
+                if window_was_corrupted:
+                    non_finite_events += 1
+                    optimizer.zero_grad(set_to_none=True)
                     timer.micro_batch_done()
                     continue
 
