@@ -1724,8 +1724,23 @@ def run_execute_mode(
             "base_model.model.ctc_head.modules_to_save.default.weight",
             "base_model.model.ctc_head.modules_to_save.default.bias",
         }
+
+        def _is_compile_wrapper_duplicate(key: str) -> bool:
+            # When a checkpoint is saved while torch.compile wraps a module,
+            # the state_dict can contain both the unwrapped key (e.g.
+            # 'positional_bridge.modules_to_save.default.norm.bias') and a
+            # compile-wrapped duplicate ('positional_bridge._orig_mod.<rest>').
+            # Resume happens BEFORE compile is re-applied, so the live
+            # uncompiled model accepts the unwrapped key and load_state_dict
+            # reports the wrapped duplicate as 'unexpected'. The duplicate is
+            # benign: the actual weights were loaded via the unwrapped key.
+            return "._orig_mod." in key
+
         disallowed_missing = sorted(key for key in missing_keys if key not in allowed_ctc_keys)
-        disallowed_unexpected = sorted(key for key in unexpected_keys if key not in allowed_ctc_keys)
+        disallowed_unexpected = sorted(
+            key for key in unexpected_keys
+            if key not in allowed_ctc_keys and not _is_compile_wrapper_duplicate(key)
+        )
         if disallowed_missing or disallowed_unexpected:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
