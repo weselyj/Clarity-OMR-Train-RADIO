@@ -909,7 +909,8 @@ def _build_optimizer(model, stage: StageTrainingConfig):
         )
     if not param_groups:
         raise RuntimeError("No trainable parameters found for optimizer setup.")
-    return torch.optim.AdamW(param_groups)
+    fused = bool(torch.cuda.is_available())
+    return torch.optim.AdamW(param_groups, fused=fused)
 
 
 def _build_scheduler(optimizer, stage: StageTrainingConfig, total_steps: int):
