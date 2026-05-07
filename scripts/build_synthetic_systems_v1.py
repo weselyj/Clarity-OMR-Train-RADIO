@@ -137,7 +137,7 @@ def main() -> int:
                 yolo_model=yolo_model,
                 token_lookup=token_lookup,
                 out_crops_dir=crops_dir,
-                crop_path_template=f"data/processed/synthetic_systems_v1/system_crops/{style_id}/{{filename}}",
+                crop_path_template=f"{args.output_crops_root}/{style_id}/{{filename}}",
                 iou_threshold=args.iou_threshold,
                 imgsz=args.imgsz,
                 conf=args.conf,
