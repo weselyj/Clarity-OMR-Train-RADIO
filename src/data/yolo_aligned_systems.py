@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from src.data.yolo_aligned_crops import iou_xyxy  # reuse
+from src.tokenizer.vocab import STAFF_INDEX_MARKER_TOKENS
 
 
 def load_oracle_system_bboxes(
@@ -104,3 +105,39 @@ def match_yolo_to_oracle_systems(
         if sid not in by_oracle or c["conf"] > by_oracle[sid]["conf"]:
             by_oracle[sid] = c
     return sorted(by_oracle.values(), key=lambda c: c["system_index"])
+
+
+def assemble_multi_staff_tokens(per_staff_token_sequences: list[list[str]]) -> list[str]:
+    """Concatenate per-staff sequences with `<staff_idx_N>` markers per staff.
+
+    Each input must follow the per-staff manifest convention:
+        <bos> <staff_start> [content] <staff_end> <eos>
+
+    Output:
+        <bos> <staff_start> <staff_idx_0> [c_0] <staff_end>
+              <staff_start> <staff_idx_1> [c_1] <staff_end> ... <eos>
+
+    Raises ValueError if N > number of available marker tokens (8 in vocab v2).
+    Raises AssertionError if a per-staff sequence doesn't have the expected
+    wrapper structure.
+    """
+    if len(per_staff_token_sequences) > len(STAFF_INDEX_MARKER_TOKENS):
+        raise ValueError(
+            f"system has {len(per_staff_token_sequences)} staves but vocab v2 only "
+            f"defines {len(STAFF_INDEX_MARKER_TOKENS)} marker tokens"
+        )
+
+    out: list[str] = ["<bos>"]
+    for idx, seq in enumerate(per_staff_token_sequences):
+        assert len(seq) >= 4, f"per-staff sequence too short: {seq[:4]}"
+        assert seq[0] == "<bos>", f"expected <bos> at start, got {seq[0]}"
+        assert seq[1] == "<staff_start>", f"expected <staff_start> at index 1, got {seq[1]}"
+        assert seq[-2] == "<staff_end>", f"expected <staff_end> at index -2, got {seq[-2]}"
+        assert seq[-1] == "<eos>", f"expected <eos> at end, got {seq[-1]}"
+        content = seq[2:-2]
+        out.append("<staff_start>")
+        out.append(STAFF_INDEX_MARKER_TOKENS[idx])
+        out.extend(content)
+        out.append("<staff_end>")
+    out.append("<eos>")
+    return out

@@ -107,3 +107,51 @@ def test_match_yolo_to_oracle_systems_keeps_highest_conf_on_dup():
     matches = match_yolo_to_oracle_systems(yolo_boxes, oracle, iou_threshold=0.5)
     assert len(matches) == 1
     assert matches[0]["yolo_idx"] == 1  # higher-conf YOLO box won
+
+
+from src.data.yolo_aligned_systems import assemble_multi_staff_tokens
+
+
+def test_assemble_multi_staff_tokens_two_staves():
+    staff_0 = ["<bos>", "<staff_start>", "clef-G2", "note-C4", "<staff_end>", "<eos>"]
+    staff_1 = ["<bos>", "<staff_start>", "clef-F3", "note-C2", "<staff_end>", "<eos>"]
+    out = assemble_multi_staff_tokens([staff_0, staff_1])
+    assert out == [
+        "<bos>",
+        "<staff_start>", "<staff_idx_0>", "clef-G2", "note-C4", "<staff_end>",
+        "<staff_start>", "<staff_idx_1>", "clef-F3", "note-C2", "<staff_end>",
+        "<eos>",
+    ]
+
+
+def test_assemble_multi_staff_tokens_three_staves():
+    s0 = ["<bos>", "<staff_start>", "a", "<staff_end>", "<eos>"]
+    s1 = ["<bos>", "<staff_start>", "b", "<staff_end>", "<eos>"]
+    s2 = ["<bos>", "<staff_start>", "c", "<staff_end>", "<eos>"]
+    out = assemble_multi_staff_tokens([s0, s1, s2])
+    assert out == [
+        "<bos>",
+        "<staff_start>", "<staff_idx_0>", "a", "<staff_end>",
+        "<staff_start>", "<staff_idx_1>", "b", "<staff_end>",
+        "<staff_start>", "<staff_idx_2>", "c", "<staff_end>",
+        "<eos>",
+    ]
+
+
+def test_assemble_multi_staff_tokens_single_staff():
+    s = ["<bos>", "<staff_start>", "x", "<staff_end>", "<eos>"]
+    out = assemble_multi_staff_tokens([s])
+    assert out == ["<bos>", "<staff_start>", "<staff_idx_0>", "x", "<staff_end>", "<eos>"]
+
+
+def test_assemble_multi_staff_tokens_rejects_malformed():
+    # Per-staff sequence missing wrapper tokens → assertion error (defensive)
+    with pytest.raises(AssertionError):
+        assemble_multi_staff_tokens([["clef-G2", "note-C4"]])  # no <bos>/<eos>
+
+
+def test_assemble_multi_staff_tokens_rejects_too_many_staves():
+    # vocab has 8 marker tokens (<staff_idx_0> through <staff_idx_7>); 9th raises
+    staves = [["<bos>", "<staff_start>", "x", "<staff_end>", "<eos>"]] * 9
+    with pytest.raises(ValueError):
+        assemble_multi_staff_tokens(staves)
