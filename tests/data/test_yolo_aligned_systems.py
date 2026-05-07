@@ -5,6 +5,9 @@ import pytest
 
 from src.data.yolo_aligned_systems import (
     load_oracle_system_bboxes,
+    load_staves_per_system,
+    match_yolo_to_oracle_systems,
+    staff_indices_for_system,
 )
 
 
@@ -46,3 +49,61 @@ def test_load_oracle_system_bboxes_empty_label(tmp_path: Path):
     txt.write_text("")
     out = load_oracle_system_bboxes(txt, page_width=1000, page_height=1500)
     assert out == []
+
+
+def test_load_staves_per_system(tmp_path: Path):
+    p = tmp_path / "page.staves.json"
+    p.write_text("[3, 3, 3]")
+    assert load_staves_per_system(p) == [3, 3, 3]
+
+
+def test_load_staves_per_system_missing(tmp_path: Path):
+    # Missing file → empty list (the system bbox file is the source of truth)
+    p = tmp_path / "missing.staves.json"
+    assert load_staves_per_system(p) == []
+
+
+def test_staff_indices_for_system_uniform():
+    # 3 systems with 3 staves each
+    assert staff_indices_for_system(0, [3, 3, 3]) == [0, 1, 2]
+    assert staff_indices_for_system(1, [3, 3, 3]) == [3, 4, 5]
+    assert staff_indices_for_system(2, [3, 3, 3]) == [6, 7, 8]
+
+
+def test_staff_indices_for_system_varied():
+    # Systems with different staff counts: vocal (1) + piano (2) + piano (2)
+    assert staff_indices_for_system(0, [1, 2, 2]) == [0]
+    assert staff_indices_for_system(1, [1, 2, 2]) == [1, 2]
+    assert staff_indices_for_system(2, [1, 2, 2]) == [3, 4]
+
+
+def test_match_yolo_to_oracle_systems_basic():
+    yolo_boxes = [
+        {"yolo_idx": 0, "bbox": (10, 10, 100, 50), "conf": 0.99},
+        {"yolo_idx": 1, "bbox": (10, 60, 100, 100), "conf": 0.95},
+    ]
+    oracle = [
+        {"system_index": 0, "bbox": (10, 10, 100, 50)},  # exact match for yolo 0
+        {"system_index": 1, "bbox": (10, 60, 100, 100)},  # exact match for yolo 1
+    ]
+    matches = match_yolo_to_oracle_systems(yolo_boxes, oracle, iou_threshold=0.5)
+    assert len(matches) == 2
+    assert {m["system_index"] for m in matches} == {0, 1}
+    assert all(m["iou"] > 0.99 for m in matches)
+
+
+def test_match_yolo_to_oracle_systems_drops_below_threshold():
+    yolo_boxes = [{"yolo_idx": 0, "bbox": (0, 0, 10, 10), "conf": 0.99}]
+    oracle = [{"system_index": 0, "bbox": (50, 50, 100, 100)}]  # disjoint
+    assert match_yolo_to_oracle_systems(yolo_boxes, oracle, iou_threshold=0.5) == []
+
+
+def test_match_yolo_to_oracle_systems_keeps_highest_conf_on_dup():
+    yolo_boxes = [
+        {"yolo_idx": 0, "bbox": (10, 10, 100, 50), "conf": 0.80},
+        {"yolo_idx": 1, "bbox": (12, 12, 102, 52), "conf": 0.99},  # same oracle, higher conf
+    ]
+    oracle = [{"system_index": 0, "bbox": (10, 10, 100, 50)}]
+    matches = match_yolo_to_oracle_systems(yolo_boxes, oracle, iou_threshold=0.5)
+    assert len(matches) == 1
+    assert matches[0]["yolo_idx"] == 1  # higher-conf YOLO box won
