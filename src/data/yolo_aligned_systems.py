@@ -9,7 +9,9 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-from src.data.yolo_aligned_crops import iou_xyxy  # reuse
+from PIL import Image
+
+from src.data.yolo_aligned_crops import iou_xyxy, _yolo_predict_to_boxes  # reuse
 from src.tokenizer.vocab import STAFF_INDEX_MARKER_TOKENS
 
 
@@ -141,3 +143,143 @@ def assemble_multi_staff_tokens(per_staff_token_sequences: list[list[str]]) -> l
         out.append("<staff_end>")
     out.append("<eos>")
     return out
+
+
+def process_page_systems(
+    page_id: str,
+    page_image_path: Path,
+    oracle_label_path: Path,
+    oracle_staves_json_path: Path,
+    yolo_model,
+    token_lookup: dict,
+    out_crops_dir: Path,
+    crop_path_template: str,
+    iou_threshold: float = 0.5,
+    imgsz: int = 1920,
+    conf: float = 0.25,
+    dataset_name: str = "synthetic_systems",
+) -> tuple[list[dict], dict]:
+    """Multi-staff variant of `yolo_aligned_crops.process_page`.
+
+    Workflow:
+      1. Load page image dimensions, oracle system bboxes, staves-per-system list
+      2. Run YOLO → system bbox predictions
+      3. Match YOLO ↔ oracle systems by IoU
+      4. For each matched system, look up per-staff token entries (cumsum over staves_per_system)
+      5. Assemble multi-staff token sequence with `<staff_idx_N>` markers
+      6. Crop the YOLO bbox region of the page, save as `<page_id>__sys{NN}.png`
+      7. Emit one manifest entry per matched system
+
+    Drops recorded in the report (no exceptions raised):
+      - YOLO false positives (no oracle match)
+      - Oracle recall gaps (YOLO missed a system)
+      - Token-lookup misses (any staff in a matched system without per-staff tokens)
+      - Degenerate crops (clipped to empty region)
+      - Marker overflow (system has > 8 staves; vocab limit)
+    """
+    out_crops_dir = Path(out_crops_dir)
+    out_crops_dir.mkdir(parents=True, exist_ok=True)
+
+    page_image = Image.open(page_image_path).convert("RGB")
+    page_w, page_h = page_image.size
+    oracles = load_oracle_system_bboxes(oracle_label_path, page_w, page_h)
+    staves_per_system = load_staves_per_system(oracle_staves_json_path)
+    if len(staves_per_system) != len(oracles):
+        # The two files MUST agree in length; if they don't, treat as data error.
+        return [], {
+            "page_id": page_id,
+            "yolo_boxes": 0,
+            "oracle_systems": len(oracles),
+            "matches": 0,
+            "dropped_yolo_fp": 0,
+            "dropped_oracle_recall_gap": 0,
+            "dropped_token_miss": 0,
+            "dropped_degenerate": 0,
+            "dropped_marker_overflow": 0,
+            "error": f"staves.json len {len(staves_per_system)} != labels.txt len {len(oracles)}",
+        }
+    yolo_boxes = _yolo_predict_to_boxes(yolo_model, page_image, imgsz=imgsz, conf=conf)
+    matches = match_yolo_to_oracle_systems(yolo_boxes, oracles, iou_threshold=iou_threshold)
+
+    matched_system_indices = {m["system_index"] for m in matches}
+    matched_yolo_indices = {m["yolo_idx"] for m in matches}
+
+    dropped_token_miss = 0
+    dropped_degenerate = 0
+    dropped_marker_overflow = 0
+    manifest_entries: list[dict] = []
+
+    for m in matches:
+        sys_idx = m["system_index"]
+        staff_indices = staff_indices_for_system(sys_idx, staves_per_system)
+
+        # Look up per-staff tokens for this system
+        per_staff_seqs = []
+        per_staff_entries = []
+        token_miss = False
+        for s in staff_indices:
+            entry = token_lookup.get((page_id, s))
+            if entry is None:
+                token_miss = True
+                break
+            per_staff_seqs.append(entry["token_sequence"])
+            per_staff_entries.append(entry)
+        if token_miss:
+            dropped_token_miss += 1
+            continue
+
+        # Assemble multi-staff sequence; trap marker overflow as a drop, not a crash
+        try:
+            multi_seq = assemble_multi_staff_tokens(per_staff_seqs)
+        except ValueError:
+            dropped_marker_overflow += 1
+            continue
+
+        # Crop the YOLO bbox
+        x1, y1, x2, y2 = (int(round(v)) for v in m["yolo_bbox"])
+        x1 = max(0, min(x1, page_w))
+        x2 = max(0, min(x2, page_w))
+        y1 = max(0, min(y1, page_h))
+        y2 = max(0, min(y2, page_h))
+        if x2 <= x1 or y2 <= y1:
+            dropped_degenerate += 1
+            continue
+        crop = page_image.crop((x1, y1, x2, y2))
+        filename = f"{page_id}__sys{sys_idx:02d}.png"
+        crop_path = out_crops_dir / filename
+        crop.save(crop_path)
+
+        # Compose manifest entry. Inherit metadata from the FIRST per-staff entry of the
+        # matched system (page_id, style_id, etc. are page-level).
+        ref = per_staff_entries[0]
+        entry = {
+            "sample_id": f"{dataset_name}:{page_id}__sys{sys_idx:02d}",
+            "dataset": dataset_name,
+            "split": ref.get("split", "train"),
+            "image_path": crop_path_template.format(filename=filename),
+            "page_id": ref["page_id"],
+            "source_path": ref["source_path"],
+            "style_id": ref["style_id"],
+            "page_number": ref["page_number"],
+            "system_index": sys_idx,
+            "staves_in_system": len(staff_indices),
+            "staff_indices": staff_indices,
+            "source_format": ref.get("source_format", "musicxml"),
+            "score_type": ref.get("score_type", "piano"),
+            "token_sequence": multi_seq,
+            "token_count": len(multi_seq),
+        }
+        manifest_entries.append(entry)
+
+    report = {
+        "page_id": page_id,
+        "yolo_boxes": len(yolo_boxes),
+        "oracle_systems": len(oracles),
+        "matches": len(matches),
+        "dropped_yolo_fp": len(yolo_boxes) - len(matched_yolo_indices),
+        "dropped_oracle_recall_gap": len(oracles) - len(matched_system_indices),
+        "dropped_token_miss": dropped_token_miss,
+        "dropped_degenerate": dropped_degenerate,
+        "dropped_marker_overflow": dropped_marker_overflow,
+    }
+    return manifest_entries, report

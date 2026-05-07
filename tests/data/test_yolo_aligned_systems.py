@@ -155,3 +155,139 @@ def test_assemble_multi_staff_tokens_rejects_too_many_staves():
     staves = [["<bos>", "<staff_start>", "x", "<staff_end>", "<eos>"]] * 9
     with pytest.raises(ValueError):
         assemble_multi_staff_tokens(staves)
+
+
+from PIL import Image
+from src.data.yolo_aligned_systems import process_page_systems
+
+
+class _FakeYoloResult:
+    """Minimal Ultralytics-result shape that yolo_aligned_crops._yolo_predict_to_boxes accepts."""
+    def __init__(self, xyxy_list, conf_list):
+        class _Boxes:
+            pass
+        self.boxes = _Boxes()
+        self.boxes.xyxy = xyxy_list
+        self.boxes.conf = conf_list
+
+
+class _FakeYoloModel:
+    def __init__(self, predictions: list[tuple[tuple[float, float, float, float], float]]):
+        self._predictions = predictions
+
+    def predict(self, image, imgsz=1920, conf=0.25, verbose=False):
+        xyxy = [list(box) for box, _ in self._predictions]
+        confs = [c for _, c in self._predictions]
+        return [_FakeYoloResult(xyxy, confs)]
+
+
+def test_process_page_systems_end_to_end(tmp_path: Path):
+    page = Image.new("RGB", (1000, 1500), color=(255, 255, 255))
+    page_path = tmp_path / "page.png"
+    page.save(page_path)
+
+    # Write oracle: 2 systems
+    txt = tmp_path / "page.txt"
+    txt.write_text(
+        "0 0.5 0.2 0.9 0.3\n"   # system 0: y_center=0.2, height=0.3 → pixel y in [75, 525], x in [50, 950]
+        "0 0.5 0.7 0.9 0.3\n"   # system 1: y_center=0.7
+    )
+    json_path = tmp_path / "page.staves.json"
+    json_path.write_text("[2, 2]")
+
+    # Token lookup: 4 staves total
+    def _staff_seq(label):
+        return ["<bos>", "<staff_start>", label, "<staff_end>", "<eos>"]
+    token_lookup = {
+        ("p001", 0): {"page_id": "p001", "staff_index": 0, "style_id": "x", "page_number": 1, "split": "train", "source_path": "src", "source_format": "musicxml", "score_type": "piano", "token_sequence": _staff_seq("a"), "token_count": 5, "dataset": "synthetic_fullpage"},
+        ("p001", 1): {"page_id": "p001", "staff_index": 1, "style_id": "x", "page_number": 1, "split": "train", "source_path": "src", "source_format": "musicxml", "score_type": "piano", "token_sequence": _staff_seq("b"), "token_count": 5, "dataset": "synthetic_fullpage"},
+        ("p001", 2): {"page_id": "p001", "staff_index": 2, "style_id": "x", "page_number": 1, "split": "train", "source_path": "src", "source_format": "musicxml", "score_type": "piano", "token_sequence": _staff_seq("c"), "token_count": 5, "dataset": "synthetic_fullpage"},
+        ("p001", 3): {"page_id": "p001", "staff_index": 3, "style_id": "x", "page_number": 1, "split": "train", "source_path": "src", "source_format": "musicxml", "score_type": "piano", "token_sequence": _staff_seq("d"), "token_count": 5, "dataset": "synthetic_fullpage"},
+    }
+
+    # YOLO predictions matching both oracle systems (high IoU)
+    yolo_model = _FakeYoloModel([
+        ((50, 75, 950, 525), 0.99),
+        ((50, 825, 950, 1275), 0.97),
+    ])
+
+    crops_dir = tmp_path / "crops"
+    entries, report = process_page_systems(
+        page_id="p001",
+        page_image_path=page_path,
+        oracle_label_path=txt,
+        oracle_staves_json_path=json_path,
+        yolo_model=yolo_model,
+        token_lookup=token_lookup,
+        out_crops_dir=crops_dir,
+        crop_path_template="crops/{filename}",
+        iou_threshold=0.5,
+    )
+
+    assert report["yolo_boxes"] == 2
+    assert report["oracle_systems"] == 2
+    assert report["matches"] == 2
+    assert len(entries) == 2
+
+    # First entry: system 0, staves 0+1
+    e0 = entries[0]
+    assert e0["staves_in_system"] == 2
+    assert e0["dataset"] == "synthetic_systems"
+    assert "<staff_idx_0>" in e0["token_sequence"]
+    assert "<staff_idx_1>" in e0["token_sequence"]
+    assert e0["token_sequence"][0] == "<bos>"
+    assert e0["token_sequence"][-1] == "<eos>"
+    # Crop file actually written
+    assert (crops_dir / Path(e0["image_path"]).name).exists()
+
+
+def test_process_page_systems_handles_recall_gap(tmp_path: Path):
+    """If YOLO misses a system, that system is dropped from output."""
+    page = Image.new("RGB", (1000, 1500))
+    page_path = tmp_path / "page.png"
+    page.save(page_path)
+
+    txt = tmp_path / "page.txt"
+    txt.write_text("0 0.5 0.2 0.9 0.3\n0 0.5 0.7 0.9 0.3\n")
+    (tmp_path / "page.staves.json").write_text("[1, 1]")
+
+    yolo_model = _FakeYoloModel([
+        ((50, 75, 950, 525), 0.99),  # only system 0
+    ])
+    token_lookup = {
+        ("p", i): {"page_id": "p", "staff_index": i, "style_id": "x", "page_number": 1, "split": "train", "source_path": "s", "source_format": "musicxml", "score_type": "piano", "token_sequence": ["<bos>", "<staff_start>", "x", "<staff_end>", "<eos>"], "token_count": 5, "dataset": "synthetic_fullpage"}
+        for i in (0, 1)
+    }
+    entries, report = process_page_systems(
+        page_id="p", page_image_path=page_path, oracle_label_path=txt,
+        oracle_staves_json_path=tmp_path / "page.staves.json",
+        yolo_model=yolo_model, token_lookup=token_lookup,
+        out_crops_dir=tmp_path / "crops", crop_path_template="crops/{filename}",
+    )
+    assert len(entries) == 1
+    assert report["dropped_oracle_recall_gap"] == 1
+
+
+def test_process_page_systems_handles_token_miss(tmp_path: Path):
+    """If a matched system has no per-staff tokens for one of its staves, drop the system."""
+    page = Image.new("RGB", (1000, 1500))
+    page_path = tmp_path / "page.png"
+    page.save(page_path)
+
+    (tmp_path / "page.txt").write_text("0 0.5 0.5 0.9 0.5\n")
+    (tmp_path / "page.staves.json").write_text("[3]")
+
+    yolo_model = _FakeYoloModel([((50, 375, 950, 1125), 0.99)])
+    # Only 2 of 3 staves have token entries
+    token_lookup = {
+        ("p", i): {"page_id": "p", "staff_index": i, "style_id": "x", "page_number": 1, "split": "train", "source_path": "s", "source_format": "musicxml", "score_type": "piano", "token_sequence": ["<bos>", "<staff_start>", "x", "<staff_end>", "<eos>"], "token_count": 5, "dataset": "synthetic_fullpage"}
+        for i in (0, 1)  # missing staff 2
+    }
+    entries, report = process_page_systems(
+        page_id="p", page_image_path=page_path, oracle_label_path=tmp_path / "page.txt",
+        oracle_staves_json_path=tmp_path / "page.staves.json",
+        yolo_model=yolo_model, token_lookup=token_lookup,
+        out_crops_dir=tmp_path / "crops", crop_path_template="crops/{filename}",
+    )
+    assert len(entries) == 0
+    assert report["dropped_token_miss"] == 1
