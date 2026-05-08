@@ -9,7 +9,7 @@ This repository is a fork of [**clquwu/Clarity-OMR-Train**](https://github.com/c
 
 For inference only (PDF → MusicXML), see the upstream [Clarity-OMR](https://github.com/clquwu/Clarity-OMR) repo.
 
-The system-level rebuild is currently in active development on `feat/system-level-rebuild`. The previous per-staff implementation is preserved on older branches.
+The system-level rebuild has landed on `main` (PR #39, merged 2026-05-08): Stage A system-level YOLO is complete, the kern converter and Stage 2 v2 trainer optimization are complete, and Stage 3 data prep (the four-corpus combined manifest, with the synthetic token-alignment fix) is in place. Stage 3 Phase 0 (encoder-cache infrastructure) is in flight on `feat/stage3-encoder-cache`. The previous per-staff implementation is preserved on older branches.
 
 ## What this project does
 
@@ -46,9 +46,9 @@ The earlier per-staff design fed individual staff crops to Stage B, then re-stit
 
 | Subproject | Component | Status |
 |---|---|---|
-| 1 | Stage A system-level YOLO retrain | **Training** (epoch 1 mAP50 = 0.994; gate ≥ 0.95) |
-| 2 | Tokenizer v2 + Stage 2 RADIO retrain | Pending |
-| 3 | Stage 3 RADIO retrain on system crops | Pending |
+| 1 | Stage A system-level YOLO retrain | **Complete** — mAP50 0.995, recall 0.996, precision 0.998 on `mixed_systems_v1` (gate ≥ 0.95). Weights at `runs/detect/runs/yolo26m_systems/weights/best.pt` |
+| 2 | Kern converter rebuild + Stage 2 v2 trainer optimization | **Complete** — 96.9% kern→OMR token-fidelity audit (see `docs/kern_converter_limitations.md`); Stage 2 v2 val_loss 0.148 at step 4000, 5.59h wall on a 5090 (vs 76h spec) |
+| 3 | Stage 3 RADIO retrain on system crops | **Data prep complete** — combined 303,663-entry manifest across synthetic_systems (20,583), grandstaff_systems (107,724), primus_systems (87,678), cameraprimus_systems (87,678). Stage 3 design spec approved; Phase 0 encoder-cache infrastructure in flight on `feat/stage3-encoder-cache` |
 
 
 ## Stage A — System detection
@@ -95,13 +95,19 @@ Notable flags:
 
 - `--noise-warmup-steps 2000` — ramps scan-noise augmentation probability from 0 to full over the first 2000 steps. Avoids the early-training NaN failure mode where `cls_loss × noise` blows up.
 - `--nan-guard` — zeroes individual NaN/Inf gradients per batch (instead of skipping the whole step) so the rare warmup gradient explosion doesn't disrupt training.
-- The data-aug pipeline (scan-noise + page-curvature) lives in `src/train/scan_aug.py`.
+- The data-aug pipeline (scan-noise + page-curvature) lives in `src/train/scan_noise.py`.
+
+Final training metrics: **mAP50 0.995, recall 0.996, precision 0.998** at 100 epochs on `mixed_systems_v1`. Weights at `runs/detect/runs/yolo26m_systems/weights/best.pt`.
 
 ## Stage B — System-level recognition
 
 The recognition model uses a **C-RADIOv4-H encoder** paired with a **custom autoregressive Transformer decoder** with RoPE. Stage B reads a *system crop* (all staves of one system, stacked vertically) and emits a token sequence where each note carries a `<staff_idx_N>` marker identifying its staff.
 
-The encoder choice is settled — a per-staff RADIO retrain ran in 2026-05 with a Flat outcome (`onset_f1 = 0.2144`), confirming that *cropping* was the bottleneck rather than the encoder. The model code (`src/models/radio_stage_b.py`) and training infrastructure are wired up; what remains is **retraining RADIO with system-level inputs and the new `<staff_idx_N>` marker convention** (subprojects 2 & 3, pending until Stage A finishes).
+The encoder choice is settled — a per-staff RADIO retrain ran in 2026-05 with a Flat outcome (`onset_f1 = 0.2144`), confirming that *cropping* was the bottleneck rather than the encoder.
+
+**Stage 2 v2** (vocab extension + system-level training warmup) completed in 2026-05: val_loss 0.148 at step 4000 in 5.59h on a 5090 (vs the spec'd 76h with the unoptimized config). The trainer optimization plan is at `docs/superpowers/plans/2026-05-06-radio-stage2-trainer-optimization.md`. Init checkpoint for Stage 3 is `checkpoints/full_radio_stage2_systems_v2/_best.pt`.
+
+**Stage 3** (full system-level retrain on the four-corpus mix with an encoder-cache hybrid) is in active development. Data prep is complete (the 303,663-entry combined manifest above). Phase 0 — encoder-cache infrastructure (`src/data/encoder_cache.py`, `scripts/build_encoder_cache.py`, tier-grouped sampler, cached/live tier dispatch) — is in flight on `feat/stage3-encoder-cache`, with the cache build currently running on the GPU box.
 
 ### Encoder: C-RADIOv4-H (~700M parameters)
 
@@ -281,75 +287,111 @@ Applied online during training (not pre-generated). Stage A uses an additional s
 ## Repository structure
 
 ```
-├── configs/                          # Training YAML configs
-│   ├── splits.yaml                   # Train/val/test split definitions
-│   ├── train_stage1.yaml             # Stage 1 monophonic config
-│   ├── train_stage2.yaml             # Stage 2 polyphonic config
-│   └── train_stage3.yaml             # Stage 3 full complexity config
+├── configs/                                        # Training YAML configs
+│   ├── splits.yaml                                 # Train/val/test split definitions
+│   ├── train_stage1.yaml                           # Stage 1 monophonic (legacy DaViT)
+│   ├── train_stage1_radio.yaml                     # Stage 1 v2 RADIO config
+│   ├── train_stage2.yaml                           # Stage 2 polyphonic (legacy)
+│   ├── train_stage2_radio.yaml                     # Stage 2 RADIO config
+│   ├── train_stage2_radio_systems.yaml             # Stage 2 v2 system-level config (current)
+│   ├── train_stage3.yaml                           # Stage 3 legacy config
+│   └── train_stage3_radio.yaml                     # Stage 3 RADIO config (Plan B will add a system-level variant)
 │
 ├── src/
 │   ├── data/
-│   │   ├── generate_synthetic.py     # Synthetic data generation + v15 system-bbox derivation
-│   │   ├── derive_systems_from_staves.py  # Spatial heuristic for AudioLabs (real scans)
-│   │   ├── bracket_detector.py       # Visual first-barline detection (real scans)
-│   │   ├── multi_dpi.py              # Verovio rendering at multiple DPIs
-│   │   ├── convert_tokens.py         # MusicXML ↔ token sequence conversion
-│   │   ├── index.py                  # Dataset indexing and manifest building
-│   │   └── filter_low_ink_samples.py # Filter out low-quality training samples
+│   │   ├── generate_synthetic.py                   # Synthetic data generation + v15 system-bbox derivation + per-staff manifest writer
+│   │   ├── yolo_aligned_systems.py                 # Multi-staff system-level helpers (Plan A consumer)
+│   │   ├── yolo_aligned_crops.py                   # Per-staff variant (helpers reused by systems module)
+│   │   ├── derive_systems_from_staves.py           # Spatial heuristic for AudioLabs (real scans)
+│   │   ├── bracket_detector.py                     # Visual first-barline detection (real scans)
+│   │   ├── multi_dpi.py                            # Verovio rendering at multiple DPIs
+│   │   ├── convert_tokens.py                       # MusicXML ↔ token sequence conversion (kern + MusicXML)
+│   │   ├── kern_validation.py                      # Kern token-sequence validation
+│   │   ├── omr_layout_import.py                    # AudioLabs typeset corpus import
+│   │   ├── sparse_augment.py                       # Sparse-content augmentation set helpers
+│   │   ├── build_mixed_dataset.py                  # Mixed-corpus dataset assembly
+│   │   ├── dataset_audit.py                        # Dataset-level audit utilities
+│   │   ├── index.py                                # Dataset indexing and manifest building
+│   │   └── filter_low_ink_samples.py               # Filter out low-quality training samples
 │   │
 │   ├── models/
-│   │   ├── radio_stage_b.py          # C-RADIOv4-H encoder + RoPE decoder architecture (current)
-│   │   ├── davit_stage_b.py          # DaViT encoder (decoder/contour-head reused by RADIO module)
-│   │   └── yolo_stage_a.py           # YOLO26m system-detection wrapper
+│   │   ├── radio_stage_b.py                        # C-RADIOv4-H encoder + RoPE decoder (current Stage B)
+│   │   ├── davit_stage_b.py                        # DaViT encoder (decoder/contour-head reused by RADIO module)
+│   │   ├── florence_stage_b.py                     # Florence experiment (archived)
+│   │   ├── system_postprocess.py                   # Inference-time system postprocessing
+│   │   └── yolo_stage_a.py                         # YOLO26m system-detection wrapper
 │   │
 │   ├── train/
-│   │   ├── train.py                  # Main training loop + DoRA setup
-│   │   ├── train_yolo_stage_a.py     # YOLO fine-tuning script
-│   │   ├── scan_aug.py               # Scan-noise + page-curvature augmentation
-│   │   ├── model_factory.py          # Model instantiation + checkpoint loading
-│   │   ├── monitor_training.py       # Training progress monitoring
-│   │   └── monitor_dashboard.py      # Training dashboard
+│   │   ├── train.py                                # Main training loop + DoRA setup + Stage 2 v2 perf optimizations
+│   │   ├── train_yolo_stage_a.py                   # YOLO fine-tuning script
+│   │   ├── scan_noise.py                           # Scan-noise + page-curvature augmentation (YOLO)
+│   │   ├── model_factory.py                        # Model instantiation + checkpoint loading
+│   │   ├── build_focus_manifest.py                 # Focus manifest builder for staged training
+│   │   ├── check_training_data.py                  # Pre-flight training data sanity checks
+│   │   ├── monitor_training.py                     # Training progress monitoring
+│   │   └── monitor_dashboard.py                    # Training dashboard
 │   │
 │   ├── tokenizer/
-│   │   └── vocab.py                  # 495-token music + staff-marker vocabulary
+│   │   └── vocab.py                                # ~495-token music + 8 staff-marker vocabulary
 │   │
 │   ├── decoding/
-│   │   ├── grammar_fsa.py            # Grammar FSA for constrained decoding
-│   │   └── beam_search.py            # Beam search with FSA integration
+│   │   ├── grammar_fsa.py                         # Grammar FSA for constrained decoding
+│   │   └── beam_search.py                         # Beam search with FSA integration
 │   │
 │   ├── pipeline/
-│   │   ├── assemble_score.py         # Cross-system assembly (Stage C)
-│   │   └── export_musicxml.py        # Token → music21 → MusicXML (Stage D)
+│   │   ├── assemble_score.py                      # Cross-system assembly (Stage C)
+│   │   └── export_musicxml.py                     # Token → music21 → MusicXML (Stage D)
 │   │
 │   ├── eval/
-│   │   ├── evaluate_stage_b_checkpoint.py  # Checkpoint evaluation
-│   │   ├── compare_musicxml.py       # MusicXML comparison (mir_eval metrics)
-│   │   ├── metrics.py                # Training metrics computation
-│   │   ├── run_eval.py               # Batch evaluation runner
-│   │   └── tune_penalties.py         # Grammar penalty tuning
+│   │   ├── evaluate_stage_b_checkpoint.py         # Checkpoint evaluation
+│   │   ├── compare_musicxml.py                    # MusicXML comparison (mir_eval metrics)
+│   │   ├── metrics.py                             # Training metrics computation
+│   │   ├── run_eval.py                            # Batch evaluation runner
+│   │   ├── run_stage_a_only.py                    # Stage-A-only eval entry point
+│   │   ├── run_subproject2_gate.py                # Subproject 2 acceptance gate
+│   │   └── tune_penalties.py                      # Grammar penalty tuning
 │   │
-│   └── pdf_to_musicxml.py            # End-to-end pipeline orchestrator
+│   └── pdf_to_musicxml.py                          # End-to-end pipeline orchestrator
 │
 ├── scripts/
-│   ├── train_yolo.py                 # Stage A training entry point
-│   ├── build_mixed_v2_systems.py     # Build mixed_systems_v1 dataset
-│   ├── derive_audiolabs_systems.py   # Real-scan system-label derivation
-│   ├── derive_sparse_augment_systems.py  # sparse_augment system-label derivation (v15)
-│   ├── rederive_synthetic_v2_systems.py  # Fast synthetic relabeling without re-render
-│   ├── verify_v15_labels.py          # Validate production labels against v15 reference
-│   └── visualize_audiolabs_systems.py    # Spot-check overlay generator
+│   │  # Stage A YOLO + dataset builders
+│   ├── train_yolo.py                               # Stage A training entry point
+│   ├── build_mixed_v2_systems.py                   # Build mixed_systems_v1 (Stage A training data)
+│   ├── derive_audiolabs_systems.py                 # Real-scan system-label derivation
+│   ├── derive_sparse_augment_systems.py            # sparse_augment system-label derivation (v15)
+│   ├── rederive_synthetic_v2_systems.py            # In-place relabeling without re-render
+│   ├── verify_v15_labels.py                        # Validate production labels against v15 reference
+│   ├── visualize_audiolabs_systems.py              # Spot-check overlay generator
+│   ├── smoketest_bracket_detector.py
+│   │
+│   │  # Plan A — Stage 3 system-level data prep
+│   ├── build_synthetic_systems_v1.py               # System-level builder for synthetic_v2
+│   ├── build_grandstaff_systems.py                 # System-level builder for grandstaff
+│   ├── build_stage3_combined_manifest.py           # Combine the 4 corpora into one Stage 3 manifest
+│   ├── retokenize_with_staff_markers.py            # Single-staff retokenizer for primus/cameraprimus
+│   ├── rederive_synthetic_v2_per_staff_manifest.py # In-place per-staff manifest fix (alignment fix)
+│   │
+│   │  # Audits
+│   ├── audit_per_staff_alignment.py                # Per-staff manifest alignment audit
+│   ├── audit_token_miss_buckets.py                 # Categorize residual token_miss drops
+│   ├── audit_kern_fidelity.py                      # Kern→OMR token fidelity audit (96.9% on rebuild)
+│   └── audit_kern_manifests.py                     # Kern manifest sanity check
 │
 ├── tests/
-│   └── data/
-│       ├── test_build_system_yolo_objects_v15.py   # v15 algorithm unit tests
-│       ├── test_generate_synthetic_systems.py      # Older system-builder tests
-│       ├── test_derive_systems_from_staves.py      # Spatial-heuristic tests
-│       └── test_bracket_detector.py                # Bracket-detector tests
+│   ├── data/                                       # Data-layer tests (208+ pass)
+│   ├── train/                                      # Trainer tests (run on GPU box; need torch)
+│   ├── models/                                     # Model-layer tests
+│   └── eval/                                       # Eval-pipeline tests
 │
 ├── docs/
-│   ├── omr-final-plan.md             # Full architecture design document
-│   ├── TRAINING_COMMANDS.md          # Training command reference
-│   └── TRAINING_COMMANDS_UBUNTU.md   # Ubuntu-specific training setup
+│   ├── omr-final-plan.md                           # Full architecture design document
+│   ├── kern_converter_limitations.md               # Subproject 2 known gaps
+│   ├── stage_a_brace_margin_known_gap.md           # Stage A v15 cosmetic gap
+│   ├── TRAINING_COMMANDS.md                        # Training command reference
+│   ├── TRAINING_COMMANDS_UBUNTU.md                 # Ubuntu-specific training setup
+│   └── superpowers/
+│       ├── plans/                                  # Implementation plans (one per workstream)
+│       └── audits/                                 # Audit findings docs
 │
 └── requirements.txt
 ```
@@ -424,18 +466,24 @@ python scripts/train_yolo.py \
 
 ~10–12h on a 5090. Gate: val mAP50 ≥ 0.95.
 
-### Stage B — System-level RADIO (subprojects 2 & 3)
+### Stage B — System-level RADIO (Stage 2 v2, Stage 3 in development)
 
 ```bash
-# Stage 2 — vocab extension warmup on grandstaff
-python src/train/train.py --config configs/train_stage2.yaml
+# Stage 1 v2 — per-staff RADIO (completed; for re-runs only)
+python src/train/train.py --config configs/train_stage1_radio.yaml
 
-# Stage 3 — full complexity on system crops
-python src/train/train.py --config configs/train_stage3.yaml \
-  --resume checkpoints/stage2_best.pt
+# Stage 2 v2 — system-level vocab-extension warmup (completed; init checkpoint for Stage 3)
+python src/train/train.py --config configs/train_stage2_radio_systems.yaml
+
+# Stage 3 — full system-level retrain with encoder-cache hybrid (in development)
+# Requires Phase 0 encoder cache infrastructure on feat/stage3-encoder-cache.
+# The Stage 3 design spec (encoder caching, hybrid 70/10/10/10 mix, 4500 opt-step target,
+# Phase 0d correctness + throughput gates) is at:
+#   docs/superpowers/specs/2026-05-07-radio-stage3-design.md (in user repo)
 ```
 
-See `docs/TRAINING_COMMANDS.md` for detailed commands and options.
+See `docs/TRAINING_COMMANDS.md` for detailed commands and options. Plans + audits for the recent
+work live under `docs/superpowers/{plans,audits}/`.
 
 ## Evaluation
 
