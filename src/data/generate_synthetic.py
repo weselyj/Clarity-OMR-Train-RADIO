@@ -2529,6 +2529,10 @@ def _render_single_job(
                         # positions automatically (their key is absent), matching
                         # the old fallback behavior of not emitting rows for
                         # filtered staves in this branch.
+                        # Note: when filter drops occur, the `staff_index`
+                        # field in emitted rows now reflects physical
+                        # position (consistent with SVG primary), not
+                        # survivor-enumerate position as in the old code.
                         page_staff_sequences = [
                             _slice_staff_sequence_for_page(
                                 sequence,
