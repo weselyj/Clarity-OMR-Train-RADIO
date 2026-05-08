@@ -246,6 +246,8 @@ def test_builder_skips_already_cached_entries(tmp_path: Path) -> None:
         img = Image.fromarray(np.ones((32, 64), dtype=np.uint8) * 200)
         img.save(tmp_path / f"img_{i}.png")
 
+    import torch
+
     encoder_call_count = [0]
 
     def fake_encode(image_batch):
