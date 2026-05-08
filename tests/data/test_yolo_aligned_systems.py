@@ -376,6 +376,8 @@ def test_process_page_systems_handles_non_contiguous_physical_indices(tmp_path: 
     assert "phys-0" in seq
     assert "phys-1" in seq
     assert "phys-2" in seq
-    # And no tokens leaked from physical positions in other systems
+    # Guards against intra-system token bleed (assembly pulling tokens from
+    # later physical positions into system 0). The primary regression guards
+    # for physical-index semantics are len(entries)==1 and dropped_token_miss==2.
     for leaked in ["phys-3", "phys-5", "phys-6"]:
         assert leaked not in seq
