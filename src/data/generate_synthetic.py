@@ -2043,6 +2043,12 @@ def _build_manifest_rows_for_page(
     `dataset_variants`, each physical position emits one row per (dataset_name,
     sample_suffix) pair.
     """
+    # Each physical position must appear at most once in staff_crop_entries.
+    # _write_staff_crops uses (saved_index, source_index - 1) with no dedup, so
+    # this is invariant by construction; surface a producer regression early.
+    assert len({phys for _, phys in staff_crop_entries}) == len(staff_crop_entries), (
+        "duplicate physical indices in staff_crop_entries"
+    )
     crop_path_by_phys = {phys: path for path, phys in staff_crop_entries}
 
     rows: List[dict] = []
