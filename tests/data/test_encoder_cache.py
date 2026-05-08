@@ -140,3 +140,76 @@ def test_sanitize_sample_key_colon_in_body_replaced() -> None:
     from src.data.encoder_cache import _sanitize_sample_key
     # "ds:body:extra" → strip "ds:", then replace ":" in "body:extra"
     assert _sanitize_sample_key("ds:body:extra") == "body__extra"
+
+
+# ---------------------------------------------------------------------------
+# Write / read / hit-miss / collision tests
+# ---------------------------------------------------------------------------
+
+def _make_fake_tensor(seq_tokens: int = 20, hidden_dim: int = 1280) -> "torch.Tensor":
+    import torch
+    return torch.randn(seq_tokens, hidden_dim, dtype=torch.bfloat16)
+
+
+def test_cache_entry_exists_false_before_write(tmp_path: Path) -> None:
+    from src.data.encoder_cache import cache_entry_exists
+    assert not cache_entry_exists(tmp_path, "abcd1234abcd1234", "synthetic_systems", "sample_001")
+
+
+def test_write_then_exists_returns_true(tmp_path: Path) -> None:
+    from src.data.encoder_cache import cache_entry_exists, write_cache_entry
+    t = _make_fake_tensor()
+    write_cache_entry(tmp_path, "abcd1234abcd1234", "synthetic_systems", "sample_001", t, h16=2, w16=10)
+    assert cache_entry_exists(tmp_path, "abcd1234abcd1234", "synthetic_systems", "sample_001")
+
+
+def test_read_returns_correct_tensor(tmp_path: Path) -> None:
+    import torch
+    from src.data.encoder_cache import read_cache_entry, write_cache_entry
+    t = _make_fake_tensor(seq_tokens=12)
+    write_cache_entry(tmp_path, "abcd1234abcd1234", "synthetic_systems", "sample_001", t, h16=3, w16=4)
+    tensor, h16, w16 = read_cache_entry(tmp_path, "abcd1234abcd1234", "synthetic_systems", "sample_001")
+    assert tensor.shape == (12, 1280)
+    assert tensor.dtype == torch.bfloat16
+    assert h16 == 3
+    assert w16 == 4
+    assert torch.allclose(tensor.float(), t.float(), atol=1e-3)
+
+
+def test_read_raises_cache_miss_on_absent_key(tmp_path: Path) -> None:
+    from src.data.encoder_cache import CacheMiss, read_cache_entry
+    with pytest.raises(CacheMiss):
+        read_cache_entry(tmp_path, "abcd1234abcd1234", "synthetic_systems", "does_not_exist")
+
+
+def test_two_sample_keys_do_not_overwrite(tmp_path: Path) -> None:
+    """Two different sample keys under same hash → distinct files, no collision."""
+    from src.data.encoder_cache import read_cache_entry, write_cache_entry
+    t1 = _make_fake_tensor(seq_tokens=5)
+    t2 = _make_fake_tensor(seq_tokens=7)
+    write_cache_entry(tmp_path, "hash0000hash0000", "primus", "sample_A", t1, h16=1, w16=5)
+    write_cache_entry(tmp_path, "hash0000hash0000", "primus", "sample_B", t2, h16=1, w16=7)
+    r1, _, _ = read_cache_entry(tmp_path, "hash0000hash0000", "primus", "sample_A")
+    r2, _, _ = read_cache_entry(tmp_path, "hash0000hash0000", "primus", "sample_B")
+    assert r1.shape == (5, 1280)
+    assert r2.shape == (7, 1280)
+
+
+def test_write_cache_metadata_creates_json(tmp_path: Path) -> None:
+    from src.data.encoder_cache import write_cache_metadata
+    meta = {"encoder_weights_path": "/fake/path.pt", "hidden_dim": 1280,
+            "dtype": "bfloat16", "sample_count": 42, "total_bytes": 1000000}
+    write_cache_metadata(tmp_path, "abcd1234abcd1234", meta)
+    md_path = tmp_path / "abcd1234abcd1234" / "metadata.json"
+    assert md_path.exists()
+    loaded = json.loads(md_path.read_text())
+    assert loaded["sample_count"] == 42
+    assert loaded["hidden_dim"] == 1280
+
+
+def test_write_returns_correct_path(tmp_path: Path) -> None:
+    from src.data.encoder_cache import write_cache_entry
+    t = _make_fake_tensor()
+    p = write_cache_entry(tmp_path, "hash0000hash0000", "grandstaff_systems", "my_sample", t, h16=4, w16=8)
+    assert p == tmp_path / "hash0000hash0000" / "grandstaff_systems" / "my_sample.pt"
+    assert p.exists()

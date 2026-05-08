@@ -91,3 +91,99 @@ def compute_cache_hash(
 
     combined = hashlib.sha256("".join(components).encode("utf-8")).hexdigest()
     return combined[:16]
+
+
+# ---------------------------------------------------------------------------
+# Write
+# ---------------------------------------------------------------------------
+
+def write_cache_entry(
+    cache_root: Path,
+    hash16: str,
+    tier: str,
+    sample_key: str,
+    tensor: "torch.Tensor",
+    *,
+    h16: int,
+    w16: int,
+) -> Path:
+    """Write a per-sample encoder feature tensor to disk.
+
+    Stores a tuple (tensor, h16, w16) via torch.save so the reader can
+    reconstruct the original (B, C, H/16, W/16) shape for deformable_attention.
+
+    Args:
+        cache_root: Root directory for all cache versions.
+        hash16: 16-char hex cache identity string.
+        tier: Dataset tier name, e.g. "synthetic_systems".
+        sample_key: Sanitized sample identifier (no colons or slashes).
+        tensor: bf16 tensor of shape (seq_tokens, 1280). Must be on CPU.
+        h16: Height dimension of the encoder spatial output (H/16).
+        w16: Width dimension of the encoder spatial output (W/16).
+
+    Returns:
+        Path to the written .pt file.
+    """
+    import torch
+
+    dest_dir = Path(cache_root) / hash16 / tier
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{sample_key}.pt"
+    payload = (tensor.cpu().to(torch.bfloat16), int(h16), int(w16))
+    torch.save(payload, dest)
+    return dest
+
+
+def write_cache_metadata(
+    cache_root: Path,
+    hash16: str,
+    metadata: dict,
+) -> None:
+    """Write or update metadata.json at cache_root/<hash16>/metadata.json."""
+    dest_dir = Path(cache_root) / hash16
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "metadata.json"
+    dest.write_text(json.dumps(metadata, indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Read
+# ---------------------------------------------------------------------------
+
+def cache_entry_exists(
+    cache_root: Path,
+    hash16: str,
+    tier: str,
+    sample_key: str,
+) -> bool:
+    """Return True if the .pt file exists on disk (path-stat only, no load)."""
+    p = Path(cache_root) / hash16 / tier / f"{sample_key}.pt"
+    return p.exists()
+
+
+def read_cache_entry(
+    cache_root: Path,
+    hash16: str,
+    tier: str,
+    sample_key: str,
+) -> Tuple["torch.Tensor", int, int]:
+    """Load and return the cached bf16 tensor plus spatial shape.
+
+    Returns:
+        (tensor, h16, w16) where tensor has shape (seq_tokens, 1280) and
+        h16 * w16 == seq_tokens.
+
+    Raises:
+        CacheMiss: If the .pt file does not exist.
+    """
+    import torch
+
+    p = Path(cache_root) / hash16 / tier / f"{sample_key}.pt"
+    if not p.exists():
+        raise CacheMiss(
+            f"Cache miss: no entry for tier={tier!r} key={sample_key!r} "
+            f"under hash {hash16!r} in {cache_root}"
+        )
+    payload = torch.load(p, weights_only=True, map_location="cpu")
+    tensor, h16, w16 = payload
+    return tensor, int(h16), int(w16)
