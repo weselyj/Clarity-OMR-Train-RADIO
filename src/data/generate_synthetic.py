@@ -2501,6 +2501,15 @@ def _render_single_job(
                             dataset_variants=dataset_variants,
                         )
                         token_rows.extend(new_rows)
+                        # Counter semantics: token_entries_written and
+                        # token_entries_by_dataset count manifest rows emitted,
+                        # including rows for filter-dropped crops (image_path is
+                        # None on those). staff_token_pairs counts physical
+                        # staves with a derivable token sequence. Both differ
+                        # from the pre-fix counts on pages where crops were
+                        # filtered, by design — the manifest now covers every
+                        # physical staff. Counters are diagnostic only; nothing
+                        # downstream gates on them.
                         token_entries_written += len(new_rows)
                         for row in new_rows:
                             token_entries_by_dataset[row["dataset"]] = (
