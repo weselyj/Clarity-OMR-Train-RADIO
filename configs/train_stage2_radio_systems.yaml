@@ -1,0 +1,52 @@
+# Stage 2 systems-aware retrain (RADIO + multi-staff markers).
+#
+# Resumes from Stage 1 monophonic foundation checkpoint and warmup-trains the model
+# to emit <staff_idx_N> markers on the corrected GrandStaff manifest (grandstaff_systems).
+# The trainer's vocab-extension hook pads embedding/lm_head for the 8 new marker tokens.
+#
+# Run command:
+#   ssh 10.10.1.29 'cd "C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO" && \
+#     venv-cu132\Scripts\python -u src/train/train.py \
+#       --stage-configs configs/train_stage2_radio_systems.yaml \
+#       --mode execute \
+#       --resume-checkpoint checkpoints/full_radio_stage1_v2/stage1-radio-monophonic-foundation_best.pt \
+#       --start-stage stage2-radio-systems-polyphonic \
+#       --checkpoint-dir checkpoints/full_radio_stage2_systems_v2 \
+#       --token-manifest src/data/manifests/token_manifest_full_systems.jsonl \
+#       --step-log logs/full_radio_stage2_systems_v2_steps.jsonl'
+
+stage_name: stage2-radio-systems-polyphonic
+stage_b_encoder: radio_h
+
+epochs: 3
+effective_samples_per_epoch: 24000
+batch_size: 2
+grad_accumulation_steps: 8
+max_sequence_length: 512
+
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 500
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.01
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 500
+validate_every_steps: 500
+
+dataset_mix:
+  - dataset: grandstaff_systems
+    ratio: 0.80
+    split: train
+    required: true
+  - dataset: primus
+    ratio: 0.10
+    split: train
+    required: true
+  - dataset: cameraprimus
+    ratio: 0.10
+    split: train
+    required: true

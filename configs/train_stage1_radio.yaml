@@ -40,7 +40,7 @@ warmup_steps: 1000
 schedule: cosine
 weight_decay: 0.01
 
-label_smoothing: 0.05
+label_smoothing: 0.01  # was 0.05; with 429-token vocab that imposed a ~0.50 token_loss floor reached by step ~2000; 0.01 drops floor to ~0.06 so the second half of training learns instead of plateauing
 contour_loss_weight: 0.01
 
 checkpoint_every_steps: 1000

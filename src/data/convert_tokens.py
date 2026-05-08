@@ -8,13 +8,17 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from src.tokenizer.vocab import (
     CLEF_TOKENS,
+    DOUBLE_ACCIDENTAL_NOTE_TOKENS,
     DYNAMIC_TOKENS,
+    EXTENDED_NOTE_TOKENS,
     EXPRESSION_TOKENS,
+    OCTAVE_1_NOTE_TOKENS,
     TEMPO_TOKENS,
     TIME_SIGNATURE_TOKENS,
     build_pitch_tokens,
@@ -82,6 +86,24 @@ EXPRESSION_CLASS_TO_TOKEN = {
     "Turn": "turn",
 }
 
+KERN_ARTICULATION_MAP = {
+    "^": "accent",
+    "'": "staccato",
+    "`": "staccatissimo",  # backtick in kern
+    "~": "tenuto",
+    ";": "fermata",
+}
+
+KERN_ORNAMENT_MAP = {
+    "T": "trill",      # uppercase = trill (no terminator)
+    "t": "trill",      # lowercase = trill (with main note attached)
+    "M": "mordent",    # uppercase = mordent (no main-note marker)
+    "m": "mordent",    # lowercase = mordent
+}
+# Note: tokens 't', 'T', 'm', 'M' would collide with pitch letters if not extracted carefully.
+# Pitches are A-G (uppercase) and a-g (lowercase). 'T', 'M', 't', 'm' are NOT pitch letters
+# (no T or M pitch class), so co-occurrence in a single body is safe to detect.
+
 DYNAMIC_VALUE_TO_TOKEN = {
     token[len("dynamic-") :].lower(): token for token in DYNAMIC_TOKENS if token.startswith("dynamic-")
 }
@@ -94,9 +116,30 @@ EXPRESSION_TEXT_TO_TOKEN = {
 SUPPORTED_CLEF_TOKENS = set(CLEF_TOKENS)
 SUPPORTED_KEY_SIGNATURE_TOKENS = set(build_key_signature_tokens())
 SUPPORTED_TIME_SIGNATURE_TOKENS = set(TIME_SIGNATURE_TOKENS)
-SUPPORTED_NOTE_TOKENS = {token for token in build_pitch_tokens() if token.startswith("note-")}
+SUPPORTED_NOTE_TOKENS = (
+    {token for token in build_pitch_tokens() if token.startswith("note-")}
+    | set(EXTENDED_NOTE_TOKENS)
+    | set(OCTAVE_1_NOTE_TOKENS)
+    | set(DOUBLE_ACCIDENTAL_NOTE_TOKENS)
+)
 SUPPORTED_GRACE_TOKENS = set(build_gracenote_tokens())
 MAX_SUPPORTED_VOICE_INDEX = 4
+
+
+@dataclass
+class KernEvent:
+    """One parsed kern event: pitches + duration + every musical marking we extract."""
+    pitches: List[str]                 # ['note-C4'] or ['note-C4', 'note-E4'] for chords
+    duration_tokens: List[str]          # ['_quarter'] or ['_eighth', '_dot']
+    is_rest: bool = False
+    is_grace: bool = False
+    tie_open: bool = False
+    tie_close: bool = False
+    slur_open: bool = False
+    slur_close: bool = False
+    articulations: List[str] = field(default_factory=list)
+    ornaments: List[str] = field(default_factory=list)
+    next_fallback_duration: Optional[Tuple[int, int]] = None
 
 
 def relpath(project_root: Path, target: Path) -> str:
@@ -456,6 +499,37 @@ def kern_time_signature_token(cell: str) -> Optional[str]:
     return _normalize_time_signature_token(f"timeSignature-{meter}")
 
 
+def kern_barline_token(cell: str) -> Optional[str]:
+    """Return a barline-type vocab token for a kern barline cell, or None for a regular barline.
+
+    Kern barline conventions:
+      =      regular (no token)
+      ==     final / double-thick  → final_barline
+      =||    double light          → double_barline
+      =:|!   end-repeat            → repeat_end
+      =!|:   start-repeat          → repeat_start
+      =:|!|: end-then-start        → repeat_both
+    """
+    if not cell.startswith("="):
+        return None
+    rest = cell[1:]  # strip leading =
+    # Final barline: starts with a second =
+    if rest.startswith("="):
+        return "final_barline"
+    # Double light barline
+    if rest.startswith("||"):
+        return "double_barline"
+    has_end = ":|!" in rest
+    has_start = "!|:" in rest
+    if has_end and has_start:
+        return "repeat_both"
+    if has_end:
+        return "repeat_end"
+    if has_start:
+        return "repeat_start"
+    return None
+
+
 def kern_pitch_token(body: str) -> str:
     match = re.search(r"[A-Ga-g]+", body)
     if not match:
@@ -475,39 +549,53 @@ def kern_pitch_token(body: str) -> str:
     return f"{base.upper()}{accidental}{octave}"
 
 
+TUPLET_RATIOS = {
+    "<tuplet_3>": (3, 2),  # 3 in time of 2 (triplet)
+    "<tuplet_5>": (5, 4),  # 5 in time of 4 (quintuplet)
+    # <tuplet_6> omitted: 6:4 reduces to 3:2 arithmetically, so <tuplet_3> always matches first.
+    # Re-add here (and update grammar_fsa.py to 4/6) only if the converter ever needs to
+    # distinguish sextuplets from triplets by context.
+    "<tuplet_7>": (7, 4),  # 7 in time of 4 (septuplet)
+}
+
+
 def kern_duration_components(duration_num: int, dots: int, is_rest: bool) -> List[str]:
+    """Convert a kern duration code (reciprocal: 4=quarter, 8=eighth, 16=sixteenth, ...)
+    into OMR duration tokens, including tuplet markers when applicable.
+
+    Math: kern duration codes are reciprocals (1/duration_num of a whole note).
+    For an N:M tuplet, kern_code = base_code × N / M. Inversely: base = kern_code × M / N.
+    """
     if duration_num <= 0:
         raise ValueError(f"Unsupported Kern duration '{duration_num}'")
 
+    # Plain (non-tuplet) duration: direct lookup.
     if str(duration_num) in KERN_DURATION_TO_NAME:
         duration_name = KERN_DURATION_TO_NAME[str(duration_num)]
         return duration_tokens(duration_name, dots=dots, is_rest=is_rest)
 
-    base_by_divisor = {
-        3: "<tuplet_3>",
-        5: "<tuplet_5>",
-        6: "<tuplet_6>",
-        7: "<tuplet_7>",
-    }
-    for divisor, tuplet_token in base_by_divisor.items():
-        if duration_num % divisor != 0:
+    # Try each tuplet ratio: base = duration_num × M / N must be an integer
+    # AND must map to a known plain kern duration.
+    # Order: tuplet_3 first since it's far more common than 5/6/7. Tuplet disambiguation
+    # (3 vs 6 for the same arithmetic) happens contextually in disambiguate_tuplet_grouping.
+    for tuplet_token, (n, m) in TUPLET_RATIOS.items():
+        if (duration_num * m) % n != 0:
             continue
-        base = duration_num // divisor
+        base = (duration_num * m) // n
         base_name = KERN_DURATION_TO_NAME.get(str(base))
         if base_name is None:
             continue
         return [tuplet_token, *duration_tokens(base_name, dots=dots, is_rest=is_rest)]
 
-    # GrandStaff includes a small tail of non-canonical durations (e.g. 22, 36).
-    # Quantize these to the nearest representable duration in our fixed token scheme.
+    # Non-canonical durations (e.g., 22, 36): quantize to nearest representable duration.
     target_ql = 4.0 / float(duration_num)
     candidates: List[Tuple[float, Optional[str], str]] = []
     for base_raw, base_name in KERN_DURATION_TO_NAME.items():
         base_num = int(base_raw)
         candidates.append((4.0 / float(base_num), None, base_name))
-        for divisor, tuplet_token in base_by_divisor.items():
-            quantized_num = base_num * divisor
-            candidates.append((4.0 / float(quantized_num), tuplet_token, base_name))
+        for tuplet_token, (n, m) in TUPLET_RATIOS.items():
+            quantized_num = base_num * n / m  # the kern code that would represent this tuplet
+            candidates.append((4.0 / quantized_num, tuplet_token, base_name))
 
     best_ql, best_tuplet, best_name = min(
         candidates, key=lambda item: abs(item[0] - target_ql)
@@ -518,9 +606,10 @@ def kern_duration_components(duration_num: int, dots: int, is_rest: bool) -> Lis
     return [best_tuplet, *quantized_duration]
 
 
+
 def parse_kern_event(
     event: str, fallback_duration: Optional[Tuple[int, int]]
-) -> Tuple[List[str], List[str], bool, Tuple[int, int]]:
+) -> KernEvent:
     match = re.match(r"^(\d+)(\.*)(.*)$", event)
     if match:
         duration_num, dot_group, body = match.groups()
@@ -534,14 +623,78 @@ def parse_kern_event(
         body = event
     duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=False)
 
-    if "r" in body.lower():
-        rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
-        return ["rest"], rest_duration_parts, True, (duration_value, dots)
+    # Detect grace note flag 'q' (acciaccatura) or 'Q' (appoggiatura).
+    is_grace = "q" in body or "Q" in body
+    body_clean_temp = body.replace("q", "").replace("Q", "")
 
-    prefer_flats = "-" in body and "#" not in body
-    normalized = _normalize_pitch_symbol(kern_pitch_token(body), prefer_flats=prefer_flats)
+    tie_continue = "_" in body_clean_temp
+    tie_open = "[" in body_clean_temp or tie_continue   # _ acts as both close + open
+    tie_close = "]" in body_clean_temp or tie_continue
+    body_clean = body_clean_temp.replace("[", "").replace("]", "").replace("_", "")
+
+    slur_open = "(" in body_clean
+    slur_close = ")" in body_clean
+    body_clean = body_clean.replace("(", "").replace(")", "")
+
+    articulations: List[str] = []
+    for sym, name in KERN_ARTICULATION_MAP.items():
+        if sym in body_clean:
+            articulations.append(name)
+            body_clean = body_clean.replace(sym, "")
+
+    ornaments: List[str] = []
+    for sym, name in KERN_ORNAMENT_MAP.items():
+        if sym in body_clean:
+            if name not in ornaments:
+                ornaments.append(name)
+            body_clean = body_clean.replace(sym, "")
+
+    if "r" in body_clean.lower():
+        rest_duration_parts = kern_duration_components(duration_value, dots=dots, is_rest=True)
+        return KernEvent(
+            pitches=["rest"],
+            duration_tokens=rest_duration_parts,
+            is_rest=True,
+            tie_open=tie_open,
+            tie_close=tie_close,
+            slur_open=slur_open,
+            slur_close=slur_close,
+            articulations=articulations,
+            ornaments=ornaments,
+            next_fallback_duration=(duration_value, dots),
+        )
+
+    prefer_flats = "-" in body_clean and "#" not in body_clean
+    normalized = _normalize_pitch_symbol(kern_pitch_token(body_clean), prefer_flats=prefer_flats)
+
+    if is_grace:
+        grace_pitch = _normalize_grace_pitch_symbol(normalized)
+        return KernEvent(
+            pitches=[f"gracenote-{grace_pitch}"],
+            duration_tokens=duration_parts,
+            is_grace=True,
+            tie_open=tie_open,
+            tie_close=tie_close,
+            slur_open=slur_open,
+            slur_close=slur_close,
+            articulations=articulations,
+            ornaments=ornaments,
+            # Grace notes consume no metric time, so don't update fallback duration.
+            next_fallback_duration=fallback_duration,
+        )
+
     pitch = _normalize_note_pitch_symbol(normalized)
-    return [f"note-{pitch}"], duration_parts, False, (duration_value, dots)
+    return KernEvent(
+        pitches=[f"note-{pitch}"],
+        duration_tokens=duration_parts,
+        tie_open=tie_open,
+        tie_close=tie_close,
+        slur_open=slur_open,
+        slur_close=slur_close,
+        articulations=articulations,
+        ornaments=ornaments,
+        next_fallback_duration=(duration_value, dots),
+    )
 
 
 def parse_kern_cell(
@@ -551,118 +704,305 @@ def parse_kern_cell(
     if not events:
         return [], fallback_duration
 
-    parsed = []
+    parsed: List[KernEvent] = []
     active_duration = fallback_duration
     for event in events:
-        pitches, duration, is_rest, active_duration = parse_kern_event(event, active_duration)
-        parsed.append((pitches, duration, is_rest))
+        ev = parse_kern_event(event, active_duration)
+        parsed.append(ev)
+        active_duration = ev.next_fallback_duration
 
     if len(parsed) > 1:
-        if any(is_rest for _, _, is_rest in parsed):
+        if any(ev.is_rest for ev in parsed):
             output: List[str] = []
-            for pitches, duration, _ in parsed:
-                output.extend(pitches)
-                output.extend(duration)
+            for ev in parsed:
+                output.extend(_emit_event_tokens(ev))
             return output, active_duration
-        chord_tokens: List[str] = ["<chord_start>"]
-        duration_tokens_out = parsed[0][1]
-        for pitches, _, _ in parsed:
-            chord_tokens.extend(pitches)
-        chord_tokens.extend(["<chord_end>", *duration_tokens_out])
+        # Chord (multiple non-rest pitches sharing the same duration).
+        any_tie_open = any(ev.tie_open for ev in parsed)
+        any_tie_close = any(ev.tie_close for ev in parsed)
+        any_slur_open = any(ev.slur_open for ev in parsed)
+        any_slur_close = any(ev.slur_close for ev in parsed)
+        chord_ornaments: List[str] = []
+        seen_orns: set[str] = set()
+        for ev in parsed:
+            for orn in ev.ornaments:
+                if orn not in seen_orns:
+                    chord_ornaments.append(orn)
+                    seen_orns.add(orn)
+        chord_articulations = []
+        seen_arts: set[str] = set()
+        for ev in parsed:
+            for art in ev.articulations:
+                if art not in seen_arts:
+                    chord_articulations.append(art)
+                    seen_arts.add(art)
+        chord_tokens: List[str] = []
+        chord_tokens.extend(chord_ornaments)
+        chord_tokens.extend(chord_articulations)
+        if any_tie_open:
+            chord_tokens.append("tie_start")
+        if any_slur_open:
+            chord_tokens.append("slur_start")
+        chord_tokens.append("<chord_start>")
+        for ev in parsed:
+            chord_tokens.extend(ev.pitches)
+        chord_tokens.append("<chord_end>")
+        chord_tokens.extend(parsed[0].duration_tokens)
+        if any_slur_close:
+            chord_tokens.append("slur_end")
+        if any_tie_close:
+            chord_tokens.append("tie_end")
         return chord_tokens, active_duration
 
-    pitches, duration, _ = parsed[0]
-    return [*pitches, *duration], active_duration
+    return _emit_event_tokens(parsed[0]), active_duration
 
 
+def _emit_event_tokens(ev: KernEvent) -> List[str]:
+    """Flatten a KernEvent to canonical token order:
+    [ornaments, articulations, tie_open?, slur_open?, pitches, duration, slur_close?, tie_close?]
+    """
+    out: List[str] = []
+    out.extend(ev.ornaments)             # ornaments first
+    out.extend(ev.articulations)         # then articulations
+    if ev.tie_open:
+        out.append("tie_start")
+    if ev.slur_open:
+        out.append("slur_start")
+    out.extend(ev.pitches)
+    out.extend(ev.duration_tokens)
+    if ev.slur_close:
+        out.append("slur_end")
+    if ev.tie_close:
+        out.append("tie_end")
+    return out
+
+
+# Known limitations (deferred — affect non-existent corpora as of 2026-05-04):
+# 1. Mixed-spine headers with non-kern columns first (e.g. `**dynam\t**kern`):
+#    column_to_spine init assumes the first N columns are the kern spines;
+#    a non-kern-first layout silently drops the kern data. All current
+#    kern corpora are kern-first or all-kern, so this path is dead.
+# 2. Three-way `*v` merges (`*v *v *v` collapsing 3 sub-spines to 1): the
+#    paired-merge loop only collapses pairs; a third `*v` retains a stale
+#    column entry. Vanishingly rare in piano kern (not seen in GrandStaff).
+# 3. `*-` spine terminators don't remove the terminated column from
+#    column_to_spine. Stale entries are harmless (subsequent data lines
+#    won't have content in the terminated column) but the per_spine_state
+#    bookkeeping for that spine continues until end-of-file.
 def convert_kern_file(path: Path) -> List[str]:
+    """Convert a kern file to OMR tokens.
+
+    Top-level **kern spines map to staves (emit <staff_start>...<staff_end> per spine,
+    with <staff_idx_N> markers in top-down display order when N>=2 spines).
+    Sub-spines from `*^` operators within a single spine map to <voice_N> tokens.
+    """
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    tokens: List[str] = ["<bos>", "<staff_start>"]
-    current_voice: Optional[int] = None
-    duration_by_voice: Dict[int, Tuple[int, int]] = {}
-    measure_open = False
-    has_clef = False
-    has_time = False
 
-    def _ensure_header_defaults() -> None:
-        nonlocal has_clef, has_time
-        if not has_clef:
-            tokens.append("clef-G2")
-            has_clef = True
-        if not has_time:
-            tokens.append("timeSignature-4/4")
-            has_time = True
-
-    def ensure_measure_open() -> None:
-        nonlocal measure_open, current_voice
-        if measure_open:
-            return
-        _ensure_header_defaults()
-        tokens.append("<measure_start>")
-        measure_open = True
-        current_voice = None
-
-    def close_measure_if_open() -> None:
-        nonlocal measure_open, current_voice
-        if not measure_open:
-            return
-        if tokens[-1] != "<measure_end>":
-            tokens.append("<measure_end>")
-        measure_open = False
-        current_voice = None
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("!"):
+    # Discover the **kern header line and count top-level spines.
+    spine_count = 0
+    header_idx = -1
+    for i, line in enumerate(lines):
+        if not line.strip() or line.startswith("!"):
             continue
         cells = line.split("\t")
-        if any(cell.startswith("=") for cell in cells):
-            close_measure_if_open()
+        kern_cells = [c for c in cells if c == "**kern"]
+        if kern_cells and len(kern_cells) == len(cells):
+            spine_count = len(cells)
+            header_idx = i
+            break
+        if line.startswith("**"):
+            # Mixed-spine header (e.g. **kern\t**dynam) — count only **kern columns.
+            spine_count = len(kern_cells)
+            header_idx = i
+            break
+    if spine_count == 0:
+        return []
+
+    # Per-spine accumulators.
+    per_spine_tokens: List[List[str]] = [[] for _ in range(spine_count)]
+    per_spine_state = [
+        {
+            "current_voice": None,
+            "measure_open": False,
+            "duration_by_voice": {},
+            "has_clef": False,
+            "has_time": False,
+            "pending_left_barline": None,  # barline token to emit after next <measure_start>
+        }
+        for _ in range(spine_count)
+    ]
+    # column -> spine_id mapping. Updates on *^ (split) and *v (merge).
+    column_to_spine = list(range(spine_count))
+
+    def ensure_measure_open(spine_id: int) -> None:
+        st = per_spine_state[spine_id]
+        if st["measure_open"]:
+            return
+        if not st["has_clef"]:
+            per_spine_tokens[spine_id].append("clef-G2")
+            st["has_clef"] = True
+        if not st["has_time"]:
+            per_spine_tokens[spine_id].append("timeSignature-4/4")
+            st["has_time"] = True
+        per_spine_tokens[spine_id].append("<measure_start>")
+        # Emit any pending left-barline token (e.g. repeat_start) immediately after
+        # <measure_start> so the export layer can attach it to leftBarline.
+        if st["pending_left_barline"] is not None:
+            per_spine_tokens[spine_id].append(st["pending_left_barline"])
+            st["pending_left_barline"] = None
+        st["measure_open"] = True
+        st["current_voice"] = None
+
+    def close_measure_if_open(spine_id: int) -> None:
+        st = per_spine_state[spine_id]
+        if not st["measure_open"]:
+            return
+        if per_spine_tokens[spine_id][-1] != "<measure_end>":
+            per_spine_tokens[spine_id].append("<measure_end>")
+        st["measure_open"] = False
+        st["current_voice"] = None
+
+    # Walk lines after the header.
+    for raw_line in lines[header_idx + 1 :]:
+        line = raw_line.rstrip("\n")
+        if not line.strip() or line.startswith("!"):
             continue
+        cells = line.split("\t")
+
+        # Barline lines apply to every column.
+        if any(cell.startswith("=") for cell in cells):
+            # Determine barline type from the first non-regular barline cell found.
+            barline_token: Optional[str] = None
+            for cell in cells:
+                if cell.startswith("="):
+                    t = kern_barline_token(cell)
+                    if t is not None:
+                        barline_token = t
+                        break
+            for spine_id in range(spine_count):
+                if barline_token is not None:
+                    if barline_token in ("repeat_start", "repeat_both"):
+                        # Start-repeat and combined barlines: the "start" half belongs
+                        # to the NEXT measure's leftBarline.  Pend it; ensure_measure_open
+                        # will emit it immediately after the next <measure_start>.
+                        per_spine_state[spine_id]["pending_left_barline"] = "repeat_start"
+                    if barline_token in ("repeat_end", "repeat_both", "double_barline", "final_barline"):
+                        # End-type tokens go inside the current measure before <measure_end>.
+                        if per_spine_state[spine_id]["measure_open"]:
+                            per_spine_tokens[spine_id].append(barline_token if barline_token != "repeat_both" else "repeat_end")
+                close_measure_if_open(spine_id)
+            continue
+
+        # Spine-manipulation operators (*^, *v) — update column_to_spine map.
         if line.startswith("*"):
-            interpretation_tokens: List[str] = []
-            for idx, cell in enumerate(cells, start=1):
+            new_column_to_spine: List[int] = []
+            i = 0
+            while i < len(cells):
+                cell = cells[i]
+                col_spine = column_to_spine[i] if i < len(column_to_spine) else None
+                if cell == "*^" and col_spine is not None:
+                    new_column_to_spine.append(col_spine)
+                    new_column_to_spine.append(col_spine)
+                    i += 1
+                elif cell == "*v" and col_spine is not None:
+                    if (
+                        i + 1 < len(cells)
+                        and cells[i + 1] == "*v"
+                        and i + 1 < len(column_to_spine)
+                        and column_to_spine[i + 1] == col_spine
+                    ):
+                        new_column_to_spine.append(col_spine)
+                        per_spine_state[col_spine]["current_voice"] = None
+                        i += 2
+                    else:
+                        new_column_to_spine.append(col_spine)
+                        i += 1
+                elif col_spine is None:
+                    i += 1
+                else:
+                    new_column_to_spine.append(col_spine)
+                    i += 1
+            if any(c in {"*^", "*v"} for c in cells):
+                column_to_spine = new_column_to_spine
+                continue
+
+            # Other interpretation tokens (clef, key, time) — emit per spine.
+            interpretation_by_spine: Dict[int, List[str]] = {}
+            for col_idx, cell in enumerate(cells):
+                if col_idx >= len(column_to_spine):
+                    continue
+                spine_id = column_to_spine[col_idx]
                 if cell in {"*", "*-"}:
                     continue
                 for parser in (kern_clef_token, kern_key_signature_token, kern_time_signature_token):
                     parsed = parser(cell)
                     if parsed:
-                        interpretation_tokens.append(parsed)
-            if interpretation_tokens:
-                close_measure_if_open()
-                deduped = _dedupe_preserve(interpretation_tokens)
-                for token in deduped:
-                    if token.startswith("clef-"):
-                        has_clef = True
-                    elif token.startswith("timeSignature-"):
-                        has_time = True
-                tokens.extend(deduped)
+                        interpretation_by_spine.setdefault(spine_id, []).append(parsed)
+            for spine_id, parsed_tokens in interpretation_by_spine.items():
+                close_measure_if_open(spine_id)
+                deduped = _dedupe_preserve(parsed_tokens)
+                for tok in deduped:
+                    if tok.startswith("clef-"):
+                        per_spine_state[spine_id]["has_clef"] = True
+                    elif tok.startswith("timeSignature-"):
+                        per_spine_state[spine_id]["has_time"] = True
+                per_spine_tokens[spine_id].extend(deduped)
             continue
 
-        for idx, cell in enumerate(cells, start=1):
-            if cell in {"", "."}:
+        # Data lines — group cells by spine and per-spine sub-spine voice.
+        cells_by_spine: Dict[int, List[Tuple[int, str]]] = {}
+        for col_idx, cell in enumerate(cells):
+            if col_idx >= len(column_to_spine):
                 continue
-            canonical_voice = min(idx, MAX_SUPPORTED_VOICE_INDEX)
-            if canonical_voice < 1 or canonical_voice > MAX_SUPPORTED_VOICE_INDEX:
-                continue
-            if idx > MAX_SUPPORTED_VOICE_INDEX:
-                # Our locked vocabulary supports four voices max; drop excess spines.
-                continue
+            spine_id = column_to_spine[col_idx]
+            cells_by_spine.setdefault(spine_id, []).append((col_idx, cell))
 
-            cell_tokens, duration_state = parse_kern_cell(cell, duration_by_voice.get(canonical_voice))
-            if not cell_tokens:
-                continue
-            ensure_measure_open()
-            if current_voice != canonical_voice:
-                tokens.append(f"<voice_{canonical_voice}>")
-                current_voice = canonical_voice
-            if duration_state is not None:
-                duration_by_voice[canonical_voice] = duration_state
-            tokens.extend(cell_tokens)
+        for spine_id, spine_cells in cells_by_spine.items():
+            sub_spine_count = len(spine_cells)
+            for sub_idx, (_, cell) in enumerate(spine_cells, start=1):
+                if cell in {"", "."}:
+                    continue
+                # Drop sub-spines beyond the supported voice cap (mirrors line-648 of the prior converter).
+                if sub_idx > MAX_SUPPORTED_VOICE_INDEX:
+                    continue
+                # Per-spine voice: 1 when only one sub-spine, else the sub-spine index.
+                canonical_voice = 1 if sub_spine_count == 1 else sub_idx
+                cell_tokens, duration_state = parse_kern_cell(
+                    cell, per_spine_state[spine_id]["duration_by_voice"].get(canonical_voice)
+                )
+                if not cell_tokens:
+                    continue
+                ensure_measure_open(spine_id)
+                # Emit <voice_N> only when there are multiple sub-spines AND the active voice changes.
+                if (
+                    sub_spine_count > 1
+                    and per_spine_state[spine_id]["current_voice"] != canonical_voice
+                ):
+                    per_spine_tokens[spine_id].append(f"<voice_{canonical_voice}>")
+                    per_spine_state[spine_id]["current_voice"] = canonical_voice
+                if duration_state is not None:
+                    per_spine_state[spine_id]["duration_by_voice"][canonical_voice] = duration_state
+                per_spine_tokens[spine_id].extend(cell_tokens)
 
-    close_measure_if_open()
-    tokens.extend(["<staff_end>", "<eos>"])
-    return tokens
+    # Close any open measure on each spine.
+    for spine_id in range(spine_count):
+        close_measure_if_open(spine_id)
+
+    # Assemble final token list — top-down order: spine N-1 first, spine 0 last.
+    out: List[str] = ["<bos>"]
+    if spine_count == 1:
+        out.append("<staff_start>")
+        out.extend(list(per_spine_tokens[0]))
+        out.append("<staff_end>")
+    else:
+        for display_idx in range(spine_count):
+            kern_spine_id = (spine_count - 1) - display_idx
+            out.append("<staff_start>")
+            out.append(f"<staff_idx_{display_idx}>")
+            out.extend(list(per_spine_tokens[kern_spine_id]))
+            out.append("<staff_end>")
+    out.append("<eos>")
+    return out
 
 
 _NATURAL_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -696,6 +1036,24 @@ def _normalize_pitch_symbol(symbol: str, prefer_flats: Optional[bool] = None) ->
 
     letter, accidental_group, octave_text = match.groups()
     octave = int(octave_text)
+
+    # Preserve double-accidentals: vocab now carries all 14 spellings × 6 octaves.
+    # Collapsing them (e.g. Bbb → A, F## → G) loses musically-meaningful spelling
+    # information carried through from kern `--` / `##` accidentals via music21.
+    if accidental_group == "bb":
+        return f"{letter}bb{octave}"
+    if accidental_group == "##":
+        return f"{letter}##{octave}"
+
+    # Preserve natural-key flat/sharp spellings (Cb, Fb, B#, E#) — these would
+    # otherwise be collapsed to their enharmonic naturals (B, E, C, F) via the
+    # semitone-math normalisation below, losing spelling fidelity. The vocab
+    # carries explicit Cb/Fb/B#/E# tokens for these cases.
+    if accidental_group == "b" and letter in ("C", "F"):
+        return f"{letter}b{octave}"
+    if accidental_group == "#" and letter in ("B", "E"):
+        return f"{letter}#{octave}"
+
     semitone = _NATURAL_SEMITONES[letter] + accidental_group.count("#") - accidental_group.count("b")
     while semitone < 0:
         semitone += 12
@@ -715,7 +1073,9 @@ def _normalize_pitch_symbol(symbol: str, prefer_flats: Optional[bool] = None) ->
 
 def _normalize_grace_pitch_symbol(symbol: str) -> str:
     normalized = _normalize_pitch_symbol(symbol)
-    match = re.fullmatch(r"([A-G])(?:[#b]?)(-?\d+)", normalized)
+    # Match optional single OR double accidental (the v3 phase-3 extension
+    # introduced Xbb / X## tokens that the old regex didn't handle).
+    match = re.fullmatch(r"([A-G])(?:##|bb|#|b)?(-?\d+)", normalized)
     if match is None:
         raise ValueError(f"Unsupported grace pitch symbol '{symbol}'")
     letter, octave_text = match.groups()
@@ -729,7 +1089,9 @@ def _normalize_grace_pitch_symbol(symbol: str) -> str:
 
 def _normalize_note_pitch_symbol(symbol: str) -> str:
     normalized = _normalize_pitch_symbol(symbol)
-    match = re.fullmatch(r"([A-G](?:#|b)?)(-?\d+)", normalized)
+    # Pattern accepts single OR double accidentals (##, bb) produced by the
+    # double-accidental preservation path in _normalize_pitch_symbol.
+    match = re.fullmatch(r"([A-G](?:##|bb|#|b)?)(-?\d+)", normalized)
     if match is None:
         raise ValueError(f"Unsupported pitch symbol '{symbol}'")
     pitch_class, octave_text = match.groups()
@@ -747,7 +1109,7 @@ def _normalize_note_pitch_symbol(symbol: str) -> str:
     best_key: Tuple[int, int, str] | None = None
     for note_token in SUPPORTED_NOTE_TOKENS:
         note_symbol = note_token[len("note-") :]
-        parsed = re.fullmatch(r"([A-G](?:#|b)?)(-?\d+)", note_symbol)
+        parsed = re.fullmatch(r"([A-G](?:##|bb|#|b)?)(-?\d+)", note_symbol)
         if parsed is None:
             continue
         cand_pitch_class, cand_octave_text = parsed.groups()

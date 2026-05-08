@@ -7,7 +7,11 @@ disabled), with the mixed dataset and chosen base model.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
 from ultralytics import YOLO
 
@@ -58,38 +62,18 @@ def parse_args() -> argparse.Namespace:
             "later runs; leave off for the YOLOv8m clean-data baseline."
         ),
     )
+    parser.add_argument(
+        "--noise-warmup-steps",
+        type=int,
+        default=0,
+        help=(
+            "Linear warmup ramp on scan-noise intensity over the first N batches "
+            "(only with --noise). Avoids the early-training cls_loss-blow-up "
+            "failure mode where a fresh detection head + heavy augmentation = NaN. "
+            "Default 0 = no warmup, full strength from step 0."
+        ),
+    )
     return parser.parse_args()
-
-
-def _patch_albumentations_for_scan_noise() -> None:
-    """Replace ultralytics' default Albumentations transform list with a scan-noise pipeline."""
-    import cv2
-    import ultralytics.data.augment as ua
-    import albumentations as A
-
-    scan_noise_transforms = [
-        A.ImageCompression(quality_range=(70, 95), p=0.4),
-        A.OneOf([
-            A.GaussNoise(std_range=(0.02, 0.11), p=0.6),
-            A.ISONoise(intensity=(0.05, 0.2), p=0.4),
-        ], p=0.3),
-        A.OneOf([
-            A.Blur(blur_limit=3, p=0.5),
-            A.MotionBlur(blur_limit=3, p=0.3),
-            A.MedianBlur(blur_limit=3, p=0.2),
-        ], p=0.15),
-        A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.4),
-        A.Rotate(limit=2, border_mode=cv2.BORDER_REPLICATE, fill=255, p=0.3),
-        A.GridDistortion(num_steps=5, distort_limit=0.05, border_mode=cv2.BORDER_REPLICATE, p=0.2),
-        A.ElasticTransform(alpha=15, sigma=8, border_mode=cv2.BORDER_REPLICATE, p=0.10),
-    ]
-
-    original_init = ua.Albumentations.__init__
-
-    def patched_init(self, p: float = 1.0, transforms=None) -> None:  # noqa: ANN001
-        original_init(self, p=p, transforms=scan_noise_transforms)
-
-    ua.Albumentations.__init__ = patched_init
 
 
 def _patch_nan_guard() -> None:
@@ -137,7 +121,8 @@ def main() -> None:
     if args.nan_guard:
         _patch_nan_guard()
     if args.noise:
-        _patch_albumentations_for_scan_noise()
+        from src.train.scan_noise import patch_albumentations_for_scan_noise
+        patch_albumentations_for_scan_noise(warmup_steps=args.noise_warmup_steps)
     model = YOLO(args.model)
     train_kwargs = dict(
         data=str(args.data),

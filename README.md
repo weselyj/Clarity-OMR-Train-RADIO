@@ -1,67 +1,126 @@
-# Clarity-OMR-Train
+# Clarity-OMR-Train-RADIO
 
-Training code and pipeline for the [Clarity-OMR](https://github.com/clquwu/Clarity-OMR) optical music recognition model.
+Training pipeline for an optical music recognition model that turns printed-score images into MusicXML.
 
-For **inference only** (PDF to MusicXML), see [Clarity-OMR](https://github.com/clquwu/Clarity-OMR).
+This repository is a fork of [**clquwu/Clarity-OMR-Train**](https://github.com/clquwu/Clarity-OMR-Train) — the original training pipeline for [Clarity-OMR](https://github.com/clquwu/Clarity-OMR) (the inference repo). The fork extends the upstream project in two directions:
 
-## System Architecture
+1. **Encoder swap (DaViT → C-RADIOv4-H).** Replaces the 86M-param ImageNet-pretrained DaViT encoder with NVIDIA's ~700M-param RADIO foundation encoder for richer features (hence the `-RADIO` suffix in this repo's name).
+2. **System-level architectural rebuild.** Stage A is being retrained to detect full multi-staff systems (rather than individual staves), and Stage B will be retrained to decode whole systems in one pass with new `<staff_idx_N>` marker tokens. The earlier per-staff retrain confirmed that cropping (not encoder capacity) was the bottleneck on cross-staff coordination, motivating this pivot.
 
-Clarity-OMR is a **4-stage pipeline** designed for clean, modern, typeset sheet music:
+For inference only (PDF → MusicXML), see the upstream [Clarity-OMR](https://github.com/clquwu/Clarity-OMR) repo.
+
+The system-level rebuild is currently in active development on `feat/system-level-rebuild`. The previous per-staff implementation is preserved on older branches.
+
+## What this project does
+
+Given a printed-music score image, the pipeline emits a structurally valid MusicXML file. The architecture splits the problem into three stages:
 
 ```
 INPUT: Full-page score image (scan or PDF render)
   │
   ▼
-STAGE A — Page Analysis (YOLOv8m)
-  │  Detect: staves, system brackets, barlines, title/page regions
-  │  Output: ordered list of staff bounding boxes grouped by system
+STAGE A — System Detection (YOLO26m)
+  │  Detect: full multi-staff systems on the page
+  │  Output: ordered list of system bounding boxes, each tagged with its staff count
   │
   ▼
-STAGE B — Staff-Level Recognition (DaViT encoder + custom RoPE decoder)
-  │  Input: individual cropped staff image (192px height, up to 2048px width)
-  │  Output: token sequence per staff (~487-token music vocabulary)
+STAGE B — System-Level Recognition (C-RADIOv4-H encoder + RoPE decoder)
+  │  Input: cropped system image (multi-staff, all voices in one pass)
+  │  Output: token sequence with <staff_idx_N> markers identifying which staff each
+  │          note/rest belongs to
   │
   ▼
-STAGE C — Constrained Decoding + Assembly
-  │  Grammar FSA validates each staff's token sequence during beam search
-  │  Staves assembled into systems using Stage A spatial metadata
+STAGE C/D — Assembly + MusicXML Serialization
   │  Cross-staff attributes resolved (shared time/key signatures, barline alignment)
-  │
-  ▼
-STAGE D — MusicXML Serialization
-  │  Token sequences → music21 stream objects → MusicXML export
+  │  Token stream → music21 stream objects → MusicXML export
   │
   ▼
 OUTPUT: Valid MusicXML file
 ```
 
-### Why pipeline over end-to-end
+### Why system-level (vs per-staff)
 
-- Staff-level recognition at 192px height preserves full detail per note — end-to-end full-page would require downsampling, losing the fine detail that distinguishes sharps from naturals or eighth notes from sixteenths.
-- Staff detection on clean typeset notation is essentially solved (0.991 mAP50, Dvořák et al., WORMS 2024).
-- Each stage can be debugged, evaluated, and improved independently.
-- Scales to any number of staves without sequence length constraints.
+The earlier per-staff design fed individual staff crops to Stage B, then re-stitched the per-staff outputs in Stage C. That recovered most onsets but lost cross-staff coordination signal — ties that span systems, anacrusis split across staves, voice-piano alignment in vocal-piano music. The 2026-05 retrain experiment confirmed this empirically: a clean per-staff-trained checkpoint produced syntactically better outputs but didn't move the headline `onset_f1` metric. System-level inputs preserve cross-staff context that single-staff windows structurally cannot recover.
 
-## Model Architecture — Stage B (Core)
+## Project status
 
-The core recognition model uses a **DaViT-pretrained encoder** paired with a **custom autoregressive Transformer decoder** with RoPE positional encoding.
+| Subproject | Component | Status |
+|---|---|---|
+| 1 | Stage A system-level YOLO retrain | **Training** (epoch 1 mAP50 = 0.994; gate ≥ 0.95) |
+| 2 | Tokenizer v2 + Stage 2 RADIO retrain | Pending |
+| 3 | Stage 3 RADIO retrain on system crops | Pending |
 
-### Encoder: DaViT (86M parameters)
 
-[DaViT](https://github.com/dingmyu/davit) (Dual Attention Vision Transformer) alternates between spatial-window and channel-group self-attention:
+## Stage A — System detection
 
-- **Spatial attention** captures local glyph structure (noteheads, stems, beams).
-- **Channel attention** captures global patterns (staff line positions, key signature context across the full width).
-- **Pretrained on ImageNet** — general visual features transfer well to the high-contrast, geometric domain of printed notation.
-- A **deformable attention layer** (3M params) is added before the final encoder output for handling dense notation (clustered accidentals, chords, grace notes).
+The Stage A model is YOLO26m, trained at imgsz=1920 to detect full multi-staff systems. Each detection is a system bbox plus a `staves_in_system` count carried through page metadata.
 
-Input: grayscale staff crop, height 192px, width preserved up to 2048px. Feature map: spatial downsampling factor 32 → 6 × (W/32) grid.
+### Training data
 
-### Positional Bridge
+| Corpus | Source | Pages | Systems | How labels are derived |
+|---|---|---|---|---|
+| `synthetic_v2` | Verovio-rendered MusicXML (OpenScore Lieder + IMSLP) | 6,979 | 21,797 | SVG hierarchy (authoritative) |
+| `sparse_augment` | Verovio-rendered (sparse-content augmentation set) | 1,288 | 4,210 | SVG hierarchy (authoritative) |
+| `omr_layout_real` | Real scans (AudioLabs typeset corpus) | 919 | ~3,000 | Bracket detection + spatial heuristic |
 
-1. **2D sinusoidal positional encoding** added to encoder feature map (separate x/y frequencies for horizontal time-position and vertical pitch-position).
+`mixed_systems_v1` combines all three (20,594 train + 5,142 val pairs, stratified by source).
+
+### Label derivation pipeline
+
+Synthetic and sparse_augment pages use a v15 SVG-hierarchy algorithm that reads the rendered Verovio `<g class="system">` tree directly, sidestepping the Verovio bounding-box rect (which is occasionally undersized). The algorithm:
+
+1. **Parse SVG hierarchy.** Each `<g class="system">` element contains the `<g class="staff">` rows belonging to that system. This tree is authoritative for staff-to-system grouping.
+2. **Match per-staff disk labels to SVG rows by y-center distance.** Each staff label inherits the `sys_idx` of its closest SVG row.
+3. **Per-row SVG fallback.** If an SVG row has no matching disk label (e.g., a coda fragment whose per-staff labels were never generated), synthesize a bbox from the SVG staff-line geometry plus extended expansion ratios (top=0.4, bottom=1.5) to cover ledger-line chords below the staff.
+4. **Single-staff fallback.** Solo treble pieces have no `<g class="system">` elements; each disk label becomes its own one-staff system.
+5. **System margins** (production-DPI pixels): `TOP=80`, `BOTTOM=130`, `RIGHT=60`, `LEFTWARD_BRACKET=40`.
+6. **Neighbor-aware cap.** When two adjacent systems would expand into each other's territory, both sides cap at the gap midpoint, preventing label overlap on tight layouts.
+
+Real scans (`omr_layout_real`) use a different path because no Verovio SVG exists — visual first-barline detection (`src/data/bracket_detector.py`) plus a spatial fallback (`src/data/derive_systems_from_staves.py`).
+
+The system-bbox derivation is exercised by 23 unit tests in `tests/data/test_build_system_yolo_objects_v15.py` and `tests/data/test_generate_synthetic_systems.py`.
+
+### Training command
+
+```bash
+python scripts/train_yolo.py \
+  --model yolo26m.pt \
+  --data data/processed/mixed_systems_v1/data.yaml \
+  --epochs 100 --imgsz 1920 --batch 4 --workers 6 \
+  --amp --nan-guard --noise --noise-warmup-steps 2000 \
+  --project runs/detect/runs --name yolo26m_systems --patience 30
+```
+
+Notable flags:
+
+- `--noise-warmup-steps 2000` — ramps scan-noise augmentation probability from 0 to full over the first 2000 steps. Avoids the early-training NaN failure mode where `cls_loss × noise` blows up.
+- `--nan-guard` — zeroes individual NaN/Inf gradients per batch (instead of skipping the whole step) so the rare warmup gradient explosion doesn't disrupt training.
+- The data-aug pipeline (scan-noise + page-curvature) lives in `src/train/scan_aug.py`.
+
+## Stage B — System-level recognition
+
+The recognition model uses a **C-RADIOv4-H encoder** paired with a **custom autoregressive Transformer decoder** with RoPE. Stage B reads a *system crop* (all staves of one system, stacked vertically) and emits a token sequence where each note carries a `<staff_idx_N>` marker identifying its staff.
+
+The encoder choice is settled — a per-staff RADIO retrain ran in 2026-05 with a Flat outcome (`onset_f1 = 0.2144`), confirming that *cropping* was the bottleneck rather than the encoder. The model code (`src/models/radio_stage_b.py`) and training infrastructure are wired up; what remains is **retraining RADIO with system-level inputs and the new `<staff_idx_N>` marker convention** (subprojects 2 & 3, pending until Stage A finishes).
+
+### Encoder: C-RADIOv4-H (~700M parameters)
+
+[NVIDIA RADIO](https://github.com/NVlabs/RADIO) (Reduced All-Domain Into One) is a vision foundation encoder distilled from CLIP, DINOv2, SAM, and DFN. C-RADIOv4-H is the Huge variant — designed to give a single encoder competitive performance across dense vision tasks without per-task pretraining.
+
+- **Hidden dim 1280** (vs DaViT's 768).
+- **Patch-16 → 12 × (W/16) feature grid** (vs DaViT's stride-32 → 6 × W/32) — ~4× more memory tokens for cross-attention to consume; the cross-attention has no length cap so this is fine.
+- **Loaded via `torch.hub`** from `NVlabs/RADIO` at construction time (`version="c-radio_v4-h"`).
+- **bf16 autocast** on the forward pass (RADIO's expected path on the 5090); output cast back to caller dtype.
+- **Resolution-snapped input**: RADIO requires HxW divisible by its patch size; the wrapper rounds the input crop to the nearest supported resolution before forward.
+- A **deformable attention layer** (3M params) is added on top for dense-notation handling (clustered accidentals, chords, grace notes).
+
+System crops are grayscale, height up to ~768px (3-4 staves stacked), width preserved up to 2048px.
+
+### Positional bridge
+
+1. **2D sinusoidal positional encoding** added to encoder feature map (separate x/y frequencies for time and pitch position).
 2. **Flatten** in raster-scan order.
-3. **Linear projection** from encoder dim 768 → decoder dim 768 + LayerNorm.
+3. **Linear projection** from encoder dim 1280 → decoder dim 768 + LayerNorm.
 
 ### Decoder: Custom Transformer
 
@@ -74,20 +133,43 @@ Input: grayscale staff crop, height 192px, width preserved up to 2048px. Feature
 | Normalization | RMSNorm (pre-norm) |
 | Activation | SwiGLU |
 | Positional encoding | RoPE (smooth sequence extrapolation) |
-| Max decode length | 512 tokens |
-| Vocabulary | ~487 custom music tokens |
+| Max decode length | 768 tokens (system-level, was 512 per-staff) |
+| Vocabulary | ~495 tokens (487 music + 8 staff-index markers) |
 
-Full cross-attention over encoder output (no windowing needed).
+Full cross-attention over encoder output.
 
-## Token Vocabulary (~487 tokens)
+### DoRA adaptation
+
+All linear layers in both encoder and decoder are adapted with [DoRA](https://arxiv.org/abs/2402.09353) rank-64. DoRA decomposes weight updates into magnitude and direction, outperforming standard LoRA on the same parameter budget.
+
+```python
+adapter_config = {
+    "method": "DoRA",
+    "r": 64,
+    "lora_alpha": 64,
+    "target_modules": [
+        "q_proj", "k_proj", "v_proj", "out_proj",      # Self-attention
+        "gate_proj", "up_proj", "down_proj",            # SwiGLU MLP
+        "cross_attn_q", "cross_attn_k",                 # Cross-attention
+        "cross_attn_v", "cross_attn_out"
+    ],
+    "lora_dropout": 0.10,
+    "bias": "none"
+}
+```
+
+Trained from scratch (not adapted): deformable attention, positional bridge, token embeddings, LM head, decoder norm, pitch contour head, **staff-index marker embeddings**.
+
+## Token vocabulary (~495 tokens)
 
 A custom domain-specific vocabulary. Music-aware encoding achieves ~4× lower error rate than character-level encoding (Alfaro-Contreras et al., WORMS 2023).
 
 | Category | Count | Examples |
 |---|---|---|
 | Structural | 17 | `<bos>`, `<eos>`, `<measure_start>`, `<voice_1>`, `<chord_start>`, `<tuplet_3>` |
-| Pitch | 87 | `note-C4`, `note-F#5`, `note-Bb3`, `rest` (C2–C7, 17 pitch classes per octave) |
-| Grace notes | 35 | `gracenote-C4`, `gracenote-D5` (natural notes only, octaves 2–6) |
+| **Staff-index markers** (new, v2) | 8 | `<staff_idx_0>` … `<staff_idx_7>` |
+| Pitch | 87 | `note-C4`, `note-F#5`, `note-Bb3`, `rest` (C2–C7) |
+| Grace notes | 35 | `gracenote-C4`, `gracenote-D5` |
 | Duration | 9 | `_whole`, `_quarter`, `_sixteenth`, `_dot`, `_double_dot` |
 | Clefs | 7 | `clef-G2`, `clef-F4`, `clef-C3`, `clef-G2_8vb` |
 | Key signatures | 31 | `keySignature-CM`, `keySignature-Am`, `keySignature-none` |
@@ -102,41 +184,28 @@ A custom domain-specific vocabulary. Music-aware encoding achieves ~4× lower er
 
 Enharmonic spellings are kept separate (`C#` vs `Db`) — essential for correct MusicXML output.
 
-### Encoding Example
+### Encoding example (system-level)
+
+A 3-staff system (vocal + piano grand staff) emits tokens like:
 
 ```
-<staff_start> clef-G2 keySignature-DM timeSignature-4/4
+<staff_idx_0> clef-G2 keySignature-DM timeSignature-4/4
 <measure_start>
-  <voice_1> note-F#5 _quarter note-E5 _quarter note-D5 _quarter note-C#5 _quarter
-  <voice_2> <chord_start> note-D4 note-F#4 note-A4 <chord_end> _half
-            <chord_start> note-A3 note-E4 note-G4 <chord_end> _half
+  <voice_1> note-F#5 _quarter note-E5 _quarter ...
 <measure_end>
-<staff_end>
+<staff_idx_1> clef-G2 keySignature-DM
+<measure_start>
+  <voice_1> <chord_start> note-D4 note-F#4 note-A4 <chord_end> _half ...
+<measure_end>
+<staff_idx_2> clef-F4 keySignature-DM
+<measure_start>
+  <voice_1> note-D2 _half note-A2 _half
+<measure_end>
 ```
 
-## DoRA (Weight-Decomposed Low-Rank Adaptation)
+The `<staff_idx_N>` marker is what makes system-level decoding possible: the decoder learns to interleave tokens for multiple staves while keeping each staff's stream coherent.
 
-All linear layers in both encoder and decoder are adapted with [DoRA](https://arxiv.org/abs/2402.09353) rank-64. DoRA decomposes weight updates into magnitude and direction, outperforming standard LoRA.
-
-```python
-adapter_config = {
-    "method": "DoRA",
-    "r": 64,
-    "lora_alpha": 64,           # α/r = 1.0
-    "target_modules": [
-        "q_proj", "k_proj", "v_proj", "out_proj",     # Self-attention
-        "gate_proj", "up_proj", "down_proj",           # SwiGLU MLP
-        "cross_attn_q", "cross_attn_k",                # Cross-attention
-        "cross_attn_v", "cross_attn_out"
-    ],
-    "lora_dropout": 0.10,
-    "bias": "none"
-}
-```
-
-Fully trainable new modules (not adapted — trained from scratch): deformable attention, positional bridge, token embeddings, LM head, decoder norm, pitch contour head.
-
-## Grammar FSA (Constrained Decoding)
+## Grammar FSA (constrained decoding)
 
 A finite-state automaton runs during beam search, producing a binary mask over the vocabulary at each step to enforce structurally valid output.
 
@@ -144,10 +213,11 @@ A finite-state automaton runs during beam search, producing a binary mask over t
 
 | Rule | Description |
 |---|---|
-| Token sequence validity | After `<measure_start>`, only note/rest/chord/voice/attribute tokens. After `<staff_end>`, only `<eos>`. |
-| Beat consistency | Track cumulative duration per measure. Force `<measure_end>` when beats are full. |
-| Chord well-formedness | Between `<chord_start>` and `<chord_end>`, only pitch tokens (duration follows after close). |
+| Token sequence validity | After `<measure_start>`, only note/rest/chord/voice/attribute tokens. After `<staff_end>`, only `<eos>` or another `<staff_idx_N>`. |
+| Beat consistency | Track cumulative duration per measure per staff. Force `<measure_end>` when beats are full. |
+| Chord well-formedness | Between `<chord_start>` and `<chord_end>`, only pitch tokens. |
 | Voice consistency | Voice tokens must alternate properly with explicit voice switching. |
+| Staff index validity | `<staff_idx_N>` must reference a staff present in the current system (`N < staves_in_system`). |
 
 **Soft constraints (logit penalties):**
 
@@ -156,58 +226,26 @@ A finite-state automaton runs during beam search, producing a binary mask over t
 | Pitch range plausibility | -5.0 | Pitches outside normal range for current clef. |
 | Accidental propagation | -3.0 | Contradicting accidentals within a measure. |
 | Measure balance | -2.5 × diff | Penalizes `<measure_end>` when beats don't sum correctly. |
-| CV note count prior | -3.0 per excess | Penalizes note emissions exceeding computer vision detection count. |
-| CV pitch prior | -0.45 to -4.5 | Multi-tiered penalty for pitch disagreement with CV detection (self-disabling if CV unreliable). |
+| CV note count prior | -3.0 per excess | Penalizes note emissions exceeding computer-vision detection count. |
+| CV pitch prior | -0.45 to -4.5 | Multi-tiered penalty for pitch disagreement with CV detection. |
 
-## Datasets
-
-| # | Dataset | Size | Purpose |
-|---|---|---|---|
-| 1 | **PrIMuS** | 87,678 incipits | Stage 1 — monophonic glyph→token mapping |
-| 2 | **Camera-PrIMuS** | 87,678 incipits | Mixed into Stage 1 at 30% for scan robustness |
-| 3 | **GrandStaff** | ~8,000 samples | Stage 2 — polyphonic piano grand staff pairs |
-| 4 | **OpenScore Lieder** | ~1,200 pieces | Stage 3 + primary evaluation set |
-| 5 | **Synthetic Full-Page** | ~20,000 pages (~120K staff crops) | Stage 3 — orchestral, chamber, all complexity levels |
-
-Synthetic data is generated from MusicXML sources (MuseScore corpus, IMSLP public domain) rendered via Verovio with 3 different visual configs per score.
-
-**Target distribution for synthetic data:**
-- 40% piano solo and piano+voice
-- 25% orchestral full scores (10-20+ staves)
-- 20% chamber music (2-5 instruments)
-- 10% choral (SATB + piano)
-- 5% solo instrument + piano accompaniment
-
-
-### Loss Function
+## Loss function
 
 - **Primary:** Token-level cross-entropy with label smoothing (ε=0.05)
 - **Auxiliary:** Pitch contour consistency (λ=0.1) — a 2-layer MLP (768→128→3) predicting pitch direction (up/down/same) between adjacent notes, providing gradient signal to the encoder-decoder interface
 
 **Total loss:** L = L_CE + 0.1 · L_contour
 
-### Training Stability
+## Training stability
 
-- BF16 mixed precision
+- BF16 mixed precision (Stage B); AMP for YOLO
 - Gradient clipping at max norm 1.0
+- `--nan-guard` (Stage A): zeroes individual NaN/Inf gradients per batch
 - Checkpoint every 1,000 steps
 - Validation every 500 steps on held-out 5% split
 - Gradient norm monitoring per module group
 
-### Total Training Budget
-
-| Component | Time |
-|---|---|
-| Synthetic data generation | ~4 hours (CPU) |
-| YOLO training | ~2 hours |
-| Stage 1: Monophonic (15 epochs) | ~6 hours |
-| Stage 2: Polyphonic (30 epochs) | ~6 hours |
-| Stage 3: Full complexity (20 epochs) | ~16 hours |
-| Evaluation | ~4 hours |
-
-## Data Augmentation
-
-Only augmentations simulating realistic variations of clean printed scores:
+## Data augmentation
 
 | Augmentation | Parameters | Probability | Purpose |
 |---|---|---|---|
@@ -219,59 +257,68 @@ Only augmentations simulating realistic variations of clean printed scores:
 | Resolution downsample | 85–100% + resize | 25% | Low-DPI simulation |
 | Salt-and-pepper noise | 0.1–0.25% of pixels | 30% | Minor scan artifacts |
 
-Applied online during training (not pre-generated).
+Applied online during training (not pre-generated). Stage A uses an additional scan-noise + page-curvature pipeline (GridDistortion, ElasticTransform) ramping up over `--noise-warmup-steps`.
 
 ## Evaluation
 
 ### Metrics
 
 - **Symbol Error Rate (SER):** Edit distance between predicted and ground-truth token sequences, normalized by ground-truth length.
-- **Pitch accuracy:** % of notes with correct pitch (ignoring duration).
-- **Rhythm accuracy:** % of notes with correct duration (ignoring pitch).
-- **Key/time signature accuracy:** Exact-match rate.
-- **Structural F1:** F1 on barlines, measure boundaries, voice assignments.
-- **Musical similarity:** Note-level precision, recall, F1 using [mir_eval](https://github.com/mir-evaluation/mir_eval) transcription metrics (onset_tolerance=50ms, pitch_tolerance=50 cents).
+- **Onset F1 (mir_eval):** Note-level precision/recall/F1 (onset_tolerance=50ms, pitch_tolerance=50 cents).
+- **Pitch / rhythm accuracy:** Per-note correctness rates.
+- **Key/time signature accuracy:** Exact-match.
+- **Structural F1:** Barlines, measure boundaries, voice assignments.
+- **Stratified by `staves_in_system`** (1, 2, 3, 4+) — checks system-level model holds up at increasing staff counts.
 
-## Repository Structure
+### Decision gates
+
+| Outcome | Mean lieder onset_f1 | Action |
+|---|---|---|
+| Strong | ≥ 0.30 | Ship: PR, write-up, follow-ups for full-quality decode + HF release prep |
+| Mixed | 0.241 ≤ x < 0.30 | Beats DaViT baseline but not transformative; investigate residual error before next major iteration |
+| Flat / regressed | < 0.241 | System-level approach also failed; pivot to classical pipeline (Audiveris-style) |
+
+## Repository structure
 
 ```
 ├── configs/                          # Training YAML configs
 │   ├── splits.yaml                   # Train/val/test split definitions
 │   ├── train_stage1.yaml             # Stage 1 monophonic config
 │   ├── train_stage2.yaml             # Stage 2 polyphonic config
-│   ├── train_stage3.yaml             # Stage 3 full complexity config
-│   └── train_stage2_*.yaml           # Stage 2 variants (rank-64, repair, finetune)
+│   └── train_stage3.yaml             # Stage 3 full complexity config
 │
 ├── src/
+│   ├── data/
+│   │   ├── generate_synthetic.py     # Synthetic data generation + v15 system-bbox derivation
+│   │   ├── derive_systems_from_staves.py  # Spatial heuristic for AudioLabs (real scans)
+│   │   ├── bracket_detector.py       # Visual first-barline detection (real scans)
+│   │   ├── multi_dpi.py              # Verovio rendering at multiple DPIs
+│   │   ├── convert_tokens.py         # MusicXML ↔ token sequence conversion
+│   │   ├── index.py                  # Dataset indexing and manifest building
+│   │   └── filter_low_ink_samples.py # Filter out low-quality training samples
+│   │
 │   ├── models/
-│   │   ├── davit_stage_b.py          # DaViT encoder + RoPE decoder architecture
-│   │   ├── florence_stage_b.py       # Florence-2 (deprecated, kept for reference)
-│   │   └── yolo_stage_a.py           # YOLOv8 staff detection wrapper
+│   │   ├── radio_stage_b.py          # C-RADIOv4-H encoder + RoPE decoder architecture (current)
+│   │   ├── davit_stage_b.py          # DaViT encoder (decoder/contour-head reused by RADIO module)
+│   │   └── yolo_stage_a.py           # YOLO26m system-detection wrapper
 │   │
 │   ├── train/
 │   │   ├── train.py                  # Main training loop + DoRA setup
 │   │   ├── train_yolo_stage_a.py     # YOLO fine-tuning script
+│   │   ├── scan_aug.py               # Scan-noise + page-curvature augmentation
 │   │   ├── model_factory.py          # Model instantiation + checkpoint loading
-│   │   ├── build_focus_manifest.py   # Build focused training manifests
-│   │   ├── check_training_data.py    # Data validation utilities
 │   │   ├── monitor_training.py       # Training progress monitoring
 │   │   └── monitor_dashboard.py      # Training dashboard
 │   │
 │   ├── tokenizer/
-│   │   └── vocab.py                  # 487-token music vocabulary definition
+│   │   └── vocab.py                  # 495-token music + staff-marker vocabulary
 │   │
 │   ├── decoding/
 │   │   ├── grammar_fsa.py            # Grammar FSA for constrained decoding
 │   │   └── beam_search.py            # Beam search with FSA integration
 │   │
-│   ├── data/
-│   │   ├── generate_synthetic.py     # Synthetic data generation pipeline
-│   │   ├── convert_tokens.py         # MusicXML ↔ token sequence conversion
-│   │   ├── index.py                  # Dataset indexing and manifest building
-│   │   └── filter_low_ink_samples.py # Filter out low-quality training samples
-│   │
 │   ├── pipeline/
-│   │   ├── assemble_score.py         # Cross-staff assembly (Stage C)
+│   │   ├── assemble_score.py         # Cross-system assembly (Stage C)
 │   │   └── export_musicxml.py        # Token → music21 → MusicXML (Stage D)
 │   │
 │   ├── eval/
@@ -279,23 +326,32 @@ Applied online during training (not pre-generated).
 │   │   ├── compare_musicxml.py       # MusicXML comparison (mir_eval metrics)
 │   │   ├── metrics.py                # Training metrics computation
 │   │   ├── run_eval.py               # Batch evaluation runner
-│   │   ├── tune_penalties.py         # Grammar penalty tuning
-│   │   └── summarize_stage_b_failures.py   # Error analysis
+│   │   └── tune_penalties.py         # Grammar penalty tuning
 │   │
-│   ├── cv/
-│   │   ├── staff_analyzer.py         # Staff line detection and analysis
-│   │   └── priors.py                 # Visual priors for notation
-│   │
-│   ├── pdf_to_musicxml.py            # End-to-end pipeline orchestrator
-│   └── cli.py                        # CLI argument parsing
+│   └── pdf_to_musicxml.py            # End-to-end pipeline orchestrator
+│
+├── scripts/
+│   ├── train_yolo.py                 # Stage A training entry point
+│   ├── build_mixed_v2_systems.py     # Build mixed_systems_v1 dataset
+│   ├── derive_audiolabs_systems.py   # Real-scan system-label derivation
+│   ├── derive_sparse_augment_systems.py  # sparse_augment system-label derivation (v15)
+│   ├── rederive_synthetic_v2_systems.py  # Fast synthetic relabeling without re-render
+│   ├── verify_v15_labels.py          # Validate production labels against v15 reference
+│   └── visualize_audiolabs_systems.py    # Spot-check overlay generator
+│
+├── tests/
+│   └── data/
+│       ├── test_build_system_yolo_objects_v15.py   # v15 algorithm unit tests
+│       ├── test_generate_synthetic_systems.py      # Older system-builder tests
+│       ├── test_derive_systems_from_staves.py      # Spatial-heuristic tests
+│       └── test_bracket_detector.py                # Bracket-detector tests
 │
 ├── docs/
 │   ├── omr-final-plan.md             # Full architecture design document
 │   ├── TRAINING_COMMANDS.md          # Training command reference
 │   └── TRAINING_COMMANDS_UBUNTU.md   # Ubuntu-specific training setup
 │
-├── analyze_data.py                   # Dataset analysis utilities
-└── requirements.txt                  # Python dependencies
+└── requirements.txt
 ```
 
 ## Installation
@@ -303,73 +359,83 @@ Applied online during training (not pre-generated).
 ### Prerequisites
 
 - Python 3.10+
-- CUDA-capable GPU (H100/A100 recommended, any GPU with 48+ GB VRAM works)
+- CUDA-capable GPU (5090 / H100 / A100; 48+ GB VRAM recommended for Stage B)
 - PyTorch with CUDA
 
 ### Setup
 
 ```bash
-git clone https://github.com/clquwu/Clarity-OMR-Train.git
-cd Clarity-OMR-Train
+git clone https://github.com/weselyj/Clarity-OMR-Train-RADIO.git
+cd Clarity-OMR-Train-RADIO
 
-# Production setup (Windows): run scripts/setup_venv_cu132.ps1 — pulls torch nightly cu132,
-# cuDNN 9.21.01, project deps, and drops the sitecustomize for DLL path resolution.
+# Production setup (Windows): scripts/setup_venv_cu132.ps1 pulls torch nightly cu132,
+# cuDNN 9.21.01, project deps, and the sitecustomize for DLL path resolution.
 
-# Manual cu132 install (if not on Windows or scripting fails):
+# Manual cu132 install (non-Windows or scripting fails):
 pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu132
 
 # Rollback / reproducibility (cu128, kept on disk as venv/):
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### Data Preparation
+### Data preparation
 
-1. Download datasets:
-   - [PrIMuS](https://grfia.dlsi.ua.es/primus/) — place in `data/primus/`
-   - [Camera-PrIMuS](https://grfia.dlsi.ua.es/primus/) — place in `data/camera-primus/`
-   - [GrandStaff](https://github.com/multiscore/GrandStaff) — place in `data/grandstaff/`
-   - [OpenScore Lieder](https://github.com/OpenScore/Lieder) — place in `data/openscore-lieder/`
+1. **Download source datasets:**
+   - [PrIMuS](https://grfia.dlsi.ua.es/primus/) → `data/primus/`
+   - [Camera-PrIMuS](https://grfia.dlsi.ua.es/primus/) → `data/camera-primus/`
+   - [GrandStaff](https://github.com/multiscore/GrandStaff) → `data/grandstaff/`
+   - [OpenScore Lieder](https://github.com/OpenScore/Lieder) → `data/openscore-lieder/`
 
-2. Generate synthetic data:
+2. **Render synthetic_v2 from MusicXML** (Verovio + ImageMagick):
    ```bash
-   python src/data/generate_synthetic.py --output data/synthetic/ --num-pages 20000
+   python src/data/generate_synthetic.py \
+     --output data/processed/synthetic_v2/ \
+     --num-pages 7000
+   ```
+   Produces SVGs, PNGs at multiple DPIs, per-staff labels, and v15 system-level labels.
+
+3. **Derive system labels for sparse_augment and AudioLabs:**
+   ```bash
+   python scripts/derive_sparse_augment_systems.py \
+     --pages-dir data/processed/sparse_augment/pages
+   python scripts/derive_audiolabs_systems.py
    ```
 
-3. Build dataset index:
+4. **Build the mixed Stage A dataset:**
    ```bash
-   python src/data/index.py --data-root data/ --output data/manifest.jsonl
+   python scripts/build_mixed_v2_systems.py
    ```
+   Produces `data/processed/mixed_systems_v1/{train,val}/{images,labels}/` plus `data.yaml` and `audit.json`.
 
 ## Training
 
-### Stage 1 — Monophonic
+### Stage A — System-level YOLO
 
 ```bash
-python src/train/train.py --config configs/train_stage1.yaml
+python scripts/train_yolo.py \
+  --model yolo26m.pt \
+  --data data/processed/mixed_systems_v1/data.yaml \
+  --epochs 100 --imgsz 1920 --batch 4 --workers 6 \
+  --amp --nan-guard --noise --noise-warmup-steps 2000 \
+  --project runs/detect/runs --name yolo26m_systems --patience 30
 ```
 
-### Stage 2 — Polyphonic
+~10–12h on a 5090. Gate: val mAP50 ≥ 0.95.
+
+### Stage B — System-level RADIO (subprojects 2 & 3)
 
 ```bash
-python src/train/train.py --config configs/train_stage2.yaml --resume checkpoints/stage1_best.pt
+# Stage 2 — vocab extension warmup on grandstaff
+python src/train/train.py --config configs/train_stage2.yaml
+
+# Stage 3 — full complexity on system crops
+python src/train/train.py --config configs/train_stage3.yaml \
+  --resume checkpoints/stage2_best.pt
 ```
 
-### Stage 3 — Full Complexity
-
-```bash
-python src/train/train.py --config configs/train_stage3.yaml --resume checkpoints/stage2_best.pt
-```
-
-### YOLO (Stage A)
-
-```bash
-python src/train/train_yolo_stage_a.py
-```
-
-See `docs/TRAINING_COMMANDS.md` for detailed training commands and options.
+See `docs/TRAINING_COMMANDS.md` for detailed commands and options.
 
 ## Evaluation
 
@@ -381,17 +447,15 @@ python src/eval/evaluate_stage_b_checkpoint.py --checkpoint checkpoints/stage3_b
 python src/eval/compare_musicxml.py ground_truth.musicxml predicted.musicxml
 ```
 
-## Architecture Design Rationale
+## Architecture rationale (selected)
 
-The full architecture decision record, including evidence-based justification for every design choice. 
-
-Key decisions:
-
-- **DaViT + custom decoder over Florence-2 fine-tuning:** General-purpose VLMs fail entirely at OMR transcription (Calvo-Zaragoza et al., WORMS 2024). Florence-2's 51K NL tokenizer conflicts with our 487-token music vocabulary. The SMT/SMIReT architecture (5.92% SER) validates the encoder + task-specific decoder pattern.
-- **Custom 487-token vocabulary over sub-word tokenization:** Music-aware encoding achieves 16.4% CER vs 62.3% character-level and 39.7% learned sub-word (Alfaro-Contreras et al., WORMS 2023).
+- **System-level over per-staff inputs:** Per-staff inference can't recover cross-staff coordination (ties spanning systems, voice-piano alignment). Confirmed empirically — a clean per-staff retrain in 2026-05 produced cleaner per-staff outputs (Stage D unknown_tokens dropped 8 → 1) but didn't move `onset_f1`. System-level is the architectural fix.
+- **C-RADIOv4-H + custom decoder over Florence-2 fine-tuning:** General-purpose VLMs fail entirely at OMR transcription (Calvo-Zaragoza et al., WORMS 2024). Florence-2's 51K NL tokenizer conflicts with our 495-token music vocabulary. The SMT/SMIReT architecture (5.92% SER) validates the encoder + task-specific decoder pattern. RADIO was selected over the original DaViT for richer features (~700M params, hidden 1280) — the per-staff retrain confirmed cropping (not encoder capacity) was the bottleneck, motivating the move to system-level inputs.
+- **Custom 495-token vocabulary over sub-word tokenization:** Music-aware encoding achieves 16.4% CER vs 62.3% character-level and 39.7% learned sub-word (Alfaro-Contreras et al., WORMS 2023).
 - **Grammar FSA over statistical language models:** Statistical LMs cannot enforce structural constraints like beat consistency (Torras et al., WORMS 2022).
-- **RoPE over learned positional embeddings:** Smooth extrapolation beyond training sequence length for unusually dense staves.
+- **RoPE over learned positional embeddings:** Smooth extrapolation beyond training sequence length for unusually dense systems.
 - **DoRA rank-64 over standard LoRA:** Weight-decomposed adaptation outperforms standard LoRA on fine-tuning benchmarks.
+- **SVG-tree label derivation over Verovio bounding-box rect:** Verovio's bounding-box rect is occasionally undersized (the trailing brace fails to encompass its bottom staff); the SVG element tree is structurally correct in all cases. Verified across 15 rounds of overlay review on 50+ pages.
 
 ## References
 

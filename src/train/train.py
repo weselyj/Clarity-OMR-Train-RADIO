@@ -909,7 +909,8 @@ def _build_optimizer(model, stage: StageTrainingConfig):
         )
     if not param_groups:
         raise RuntimeError("No trainable parameters found for optimizer setup.")
-    return torch.optim.AdamW(param_groups)
+    fused = bool(torch.cuda.is_available())
+    return torch.optim.AdamW(param_groups, fused=fused)
 
 
 def _build_scheduler(optimizer, stage: StageTrainingConfig, total_steps: int):
@@ -1237,6 +1238,7 @@ def _save_checkpoint(
     stage_steps_total: Optional[int] = None,
     stage_b_config: Optional[Dict[str, object]] = None,
     name_suffix: Optional[str] = None,
+    best_val_loss: Optional[float] = None,
 ) -> Path:
     import torch
 
@@ -1254,6 +1256,7 @@ def _save_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "stage_b_config": stage_b_config,
+        "best_val_loss": best_val_loss,
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
@@ -1435,6 +1438,138 @@ def _expand_lora_rank_tensors_for_resume(
     return expanded_state, notes
 
 
+def _extend_vocab_tensors_for_resume(
+    state_dict: Dict[str, object],
+    model_state: Dict[str, object],
+    init_seed: int = 0,
+) -> Tuple[Dict[str, object], List[str]]:
+    """Pad vocab-shaped tensors with new rows when checkpoint vocab < target vocab.
+
+    Handles both plain and PEFT/DoRA-wrapped names.  Any key in the live model that contains
+    ``"token_embedding"`` or ``"lm_head"`` as a substring is a candidate.  Examples:
+
+    * Plain:        ``token_embedding.weight``, ``lm_head.weight``, ``lm_head.bias``
+    * PEFT-wrapped: ``base_model.model.token_embedding.original_module.weight``,
+                    ``base_model.model.token_embedding.modules_to_save.default.weight``,
+                    ``base_model.model.lm_head.original_module.weight``, … (6 keys total)
+
+    Padding init: weight rows = mean(existing rows) + N(0, 0.01); bias entries = 0.
+    Caller is responsible for weight tying — if ``lm_head.weight is token_embedding.weight``
+    in the live model, ``model.load_state_dict`` will preserve the tie.
+    """
+    import torch
+
+    expanded_state = dict(state_dict)
+    notes: List[str] = []
+    g = torch.Generator()
+    g.manual_seed(int(init_seed))
+    # Track already-extended tensors by source object identity to handle weight tying.
+    # When lm_head.weight is the same tensor object as token_embedding.weight, reuse
+    # the already-computed extended result so tied weights remain identical after padding.
+    extended_by_id: Dict[int, object] = {}
+
+    _VOCAB_SUBSTRINGS = ("token_embedding", "lm_head")
+
+    # Iterate ALL keys in the live model that look like vocab-shaped layers.
+    # The checkpoint is expected to have the exact same key (PEFT wraps both consistently).
+    for model_key in model_state:
+        if not any(sub in model_key for sub in _VOCAB_SUBSTRINGS):
+            continue
+        # The checkpoint must contain an identically named key.
+        if model_key not in state_dict:
+            continue
+
+        ckpt_key = model_key
+        source_value = state_dict[ckpt_key]
+        target_value = model_state[model_key]
+        if not isinstance(source_value, torch.Tensor) or not isinstance(target_value, torch.Tensor):
+            continue
+        source_shape = tuple(int(d) for d in source_value.shape)
+        target_shape = tuple(int(d) for d in target_value.shape)
+        if source_shape == target_shape:
+            continue
+
+        # Validate diff: target = source with N extra rows at the end (axis 0), every other axis equal.
+        if len(source_shape) != len(target_shape):
+            raise ValueError(f"only +N rows at end of axis 0 supported; got rank diff for {ckpt_key}")
+        if any(s != t for s, t in zip(source_shape[1:], target_shape[1:])):
+            raise ValueError(
+                f"only +N rows at end of axis 0 supported; non-axis-0 dims differ for {ckpt_key}: {source_shape} -> {target_shape}"
+            )
+        if target_shape[0] <= source_shape[0]:
+            raise ValueError(
+                f"only +N rows at end of axis 0 supported; target rows not greater than source for {ckpt_key}"
+            )
+        n_new = target_shape[0] - source_shape[0]
+
+        # Reuse previously computed extension if this is a tied tensor (same object).
+        src_id = id(source_value)
+        if src_id in extended_by_id:
+            expanded_state[ckpt_key] = extended_by_id[src_id]
+            notes.append(f"{ckpt_key}: extended vocab dim 0 from {source_shape[0]} to {target_shape[0]} (tied)")
+            continue
+
+        if ckpt_key.endswith("bias"):
+            new_rows = torch.zeros(n_new, dtype=source_value.dtype)
+        else:
+            mean_row = source_value.mean(dim=0, keepdim=True)
+            noise = torch.randn(n_new, source_shape[1], generator=g, dtype=source_value.dtype) * 0.01
+            new_rows = mean_row.expand(n_new, source_shape[1]) + noise
+
+        extended = torch.cat([source_value, new_rows.to(device=source_value.device, dtype=source_value.dtype)], dim=0)
+        expanded_state[ckpt_key] = extended
+        extended_by_id[src_id] = extended
+        notes.append(f"{ckpt_key}: extended vocab dim 0 from {source_shape[0]} to {target_shape[0]}")
+
+    return expanded_state, notes
+
+
+def _step_window_corrupted(prior: "torch.Tensor", loss: "torch.Tensor") -> "torch.Tensor":
+    """OR-accumulate non-finite-loss flag across an accumulation window.
+
+    Returns a torch.bool tensor that is True if `prior` was True OR if `loss`
+    is non-finite. Does NOT call .item() — caller decides when to sync at
+    the opt-step boundary.
+
+    This replaces the per-micro-batch `not bool(torch.isfinite(loss).item())`
+    pattern that was forcing a CPU<>GPU sync 8x per opt-step at
+    grad_accumulation_steps=8, defeating CPU runahead before the backward pass.
+    """
+    import torch
+    is_nonfinite = ~torch.isfinite(loss).all()
+    return prior | is_nonfinite.to(prior.device)
+
+
+def _should_skip_backward_on_corrupt(loss: "torch.Tensor") -> bool:
+    """Return True if loss is non-finite and backward() should be skipped.
+
+    This is a per-micro-batch early-exit check that avoids running
+    backward() through NaN/Inf loss values, which can corrupt the gradient
+    state for subsequent micro-batches in the same accumulation window and
+    may trigger CUDA errors on certain architectures.
+
+    The accumulation-window corruption flag (_step_window_corrupted) must
+    still be updated BEFORE this check is consulted, so the boundary logic
+    correctly discards the window even when backward() was skipped.
+    """
+    import torch
+    return not bool(torch.isfinite(loss).all().item())
+
+
+def _apply_cuda_perf_toggles() -> None:
+    """Enable cuDNN auto-tuner and TF32 matmuls when CUDA is available.
+
+    Static input shape (250x2500) makes cudnn.benchmark a free 2-5% win.
+    set_float32_matmul_precision('high') routes any fp32 matmul fallback
+    (e.g. CE-loss reduce) through TF32; bf16 forward path is unaffected.
+    """
+    import torch
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+
 def run_execute_mode(
     stages: Sequence[StageTrainingConfig],
     grouped_entries: Dict[Tuple[str, str], List[Dict[str, object]]],
@@ -1534,6 +1669,8 @@ def run_execute_mode(
             torch.cuda.get_device_properties(0)
         except Exception:
             use_cuda = False
+    if use_cuda:
+        _apply_cuda_perf_toggles()
     device = torch.device("cuda" if use_cuda else "cpu")
     if channels_last:
         # Move weights to channels_last memory format before any forward pass.
@@ -1551,6 +1688,7 @@ def run_execute_mode(
     resume_stage_name: Optional[str] = None
     resume_optimizer_state = None
     resume_scheduler_state = None
+    resume_best_val_loss: Optional[float] = None
     global_step = 0
     if resume_checkpoint is not None:
         checkpoint_payload = resume_payload
@@ -1580,6 +1718,18 @@ def run_execute_mode(
                     f"{checkpoint_rank} -> {target_rank}.",
                     file=sys.stderr,
                 )
+        # Vocab extension: pad embedding/lm_head when target vocab > checkpoint vocab.
+        # Required when adding new tokens (e.g., <staff_idx_N>) at the end of the vocabulary.
+        model_state, vocab_extension_notes = _extend_vocab_tensors_for_resume(
+            model_state,
+            model.state_dict(),
+            init_seed=int(seed),
+        )
+        if vocab_extension_notes:
+            print(
+                f"[train] extended {len(vocab_extension_notes)} vocab tensors for resume.",
+                file=sys.stderr,
+            )
         load_result = model.load_state_dict(model_state, strict=False)
         missing_keys = set(load_result.missing_keys)
         unexpected_keys = set(load_result.unexpected_keys)
@@ -1593,8 +1743,23 @@ def run_execute_mode(
             "base_model.model.ctc_head.modules_to_save.default.weight",
             "base_model.model.ctc_head.modules_to_save.default.bias",
         }
+
+        def _is_compile_wrapper_duplicate(key: str) -> bool:
+            # When a checkpoint is saved while torch.compile wraps a module,
+            # the state_dict can contain both the unwrapped key (e.g.
+            # 'positional_bridge.modules_to_save.default.norm.bias') and a
+            # compile-wrapped duplicate ('positional_bridge._orig_mod.<rest>').
+            # Resume happens BEFORE compile is re-applied, so the live
+            # uncompiled model accepts the unwrapped key and load_state_dict
+            # reports the wrapped duplicate as 'unexpected'. The duplicate is
+            # benign: the actual weights were loaded via the unwrapped key.
+            return "._orig_mod." in key
+
         disallowed_missing = sorted(key for key in missing_keys if key not in allowed_ctc_keys)
-        disallowed_unexpected = sorted(key for key in unexpected_keys if key not in allowed_ctc_keys)
+        disallowed_unexpected = sorted(
+            key for key in unexpected_keys
+            if key not in allowed_ctc_keys and not _is_compile_wrapper_duplicate(key)
+        )
         if disallowed_missing or disallowed_unexpected:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
@@ -1609,6 +1774,10 @@ def run_execute_mode(
         resume_stage_name = str(checkpoint_payload.get("stage_name") or "")
         resume_optimizer_state = checkpoint_payload.get("optimizer_state_dict")
         resume_scheduler_state = checkpoint_payload.get("scheduler_state_dict")
+        # Restore best_val_loss so that resume does not unconditionally overwrite
+        # _best.pt on the first validation pass.  Fall back to None for checkpoints
+        # saved before this fix (backward compat).
+        resume_best_val_loss: Optional[float] = checkpoint_payload.get("best_val_loss", None)
         print(
             f"[train] resuming from checkpoint: {resume_checkpoint} "
             f"(global_step={global_step}, stage='{resume_stage_name}')",
@@ -1825,7 +1994,10 @@ def run_execute_mode(
             losses: List[float] = []
             non_finite_events = 0
             stage_grad_alerts = 0
-            best_val_loss: Optional[float] = None
+            # On resume, restore best_val_loss from the checkpoint so we don't
+            # unconditionally overwrite _best.pt on the first validation pass.
+            # For new runs (or checkpoints pre-dating this fix) this is None.
+            best_val_loss: Optional[float] = resume_best_val_loss if resumed_stage else None
             best_val_step: Optional[int] = None
 
             # Build a DataLoader for this stage's training set.
@@ -1953,7 +2125,7 @@ def run_execute_mode(
                 is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
                 if (stage_step - 1) % accum_steps == 0:
                     optimizer.zero_grad(set_to_none=True)
-                    accum_window_corrupted = False
+                    accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
                 with timer.gpu("forward"):
                     with torch.autocast(
                         device_type=device.type,
@@ -1972,30 +2144,39 @@ def run_execute_mode(
                         if accum_steps > 1:
                             loss = loss / accum_steps
 
-                non_finite_loss = not bool(torch.isfinite(loss).item())
-                if non_finite_loss:
-                    non_finite_events += 1
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_window_corrupted = True
-                    timer.micro_batch_done()
-                    continue
+                # On-device OR-accumulator: no sync. Boundary-only sync below.
+                # Update BEFORE the early-skip check so the corruption flag is
+                # always set even when backward() is skipped for this micro-batch.
+                accum_corruption = _step_window_corrupted(accum_corruption, loss)
 
-                if accum_window_corrupted:
-                    # Prior micro-batch in this window had non-finite loss;
-                    # skip remaining backward passes to avoid wrong gradient scale.
-                    if is_accum_step:
-                        optimizer.zero_grad(set_to_none=True)
-                    timer.micro_batch_done()
-                    continue
-
-                with timer.gpu("backward"):
-                    loss.backward()
+                # Early skip: if this micro-batch's loss is non-finite, do NOT
+                # call backward() — it would propagate NaN/Inf gradients into
+                # subsequent micro-batches in the window, wasting GPU time and
+                # risking CUDA errors on some architectures.  The boundary logic
+                # below discards the whole window via accum_corruption.
+                if _should_skip_backward_on_corrupt(loss):
+                    if not is_accum_step:
+                        timer.micro_batch_done()
+                        continue
+                else:
+                    with timer.gpu("backward"):
+                        loss.backward()
 
                 if not is_accum_step:
                     # Single CPU sync per micro-batch; cache the python float so any
                     # downstream consumer reads from CPU memory rather than re-syncing.
                     _loss_scalar_cache = loss.detach().item() * accum_steps
                     losses.append(_loss_scalar_cache)
+                    timer.micro_batch_done()
+                    continue
+
+                # Opt-step boundary: ONE sync to check whether any micro-batch in
+                # this window had a non-finite loss. If so, throw out accumulated
+                # gradients and skip the optimizer step.
+                window_was_corrupted = bool(accum_corruption.item())
+                if window_was_corrupted:
+                    non_finite_events += 1
+                    optimizer.zero_grad(set_to_none=True)
                     timer.micro_batch_done()
                     continue
 
@@ -2093,6 +2274,7 @@ def run_execute_mode(
                                         stage_steps_total=stage_total_steps,
                                         stage_b_config=stage_b_config_dict,
                                         name_suffix="best",
+                                        best_val_loss=best_val_loss,
                                     )
 
                 _checkpoint_ms: Optional[float] = None
@@ -2109,6 +2291,7 @@ def run_execute_mode(
                         stage_step=stage_step,
                         stage_steps_total=stage_total_steps,
                         stage_b_config=stage_b_config_dict,
+                        best_val_loss=best_val_loss,
                     )
                     checkpoints_written.append(str(checkpoint_path))
                     _checkpoint_ms = (_time.perf_counter() - _ckpt_t0) * 1000.0
@@ -2157,7 +2340,10 @@ def run_execute_mode(
                             "grad_alerts": grad_alert_messages,
                             "batch_size": int(images.shape[0]),
                             "max_sequence_length": stage.max_sequence_length,
-                            "non_finite_loss": non_finite_loss,
+                            # window_was_corrupted is always False on the JSONL-write
+                            # path (corrupted windows continue earlier at the opt-step
+                            # boundary check). Keep the field for log-schema continuity.
+                            "non_finite_loss": window_was_corrupted,
                             "non_finite_grad": non_finite_grad,
                             "bf16_enabled": bf16_enabled,
                             "validation": validation_result,
@@ -2199,6 +2385,7 @@ def run_execute_mode(
                     stage_steps_total=stage_total_steps,
                     stage_b_config=stage_b_config_dict,
                     name_suffix="final",
+                    best_val_loss=best_val_loss,
                 )
                 checkpoints_written.append(str(final_path))
 

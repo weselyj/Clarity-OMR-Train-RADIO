@@ -1,0 +1,154 @@
+{
+  "dataset_name": "mixed_systems_v1",
+  "build_seed": 20260502,
+  "val_ratio": 0.2,
+  "elapsed_seconds": 24.8,
+  "n_train_pairs": 20594,
+  "n_val_pairs": 5142,
+  "n_total_pairs": 25736,
+  "data_yaml": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\mixed_systems_v1\\data.yaml",
+  "data_yaml_contents": {
+    "names": [
+      "system"
+    ],
+    "nc": 1,
+    "path": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\mixed_systems_v1",
+    "train": "train/images",
+    "val": "val/images"
+  },
+  "per_source": {
+    "syn_dpi94_bravura_compact": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi94\\bravura-compact",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\bravura-compact",
+      "n_images": 2472,
+      "n_labels": 2514,
+      "n_paired": 2458
+    },
+    "syn_dpi94_gootville_wide": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi94\\gootville-wide",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\gootville-wide",
+      "n_images": 2231,
+      "n_labels": 2251,
+      "n_paired": 2206
+    },
+    "syn_dpi94_leipzig_default": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi94\\leipzig-default",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\leipzig-default",
+      "n_images": 2344,
+      "n_labels": 2387,
+      "n_paired": 2331
+    },
+    "syn_dpi150_bravura_compact": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi150\\bravura-compact",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\bravura-compact",
+      "n_images": 2466,
+      "n_labels": 2514,
+      "n_paired": 2452
+    },
+    "syn_dpi150_gootville_wide": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi150\\gootville-wide",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\gootville-wide",
+      "n_images": 2227,
+      "n_labels": 2251,
+      "n_paired": 2202
+    },
+    "syn_dpi150_leipzig_default": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi150\\leipzig-default",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\leipzig-default",
+      "n_images": 2338,
+      "n_labels": 2387,
+      "n_paired": 2325
+    },
+    "syn_dpi300_bravura_compact": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi300\\bravura-compact",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\bravura-compact",
+      "n_images": 2466,
+      "n_labels": 2514,
+      "n_paired": 2452
+    },
+    "syn_dpi300_gootville_wide": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi300\\gootville-wide",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\gootville-wide",
+      "n_images": 2227,
+      "n_labels": 2251,
+      "n_paired": 2202
+    },
+    "syn_dpi300_leipzig_default": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\images\\dpi300\\leipzig-default",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\synthetic_v2\\labels_systems\\leipzig-default",
+      "n_images": 2338,
+      "n_labels": 2387,
+      "n_paired": 2325
+    },
+    "aug_dpi94_bravura_compact": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi94\\bravura-compact",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\bravura-compact",
+      "n_images": 461,
+      "n_labels": 460,
+      "n_paired": 460
+    },
+    "aug_dpi94_gootville_wide": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi94\\gootville-wide",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\gootville-wide",
+      "n_images": 403,
+      "n_labels": 401,
+      "n_paired": 401
+    },
+    "aug_dpi94_leipzig_default": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi94\\leipzig-default",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\leipzig-default",
+      "n_images": 430,
+      "n_labels": 427,
+      "n_paired": 427
+    },
+    "aug_dpi150_bravura_compact": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi150\\bravura-compact",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\bravura-compact",
+      "n_images": 461,
+      "n_labels": 460,
+      "n_paired": 460
+    },
+    "aug_dpi150_gootville_wide": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi150\\gootville-wide",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\gootville-wide",
+      "n_images": 403,
+      "n_labels": 401,
+      "n_paired": 401
+    },
+    "aug_dpi150_leipzig_default": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi150\\leipzig-default",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\leipzig-default",
+      "n_images": 430,
+      "n_labels": 427,
+      "n_paired": 427
+    },
+    "aug_dpi300_bravura_compact": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi300\\bravura-compact",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\bravura-compact",
+      "n_images": 461,
+      "n_labels": 460,
+      "n_paired": 460
+    },
+    "aug_dpi300_gootville_wide": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi300\\gootville-wide",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\gootville-wide",
+      "n_images": 403,
+      "n_labels": 401,
+      "n_paired": 401
+    },
+    "aug_dpi300_leipzig_default": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\images\\dpi300\\leipzig-default",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\sparse_augment\\labels_systems\\leipzig-default",
+      "n_images": 430,
+      "n_labels": 427,
+      "n_paired": 427
+    },
+    "real": {
+      "images_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\omr_layout_real\\images",
+      "labels_dir": "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\\data\\processed\\omr_layout_real\\labels_systems",
+      "n_images": 919,
+      "n_labels": 919,
+      "n_paired": 919
+    }
+  }
+}

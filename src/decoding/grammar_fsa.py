@@ -22,7 +22,7 @@ DURATION_TO_BEATS: Dict[str, float] = {
 TUPLET_BEAT_SCALE: Dict[str, float] = {
     "<tuplet_3>": 2.0 / 3.0,
     "<tuplet_5>": 4.0 / 5.0,
-    "<tuplet_6>": 5.0 / 6.0,
+    "<tuplet_6>": 4.0 / 6.0,
     "<tuplet_7>": 6.0 / 7.0,
 }
 
@@ -201,6 +201,9 @@ class GrammarFSA:
             )
             if allow_measure_start:
                 allowed.add("<measure_start>")
+            # <staff_idx_N> is a no-op marker valid only immediately after <staff_start>.
+            if state.last_token == "<staff_start>":
+                allowed |= {f"<staff_idx_{i}>" for i in range(8)}
             return allowed
 
         if self._measure_end_forced():
@@ -339,6 +342,10 @@ class GrammarFSA:
             state.header_has_time = False
             state.measure_index_in_staff = 0
             state.measure_has_content = False
+            return
+        # <staff_idx_N>: no-op marker; only valid immediately after <staff_start>
+        # (enforced by valid_next_tokens; state.last_token already updated above).
+        if token.startswith("<staff_idx_"):
             return
         if token == "<measure_start>":
             if strict and state.measure_index_in_staff == 0 and not (

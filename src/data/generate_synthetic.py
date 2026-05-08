@@ -56,6 +56,23 @@ DEFAULT_STYLE_PRESETS: Dict[str, Dict[str, object]] = {
 YOLO_CLASS_NAMES = ["staff"]
 YOLO_CLASS_TO_ID = {name: idx for idx, name in enumerate(YOLO_CLASS_NAMES)}
 
+# ---------------------------------------------------------------------------
+# v15 system-layout constants — tune here without touching algorithm code
+# ---------------------------------------------------------------------------
+# Margins added to raw system bboxes (derived from grouped staff bboxes)
+V15_SYSTEM_TOP_MARGIN_PX:    float = 80.0
+V15_SYSTEM_BOTTOM_MARGIN_PX: float = 130.0
+V15_RIGHT_BARLINE_MARGIN_PX: float = 60.0
+V15_LEFTWARD_BRACKET_MARGIN_PX: float = 40.0
+
+# Minimum pixel gap between adjacent final system bboxes (neighbor cap)
+V15_NEIGHBOR_GAP_PX: float = 2.0
+
+# Per-row SVG fallback expansion ratios (used when an SVG row has no matching
+# disk label — larger than per-staff ratios to cover ledger-line notes)
+V15_SYNTHETIC_ROW_TOP_RATIO:    float = 0.4
+V15_SYNTHETIC_ROW_BOTTOM_RATIO: float = 1.5   # bumped from 0.7 in v15 for deep bass-clef chords
+
 SCORE_TYPE_TARGET_DISTRIBUTION = {
     "piano": 0.40,
     "orchestral": 0.25,
@@ -1312,6 +1329,12 @@ class _SvgSystemInfo:
     staves_per_system: int
     y_top: float
     y_bottom: float
+    # x_left is the left edge of the system bounding-box rect, which Verovio
+    # places at the bracket position (rect width is just the bracket itself,
+    # ~20-30 px). Use as a candidate for the bbox left edge to capture the
+    # bracket as a distinctive YOLO-detection anchor. None when no bracket
+    # info is available (e.g., older callers, or pages without a system rect).
+    x_left: Optional[float] = None
 
 
 def _extract_system_layout_from_svg(
@@ -1331,7 +1354,7 @@ def _extract_system_layout_from_svg(
     except ET.ParseError:
         return None
 
-    raw: List[Tuple[float, float, int, int]] = []  # (y_top, y_bottom, measures, staves)
+    raw: List[Tuple[float, float, int, int, float]] = []  # (y_top, y_bottom, measures, staves, x_left)
     for elem in root.iter():
         if elem.attrib.get("class", "").strip() != "system":
             continue
@@ -1350,23 +1373,27 @@ def _extract_system_layout_from_svg(
             if c.attrib.get("class", "").strip() == "staff"
         )
 
-        # Extract bounding box y and height
+        # Extract bounding box y, height, and x (bracket left edge).
         y_top = 0.0
         y_bottom = 0.0
+        x_left = 0.0
         for child in elem.iter():
             if child.attrib.get("class", "").strip() == "system bounding-box":
                 for rect in child.iter():
                     tag = rect.tag.split("}")[-1] if "}" in rect.tag else rect.tag
                     if tag == "rect":
+                        x_val = parse_float(rect.attrib.get("x"))
                         y_val = parse_float(rect.attrib.get("y"))
                         h_val = parse_float(rect.attrib.get("height"))
                         if y_val is not None:
                             y_top = y_val
                             y_bottom = y_val + (h_val or 0.0)
+                        if x_val is not None:
+                            x_left = x_val
                         break
                 break
 
-        raw.append((y_top, y_bottom, len(measures), staves_in_first))
+        raw.append((y_top, y_bottom, len(measures), staves_in_first, x_left))
 
     if not raw:
         return None
@@ -1378,8 +1405,9 @@ def _extract_system_layout_from_svg(
             staves_per_system=s,
             y_top=yt,
             y_bottom=yb,
+            x_left=xl,
         )
-        for yt, yb, m, s in raw
+        for yt, yb, m, s, xl in raw
     ]
 
 
@@ -1406,6 +1434,517 @@ def _assign_staff_boxes_to_systems(
             result[box_idx] = (sys_idx, pos)
             box_idx += 1
     return result
+
+
+def _select_staff_boxes_for_svg_layout(
+    staff_boxes: Sequence[Tuple[float, float, float, float]],
+    svg_layout: Sequence["_SvgSystemInfo"],
+) -> List[Tuple[int, Tuple[float, float, float, float]]]:
+    """Select the staff boxes most consistent with the SVG's system counts.
+
+    Synthetic pages occasionally include extra staff-like boxes from ossias,
+    cue fragments, or annotations. Dropping the narrowest boxes is a useful
+    first approximation, but it can discard legitimate short final systems and
+    silently shift every later system. This dynamic assignment keeps top-to-
+    bottom order and exact ``staves_per_system`` counts while allowing surplus
+    boxes to be skipped where they least fit the page's system structure.
+    """
+    if not staff_boxes or not svg_layout:
+        return []
+
+    expected_total = sum(s.staves_per_system for s in svg_layout)
+    indexed = [(i, sb) for i, sb in enumerate(staff_boxes)]
+    if len(indexed) <= expected_total:
+        return indexed
+
+    widths = sorted(max(1.0, sb[2]) for sb in staff_boxes)
+    heights = sorted(max(1.0, sb[3]) for sb in staff_boxes)
+    median_w = widths[len(widths) // 2]
+    median_h = heights[len(heights) // 2]
+
+    def skip_penalty(box: Tuple[float, float, float, float]) -> float:
+        width_frac = max(0.0, box[2]) / max(1.0, median_w)
+        # Skipping a full-width staff should be expensive; skipping a short
+        # ossia/cue-like staff should be relatively cheap.
+        return median_h * (0.25 + 2.0 * width_frac * width_frac)
+
+    def skipped_penalty(start: int, end: int) -> float:
+        return sum(skip_penalty(indexed[i][1]) for i in range(start, end))
+
+    def group_cost(start: int, count: int) -> float:
+        group = [indexed[i][1] for i in range(start, start + count)]
+        y_top = min(y for _x, y, _w, _h in group)
+        y_bottom = max(y + h for _x, y, _w, h in group)
+        x_left = min(x for x, _y, _w, _h in group)
+        x_right = max(x + w for x, _y, w, _h in group)
+        widths_in_group = [w for _x, _y, w, _h in group]
+        x_span = x_right - x_left
+        widest = max(widths_in_group)
+        x_spread = max(0.0, x_span - widest)
+        return (y_bottom - y_top) + 0.05 * x_spread
+
+    n = len(indexed)
+    counts = [s.staves_per_system for s in svg_layout]
+    # dp[(sys_idx, next_box_idx)] = (cost, selected_original_indices)
+    states: Dict[int, Tuple[float, List[int]]] = {0: (0.0, [])}
+    for sys_idx, count in enumerate(counts):
+        next_states: Dict[int, Tuple[float, List[int]]] = {}
+        systems_left_after = len(counts) - sys_idx - 1
+        min_boxes_after = sum(counts[sys_idx + 1:])
+        for cursor, (base_cost, selected) in states.items():
+            latest_start = n - count - min_boxes_after
+            for start in range(cursor, latest_start + 1):
+                end = start + count
+                cost = (
+                    base_cost
+                    + skipped_penalty(cursor, start)
+                    + group_cost(start, count)
+                )
+                chosen = selected + [indexed[i][0] for i in range(start, end)]
+                prev = next_states.get(end)
+                if prev is None or cost < prev[0]:
+                    next_states[end] = (cost, chosen)
+        states = next_states
+        if not states:
+            return indexed[:expected_total]
+
+    best_cost = None
+    best_selected: List[int] = []
+    for cursor, (cost, selected) in states.items():
+        total_cost = cost + skipped_penalty(cursor, n)
+        if best_cost is None or total_cost < best_cost:
+            best_cost = total_cost
+            best_selected = selected
+
+    selected_set = set(best_selected)
+    return [(i, sb) for i, sb in indexed if i in selected_set]
+
+
+def _build_system_yolo_objects(
+    staff_boxes: Sequence[Tuple[float, float, float, float]],
+    svg_layout: Sequence["_SvgSystemInfo"],
+    *,
+    leftward_bracket_margin_px: float = 40.0,
+    vertical_margin_frac: float = 0.0,
+) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
+    """Group per-staff bboxes into per-system YOLO label objects.
+
+    Uses Verovio's authoritative ``staves_per_system`` counts, then assigns
+    already-pixel-space staff boxes in top-to-bottom order. When surplus
+    staff-like boxes are present, a small dynamic-programming pass chooses which
+    boxes to skip by looking for compact vertical groups matching the expected
+    per-system counts. This avoids width-only pruning shifting later systems.
+
+    Returns a pair ``(label_objects, staves_in_system)`` where:
+      - ``label_objects`` is ``[(0, (x, y, w, h)), ...]`` — class 0, page-pixel coords
+      - ``staves_in_system`` is a parallel list of stave counts
+    """
+    if not staff_boxes or not svg_layout:
+        return [], []
+
+    kept_with_idx = _select_staff_boxes_for_svg_layout(staff_boxes, svg_layout)
+
+    if not kept_with_idx:
+        return [], []
+
+    kept_boxes = [sb for _idx, sb in kept_with_idx]
+    box_to_system = _assign_staff_boxes_to_systems(kept_boxes, svg_layout)
+
+    # Map back to original indices
+    by_system: Dict[int, List[int]] = {}
+    for kept_idx, (sys_idx, _pos) in box_to_system.items():
+        orig_idx = kept_with_idx[kept_idx][0]
+        by_system.setdefault(sys_idx, []).append(orig_idx)
+
+    label_objects: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    staves_in_system: List[int] = []
+    for sys_idx in sorted(by_system.keys()):
+        indices = by_system[sys_idx]
+        if not indices:
+            continue
+        x_min = min(staff_boxes[i][0] for i in indices)
+        y_min = min(staff_boxes[i][1] for i in indices)
+        x_max = max(staff_boxes[i][0] + staff_boxes[i][2] for i in indices)
+        y_max = max(staff_boxes[i][1] + staff_boxes[i][3] for i in indices)
+        # Pull the bbox left edge out to include the bracket. Verovio's system
+        # bounding-box rect's x_left is in internal units (not pixel coords),
+        # so we use a fixed pixel margin instead. Plus a small vertical margin
+        # to capture notes/dynamics extending past staff lines.
+        x_min = max(0.0, x_min - leftward_bracket_margin_px)
+        per_staff_h = max(1.0, (y_max - y_min) / max(1, len(indices)))
+        v_margin = vertical_margin_frac * per_staff_h
+        y_min = max(0.0, y_min - v_margin)
+        y_max = y_max + v_margin
+        bbox = (x_min, y_min, max(0.0, x_max - x_min), max(0.0, y_max - y_min))
+        label_objects.append((0, bbox))
+        staves_in_system.append(len(indices))
+
+    return label_objects, staves_in_system
+
+
+# ---------------------------------------------------------------------------
+# v15 SVG-hierarchy helpers (ported from verovio_overlay_v15.py)
+# ---------------------------------------------------------------------------
+
+class _SvgStaffRow:
+    """One staff row extracted from a Verovio SVG hierarchy."""
+    __slots__ = ("sys_idx", "row_idx", "y_top", "y_bot", "y_center", "x_min", "x_max")
+
+    def __init__(
+        self,
+        sys_idx: int,
+        row_idx: int,
+        y_top: float,
+        y_bot: float,
+        y_center: float,
+        x_min: float,
+        x_max: float,
+    ) -> None:
+        self.sys_idx  = sys_idx
+        self.row_idx  = row_idx
+        self.y_top    = y_top
+        self.y_bot    = y_bot
+        self.y_center = y_center
+        self.x_min    = x_min
+        self.x_max    = x_max
+
+
+def _find_inner_svg_v15(root: ET.Element) -> Optional[ET.Element]:
+    """Find the inner SVG element with class='definition-scale' that carries the viewBox."""
+    for child in root.iter():
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag != "svg":
+            continue
+        if "definition-scale" in child.attrib.get("class", "").lower() and child.attrib.get("viewBox"):
+            return child
+    return None
+
+
+def _viewbox_scale_v15(
+    inner_svg: ET.Element, png_w: int, png_h: int
+) -> Tuple[float, float, float, float, float, float]:
+    """Return (vb_x, vb_y, vb_w, vb_h, sx, sy) from the inner SVG viewBox."""
+    vb = inner_svg.attrib.get("viewBox", "")
+    nums = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", vb)]
+    vb_x, vb_y, vb_w, vb_h = nums[:4]
+    return vb_x, vb_y, vb_w, vb_h, png_w / vb_w, png_h / vb_h
+
+
+def _staff_line_segments_v15(
+    staff_g: ET.Element,
+) -> List[Tuple[float, float, float, float]]:
+    """Extract horizontal staff-line segments from a <g class='staff'> element."""
+    segments: List[Tuple[float, float, float, float]] = []
+    for child in staff_g:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag != "path":
+            continue
+        d = child.attrib.get("d", "")
+        vals = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", d)]
+        if len(vals) < 4:
+            continue
+        x1, y1, x2, y2 = vals[:4]
+        if abs(y1 - y2) > 2.0:
+            continue  # skip non-horizontal paths
+        if abs(x2 - x1) < 10.0:
+            continue  # skip very short segments
+        segments.append((x1, y1, x2, y2))
+    return segments
+
+
+def _parse_svg_hierarchy_staves_v15(
+    svg_path: Path,
+    png_w: int,
+    png_h: int,
+) -> Tuple[List[_SvgStaffRow], int]:
+    """Parse SVG tree to extract one _SvgStaffRow per (sys_idx, row_idx).
+
+    Returns (svg_staff_rows, n_systems_in_svg).  On any parse error or when
+    no <g class='system'> elements exist, returns ([], 0) — callers use this
+    as the trigger for the single-staff fallback.
+    """
+    try:
+        content = svg_path.read_text(encoding="utf-8")
+        root = ET.fromstring(content)
+    except (OSError, ET.ParseError):
+        return [], 0
+
+    inner_svg = _find_inner_svg_v15(root)
+    if inner_svg is None:
+        return [], 0
+
+    vb_x, vb_y, vb_w, vb_h, sx, sy = _viewbox_scale_v15(inner_svg, png_w, png_h)
+
+    system_elems = [
+        elem for elem in inner_svg.iter()
+        if elem.attrib.get("class", "").strip() == "system"
+    ]
+    if not system_elems:
+        return [], 0
+
+    svg_rows: List[_SvgStaffRow] = []
+    for sys_idx, sys_elem in enumerate(system_elems):
+        measures = [
+            c for c in sys_elem
+            if c.attrib.get("class", "").strip() == "measure"
+        ]
+        if not measures:
+            continue
+
+        first_staves = [
+            c for c in measures[0]
+            if c.attrib.get("class", "").strip() == "staff"
+        ]
+        n_rows = len(first_staves)
+        if n_rows == 0:
+            continue
+
+        # Gather staff-line segments per row across all measures
+        row_segments: Dict[int, List[Tuple[float, float, float, float]]] = {
+            i: [] for i in range(n_rows)
+        }
+        for measure in measures:
+            staff_groups = [
+                c for c in measure
+                if c.attrib.get("class", "").strip() == "staff"
+            ]
+            for row_idx, sg in enumerate(staff_groups[:n_rows]):
+                row_segments[row_idx].extend(_staff_line_segments_v15(sg))
+
+        for row_idx in range(n_rows):
+            segs = row_segments[row_idx]
+            if not segs:
+                continue
+
+            ys = [s[1] for s in segs]
+            y_top_svg    = min(ys)
+            y_bot_svg    = max(ys)
+            y_center_svg = (y_top_svg + y_bot_svg) / 2.0
+
+            y_top_px    = (y_top_svg    - vb_y) * sy
+            y_bot_px    = (y_bot_svg    - vb_y) * sy
+            y_center_px = (y_center_svg - vb_y) * sy
+
+            x_min_svg = min(min(s[0], s[2]) for s in segs)
+            x_max_svg = max(max(s[0], s[2]) for s in segs)
+            x_min_px  = (x_min_svg - vb_x) * sx
+            x_max_px  = (x_max_svg - vb_x) * sx
+
+            svg_rows.append(_SvgStaffRow(
+                sys_idx=sys_idx,
+                row_idx=row_idx,
+                y_top=y_top_px,
+                y_bot=y_bot_px,
+                y_center=y_center_px,
+                x_min=x_min_px,
+                x_max=x_max_px,
+            ))
+
+    return svg_rows, len(system_elems)
+
+
+def _expand_single_staff_v15(
+    x1: float, y1: float, x2: float, y2: float,
+    page_h: float,
+    top_ratio: float,
+    bottom_ratio: float,
+) -> Tuple[float, float, float, float]:
+    """Expand a single staff bbox vertically using ratio-based padding."""
+    h = max(0.0, y2 - y1)
+    top_pad    = max(8.0, h * top_ratio)
+    bottom_pad = max(8.0, h * bottom_ratio)
+    return x1, max(0.0, y1 - top_pad), x2, min(float(page_h), y2 + bottom_pad)
+
+
+def _build_system_yolo_objects_v15(
+    svg_path: Path,
+    staff_yolo_boxes: Sequence[Tuple[float, float, float, float]],
+    png_w: int,
+    png_h: int,
+) -> Tuple[List[Tuple[int, Tuple[float, float, float, float]]], List[int]]:
+    """Build system YOLO label objects using the v15 SVG-hierarchy algorithm.
+
+    Parameters
+    ----------
+    svg_path:
+        Path to the Verovio-rendered SVG for this page (must exist on disk).
+    staff_yolo_boxes:
+        Already-expanded per-staff bboxes in pixel-space YOLO format
+        ``(x, y, w, h)`` — the same list passed to the old
+        ``_build_system_yolo_objects``.
+    png_w, png_h:
+        Page dimensions in pixels (used for coordinate normalisation and
+        clamping).
+
+    Returns
+    -------
+    label_objects : list of ``(class_id, (x, y, w, h))``
+        One entry per system, class_id always 0.  Coords are pixel-space
+        ``(x, y, w, h)`` ready for ``write_yolo_labels``.
+    staves_in_system : list of int
+        Parallel list of stave counts per system (same length as
+        ``label_objects``).
+
+    Algorithm (v15)
+    ---------------
+    1. Parse the SVG ``<g class="system">`` hierarchy to get per-row pixel
+       extents (``_parse_svg_hierarchy_staves_v15``).
+    2. Assign each per-staff disk label to the SVG row with the closest
+       y_center; inherits that row's sys_idx.
+    3. For SVG rows that received no disk label, synthesise a bbox from SVG
+       staff-line geometry using larger expansion ratios
+       (``V15_SYNTHETIC_ROW_TOP_RATIO``, ``V15_SYNTHETIC_ROW_BOTTOM_RATIO``).
+    4. Single-staff fallback: if the SVG has no ``<g class="system">``
+       elements, treat each disk label as its own system.
+    5. Apply fixed pixel margins (top/bottom/left/right), a neighbor-aware
+       cap so adjacent systems do not overlap, and clamp to page bounds.
+    """
+    if not staff_yolo_boxes:
+        return [], []
+
+    # Convert (x, y, w, h) pixel YOLO → (x1, y1, x2, y2) pixel absolute
+    staff_abs: List[Tuple[float, float, float, float]] = []
+    for x, y, w, h in staff_yolo_boxes:
+        staff_abs.append((x, y, x + w, y + h))
+
+    svg_rows, n_svg_systems = _parse_svg_hierarchy_staves_v15(svg_path, png_w, png_h)
+
+    # -----------------------------------------------------------------------
+    # Single-staff fallback: no <g class="system"> elements in SVG
+    # -----------------------------------------------------------------------
+    if n_svg_systems == 0:
+        label_objects: List[Tuple[int, Tuple[float, float, float, float]]] = []
+        staves_in_system: List[int] = []
+        # Sort by y-center, assign each disk label its own system
+        sorted_abs = sorted(staff_abs, key=lambda b: (b[1] + b[3]) / 2.0)
+        for i, (x1, y1, x2, y2) in enumerate(sorted_abs):
+            # Apply margins + clamp (treat single staff as a 1-staff system)
+            final_x1 = max(0.0,          x1 - V15_LEFTWARD_BRACKET_MARGIN_PX)
+            final_x2 = min(float(png_w), x2 + V15_RIGHT_BARLINE_MARGIN_PX)
+            final_y1 = max(0.0,          y1 - V15_SYSTEM_TOP_MARGIN_PX)
+            final_y2 = min(float(png_h), y2 + V15_SYSTEM_BOTTOM_MARGIN_PX)
+            w_px = max(0.0, final_x2 - final_x1)
+            h_px = max(0.0, final_y2 - final_y1)
+            label_objects.append((0, (final_x1, final_y1, w_px, h_px)))
+            staves_in_system.append(1)
+        return label_objects, staves_in_system
+
+    # -----------------------------------------------------------------------
+    # Multi-staff path: SVG-hierarchy grouping
+    # -----------------------------------------------------------------------
+
+    # Step 1: Assign each disk label to closest SVG row by y_center distance
+    # -----------------------------------------------------------------------
+    # assignments[i] = (sys_idx, row_idx) for disk label i
+    assignments: List[Tuple[int, int]] = []
+    for x1, y1, x2, y2 in staff_abs:
+        yc = (y1 + y2) / 2.0
+        closest = min(svg_rows, key=lambda r: abs(r.y_center - yc))
+        assignments.append((closest.sys_idx, closest.row_idx))
+
+    # Step 2: Group disk labels by system
+    by_system: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    for i, (sys_idx, _row_idx) in enumerate(assignments):
+        by_system.setdefault(sys_idx, []).append(staff_abs[i])
+
+    claimed_rows: Dict[int, set] = {}
+    for i, (sys_idx, row_idx) in enumerate(assignments):
+        claimed_rows.setdefault(sys_idx, set()).add(row_idx)
+
+    # Step 3: Build raw system bboxes, applying per-row SVG fallback for
+    #         unclaimed rows
+    # -----------------------------------------------------------------------
+    # raw_bboxes[sys_idx] = (raw_x1, raw_y1, raw_x2, raw_y2) in pixel abs
+    raw_bboxes: Dict[int, Tuple[float, float, float, float]] = {}
+    staves_per_sys: Dict[int, int] = {}
+
+    for si in range(n_svg_systems):
+        svg_rows_in_sys = [r for r in svg_rows if r.sys_idx == si]
+        if not svg_rows_in_sys:
+            continue
+
+        disk_members = by_system.get(si, [])
+        claimed = claimed_rows.get(si, set())
+        unclaimed = [r for r in svg_rows_in_sys if r.row_idx not in claimed]
+
+        synthetic_members: List[Tuple[float, float, float, float]] = []
+        for row in unclaimed:
+            _, exp_y1, _, exp_y2 = _expand_single_staff_v15(
+                row.x_min, row.y_top, row.x_max, row.y_bot,
+                float(png_h),
+                V15_SYNTHETIC_ROW_TOP_RATIO,
+                V15_SYNTHETIC_ROW_BOTTOM_RATIO,
+            )
+            synthetic_members.append((row.x_min, exp_y1, row.x_max, exp_y2))
+
+        all_members = disk_members + synthetic_members
+        if not all_members:
+            continue
+
+        raw_bboxes[si] = (
+            min(m[0] for m in all_members),
+            min(m[1] for m in all_members),
+            max(m[2] for m in all_members),
+            max(m[3] for m in all_members),
+        )
+        staves_per_sys[si] = len(disk_members) + len(synthetic_members)
+
+    if not raw_bboxes:
+        return [], []
+
+    # Step 4: Apply margins, neighbor cap, clamp
+    # -----------------------------------------------------------------------
+    sorted_sys = sorted(raw_bboxes.keys(), key=lambda si: raw_bboxes[si][1])
+    n = len(sorted_sys)
+
+    # Compute gap midpoints between consecutive raw systems
+    gap_mids: List[float] = []
+    for i in range(n - 1):
+        a_bot = raw_bboxes[sorted_sys[i]][3]
+        b_top = raw_bboxes[sorted_sys[i + 1]][1]
+        gap_mids.append((a_bot + b_top) / 2.0)
+
+    final_bboxes: Dict[int, Tuple[float, float, float, float]] = {}
+    for i, si in enumerate(sorted_sys):
+        rx1, ry1, rx2, ry2 = raw_bboxes[si]
+
+        # Apply margins
+        y_top_exp = ry1 - V15_SYSTEM_TOP_MARGIN_PX
+        y_bot_exp = ry2 + V15_SYSTEM_BOTTOM_MARGIN_PX
+        x_lft_exp = rx1 - V15_LEFTWARD_BRACKET_MARGIN_PX
+        x_rgt_exp = rx2 + V15_RIGHT_BARLINE_MARGIN_PX
+
+        # Neighbor cap: prevent overlapping into adjacent system's territory
+        if i > 0:
+            limit = gap_mids[i - 1]
+            if y_top_exp < limit:
+                y_top_exp = limit
+        if i + 1 < n:
+            limit = gap_mids[i]
+            if y_bot_exp > limit:
+                y_bot_exp = limit
+
+        # Clamp to page
+        final_x1 = max(0.0,          x_lft_exp)
+        final_y1 = max(0.0,          y_top_exp)
+        final_x2 = min(float(png_w), x_rgt_exp)
+        final_y2 = min(float(png_h), y_bot_exp)
+
+        final_bboxes[si] = (final_x1, final_y1, final_x2, final_y2)
+
+    # Convert (x1,y1,x2,y2) → YOLO (x,y,w,h) and build output
+    label_objects = []
+    staves_in_system = []
+    for si in sorted_sys:
+        x1, y1, x2, y2 = final_bboxes[si]
+        w_px = max(0.0, x2 - x1)
+        h_px = max(0.0, y2 - y1)
+        if w_px <= 0 or h_px <= 0:
+            continue
+        label_objects.append((0, (x1, y1, w_px, h_px)))
+        staves_in_system.append(staves_per_sys.get(si, 0))
+
+    return label_objects, staves_in_system
 
 
 def _extract_measure_range_from_sequence(
@@ -1473,6 +2012,73 @@ def _extract_measure_range_from_sequence(
     result.append("<staff_end>")
     result.append("<eos>")
     return result
+
+
+def _build_manifest_rows_for_page(
+    *,
+    page_basename: str,
+    staff_crop_entries: List[Tuple[Path, int]],
+    total_physical_staves: int,
+    token_sequences_by_phys: Dict[int, List[str]],
+    page_number: int,
+    style_id: str,
+    score_type: str,
+    source_relpath: str,
+    project_root: Path,
+    dataset_variants: Sequence[Tuple[str, str]],
+) -> List[dict]:
+    """Build per-staff manifest rows keyed by PHYSICAL staff position.
+
+    For each physical staff position 0..total_physical_staves-1, emit a manifest
+    entry IF a token sequence exists for that position. If the position has a
+    surviving crop in `staff_crop_entries`, the `image_path` is set; otherwise
+    `image_path` is None (the filter rejected the crop, but the token sequence
+    is still derivable from the source split).
+
+    Tokens come from `token_sequences_by_phys[physical_position]`. Callers are
+    responsible for computing that lookup according to whichever code path
+    (SVG primary or proportional fallback) they use.
+
+    The output is a list of row dicts ready to extend a `token_rows` list. Per
+    `dataset_variants`, each physical position emits one row per (dataset_name,
+    sample_suffix) pair.
+    """
+    # Each physical position must appear at most once in staff_crop_entries.
+    # _write_staff_crops uses (saved_index, source_index - 1) with no dedup, so
+    # this is invariant by construction; surface a producer regression early.
+    assert len({phys for _, phys in staff_crop_entries}) == len(staff_crop_entries), (
+        "duplicate physical indices in staff_crop_entries"
+    )
+    crop_path_by_phys = {phys: path for path, phys in staff_crop_entries}
+
+    rows: List[dict] = []
+    for phys_idx in range(total_physical_staves):
+        token_sequence = token_sequences_by_phys.get(phys_idx)
+        if token_sequence is None:
+            continue
+        crop_path = crop_path_by_phys.get(phys_idx)
+        image_path = relpath(project_root, crop_path) if crop_path is not None else None
+        base_sample_id = f"{page_basename}__staff{phys_idx + 1:02d}"
+        for dataset_name, sample_suffix in dataset_variants:
+            sample_id = f"{base_sample_id}{sample_suffix}"
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "dataset": dataset_name,
+                    "split": "train",
+                    "image_path": image_path,
+                    "page_id": page_basename,
+                    "source_path": source_relpath,
+                    "style_id": style_id,
+                    "page_number": page_number,
+                    "staff_index": phys_idx,
+                    "source_format": "musicxml",
+                    "score_type": score_type,
+                    "token_sequence": token_sequence,
+                    "token_count": len(token_sequence),
+                }
+            )
+    return rows
 
 
 def _write_staff_crops(
@@ -1679,6 +2285,7 @@ def _render_single_job(
     png_root: Path,
     staff_crop_root: Path,
     label_root: Path,
+    label_systems_root: Path,
     token_cache: Dict[str, Optional[List[List[str]]]],
     allow_fallback_labels: bool,
 ) -> Dict[str, object]:
@@ -1736,6 +2343,7 @@ def _render_single_job(
                 page_ink_array=page_ink_array,
             )
             output_label = label_root / job.style_id / f"{page_basename}.txt"
+            output_label_systems = label_systems_root / job.style_id / f"{page_basename}.txt"
             staff_boxes = _sorted_staff_boxes(objects)
             barline_class_id = YOLO_CLASS_TO_ID.get("barline_system")
             barline_boxes = [
@@ -1769,6 +2377,32 @@ def _render_single_job(
                 yolo_labels_rejected += 1
                 for reason in reject_reasons:
                     yolo_reject_reasons[reason] += 1
+
+            # System-level labels: v15 SVG-hierarchy grouping.
+            # svg_layout is still parsed for the token-pairing path below.
+            svg_layout = _extract_system_layout_from_svg(svg_text)
+            staves_in_system: List[int] = []
+            label_systems_written = False
+            if label_valid:
+                system_label_objects, staves_in_system = _build_system_yolo_objects_v15(
+                    output_svg, staff_boxes, int(page_width), int(page_height)
+                )
+                if system_label_objects:
+                    write_yolo_labels(
+                        output_label_systems,
+                        system_label_objects,
+                        page_width=page_width,
+                        page_height=page_height,
+                    )
+                    output_label_systems.with_suffix(".staves.json").write_text(
+                        json.dumps(staves_in_system), encoding="utf-8",
+                    )
+                    label_systems_written = True
+            if not label_systems_written and output_label_systems.exists():
+                output_label_systems.unlink()
+                sidecar = output_label_systems.with_suffix(".staves.json")
+                if sidecar.exists():
+                    sidecar.unlink()
 
             class_counter = Counter()
             for class_id, _ in label_objects:
@@ -1819,7 +2453,7 @@ def _render_single_job(
                     token_pairing_mismatches += 1
                 else:
                     # --- Primary path: SVG-based exact measure mapping ---
-                    svg_layout = _extract_system_layout_from_svg(svg_text)
+                    # svg_layout was hoisted above (alongside system-label emission)
                     use_svg = svg_layout is not None and len(svg_layout) > 0
 
                     if use_svg:
@@ -1830,8 +2464,12 @@ def _render_single_job(
                             staff_boxes, svg_layout,
                         )
 
-                        for staff_index, (crop_path, source_staff_index) in enumerate(staff_crop_entries):
-                            mapping = staff_to_system.get(source_staff_index)
+                        # Build token sequence per PHYSICAL staff position by
+                        # iterating over ALL physical staves (not just survivors).
+                        # `staff_to_system` is keyed by physical position 0..len(staff_boxes)-1.
+                        token_sequences_by_phys: Dict[int, List[str]] = {}
+                        for phys_idx in range(len(staff_boxes)):
+                            mapping = staff_to_system.get(phys_idx)
                             if mapping is None:
                                 continue
                             sys_idx, pos_in_system = mapping
@@ -1842,40 +2480,59 @@ def _render_single_job(
                                 continue
                             m_start = cumulative_measure_offset + sum(svg_measures[:sys_idx])
                             m_end = m_start + svg_measures[sys_idx]
-                            token_sequence = _extract_measure_range_from_sequence(
+                            token_sequences_by_phys[phys_idx] = _extract_measure_range_from_sequence(
                                 staff_token_sequences[pi], m_start, m_end
                             )
 
-                            base_sample_id = f"{page_basename}__staff{staff_index + 1:02d}"
-                            dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
-                            if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
-                                dataset_variants.append(("synthetic_polyphonic", "__poly"))
-                            for dataset_name, sample_suffix in dataset_variants:
-                                sample_id = f"{base_sample_id}{sample_suffix}"
-                                token_rows.append(
-                                    {
-                                        "sample_id": sample_id,
-                                        "dataset": dataset_name,
-                                        "split": "train",
-                                        "image_path": relpath(project_root, crop_path),
-                                        "page_id": page_basename,
-                                        "source_path": job.source_relpath,
-                                        "style_id": job.style_id,
-                                        "page_number": page_no,
-                                        "staff_index": staff_index,
-                                        "source_format": "musicxml",
-                                        "score_type": job.score_type,
-                                        "token_sequence": token_sequence,
-                                        "token_count": len(token_sequence),
-                                    }
-                                )
-                                token_entries_written += 1
-                                token_entries_by_dataset[dataset_name] = token_entries_by_dataset.get(dataset_name, 0) + 1
-                            staff_token_pairs += 1
+                        dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
+                        if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
+                            dataset_variants.append(("synthetic_polyphonic", "__poly"))
+
+                        new_rows = _build_manifest_rows_for_page(
+                            page_basename=page_basename,
+                            staff_crop_entries=staff_crop_entries,
+                            total_physical_staves=len(staff_boxes),
+                            token_sequences_by_phys=token_sequences_by_phys,
+                            page_number=page_no,
+                            style_id=job.style_id,
+                            score_type=job.score_type,
+                            source_relpath=job.source_relpath,
+                            project_root=project_root,
+                            dataset_variants=dataset_variants,
+                        )
+                        token_rows.extend(new_rows)
+                        # Counter semantics: token_entries_written and
+                        # token_entries_by_dataset count manifest rows emitted,
+                        # including rows for filter-dropped crops (image_path is
+                        # None on those). staff_token_pairs counts physical
+                        # staves with a derivable token sequence. Both differ
+                        # from the pre-fix counts on pages where crops were
+                        # filtered, by design — the manifest now covers every
+                        # physical staff. Counters are diagnostic only; nothing
+                        # downstream gates on them.
+                        token_entries_written += len(new_rows)
+                        for row in new_rows:
+                            token_entries_by_dataset[row["dataset"]] = (
+                                token_entries_by_dataset.get(row["dataset"], 0) + 1
+                            )
+                        staff_token_pairs += len(token_sequences_by_phys)
 
                         cumulative_measure_offset += sum(svg_measures)
                     else:
                         # --- Fallback: proportional slicing (old behaviour) ---
+                        # Like the SVG primary path, this branch builds
+                        # token_sequences_by_phys keyed by physical staff index.
+                        # Unlike the SVG path, we don't have a system mapping
+                        # for filter-dropped positions, so we only emit token
+                        # sequences for surviving crops (their source_staff_index
+                        # IS the physical position). The helper skips filtered
+                        # positions automatically (their key is absent), matching
+                        # the old fallback behavior of not emitting rows for
+                        # filtered staves in this branch.
+                        # Note: when filter drops occur, the `staff_index`
+                        # field in emitted rows now reflects physical
+                        # position (consistent with SVG primary), not
+                        # survivor-enumerate position as in the old code.
                         page_staff_sequences = [
                             _slice_staff_sequence_for_page(
                                 sequence,
@@ -1894,77 +2551,52 @@ def _render_single_job(
                                 weight = max(1, int(staff_measure_weights[source_staff_index]))
                             fragment_weights_fb[pi_fb].append(weight)
 
+                        token_sequences_by_phys: Dict[int, List[str]] = {}
                         if min(fragment_counts) <= 0:
                             token_pairing_mismatches += 1
                             pair_count = min(len(staff_crop_entries), part_count)
-                            for staff_index in range(pair_count):
-                                crop_path, _ = staff_crop_entries[staff_index]
-                                token_sequence = page_staff_sequences[staff_index]
-                                base_sample_id = f"{page_basename}__staff{staff_index + 1:02d}"
-                                dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
-                                if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
-                                    dataset_variants.append(("synthetic_polyphonic", "__poly"))
-                                for dataset_name, sample_suffix in dataset_variants:
-                                    sample_id = f"{base_sample_id}{sample_suffix}"
-                                    token_rows.append(
-                                        {
-                                            "sample_id": sample_id,
-                                            "dataset": dataset_name,
-                                            "split": "train",
-                                            "image_path": relpath(project_root, crop_path),
-                                            "page_id": page_basename,
-                                            "source_path": job.source_relpath,
-                                            "style_id": job.style_id,
-                                            "page_number": page_no,
-                                            "staff_index": staff_index,
-                                            "source_format": "musicxml",
-                                            "score_type": job.score_type,
-                                            "token_sequence": token_sequence,
-                                            "token_count": len(token_sequence),
-                                        }
-                                    )
-                                    token_entries_written += 1
-                                    token_entries_by_dataset[dataset_name] = token_entries_by_dataset.get(dataset_name, 0) + 1
-                                staff_token_pairs += 1
+                            for i in range(pair_count):
+                                _, source_staff_index = staff_crop_entries[i]
+                                # In the degenerate path the i-th survivor takes
+                                # the i-th per-page sequence; key by physical pos.
+                                token_sequences_by_phys[source_staff_index] = page_staff_sequences[i]
                         else:
                             part_fragment_seen = [0 for _ in range(part_count)]
-                            for staff_index, (crop_path, source_staff_index) in enumerate(staff_crop_entries):
+                            for _, source_staff_index in staff_crop_entries:
                                 pi_fb = source_staff_index % part_count
                                 part_fragment_seen[pi_fb] += 1
                                 fragment_index = part_fragment_seen[pi_fb]
                                 part_weights = fragment_weights_fb[pi_fb] if pi_fb < len(fragment_weights_fb) else None
-                                token_sequence = _slice_staff_sequence_for_fragment(
+                                token_sequences_by_phys[source_staff_index] = _slice_staff_sequence_for_fragment(
                                     page_staff_sequences[pi_fb],
                                     fragment_index=fragment_index,
                                     fragment_count=fragment_counts[pi_fb],
                                     fragment_weights=part_weights,
                                 )
-                                base_sample_id = f"{page_basename}__staff{staff_index + 1:02d}"
-                                dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
-                                if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
-                                    dataset_variants.append(("synthetic_polyphonic", "__poly"))
-                                for dataset_name, sample_suffix in dataset_variants:
-                                    sample_id = f"{base_sample_id}{sample_suffix}"
-                                    token_rows.append(
-                                        {
-                                            "sample_id": sample_id,
-                                            "dataset": dataset_name,
-                                            "split": "train",
-                                            "image_path": relpath(project_root, crop_path),
-                                            "page_id": page_basename,
-                                            "source_path": job.source_relpath,
-                                            "style_id": job.style_id,
-                                            "page_number": page_no,
-                                            "staff_index": staff_index,
-                                            "source_format": "musicxml",
-                                            "score_type": job.score_type,
-                                            "token_sequence": token_sequence,
-                                            "token_count": len(token_sequence),
-                                        }
-                                    )
-                                    token_entries_written += 1
-                                    token_entries_by_dataset[dataset_name] = token_entries_by_dataset.get(dataset_name, 0) + 1
-                                staff_token_pairs += 1
+
+                        dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
+                        if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
+                            dataset_variants.append(("synthetic_polyphonic", "__poly"))
+
+                        new_rows = _build_manifest_rows_for_page(
+                            page_basename=page_basename,
+                            staff_crop_entries=staff_crop_entries,
+                            total_physical_staves=len(staff_boxes),
+                            token_sequences_by_phys=token_sequences_by_phys,
+                            page_number=page_no,
+                            style_id=job.style_id,
+                            score_type=job.score_type,
+                            source_relpath=job.source_relpath,
+                            project_root=project_root,
+                            dataset_variants=dataset_variants,
+                        )
+                        token_rows.extend(new_rows)
+                        token_entries_written += len(new_rows)
+                        for row in new_rows:
+                            token_entries_by_dataset[row["dataset"]] = (
+                                token_entries_by_dataset.get(row["dataset"], 0) + 1
+                            )
+                        staff_token_pairs += len(token_sequences_by_phys)
 
                         # Estimate cumulative offset for fallback path
                         if page_count_for_job > 0:
@@ -1984,6 +2616,8 @@ def _render_single_job(
                     "svg_path": relpath(project_root, output_svg),
                     "png_path": relpath(project_root, output_png) if output_png else None,
                     "label_path": relpath(project_root, output_label) if label_written else None,
+                    "label_systems_path": relpath(project_root, output_label_systems) if label_systems_written else None,
+                    "staves_in_system": staves_in_system,
                     "yolo_label_valid": label_valid,
                     "yolo_reject_reasons": reject_reasons,
                     "page_width": page_width,
@@ -2039,6 +2673,7 @@ def _render_source_task(
     png_root: Path,
     staff_crop_root: Path,
     label_root: Path,
+    label_systems_root: Path,
     allow_fallback_labels: bool,
 ) -> Dict[str, object]:
     source_key = str(task.source_path.resolve())
@@ -2080,6 +2715,7 @@ def _render_source_task(
             png_root=png_root,
             staff_crop_root=staff_crop_root,
             label_root=label_root,
+            label_systems_root=label_systems_root,
             token_cache=token_cache,
             allow_fallback_labels=allow_fallback_labels,
         )
@@ -2136,6 +2772,7 @@ def run(
     png_root = synthetic_root / "images"
     staff_crop_root = synthetic_root / "staff_crops"
     label_root = synthetic_root / "labels"
+    label_systems_root = synthetic_root / "labels_systems"
     manifest_root = synthetic_root / "manifests"
     manifest_root.mkdir(parents=True, exist_ok=True)
 
@@ -2194,6 +2831,7 @@ def run(
                 png_root=png_root,
                 staff_crop_root=staff_crop_root,
                 label_root=label_root,
+                label_systems_root=label_systems_root,
                 allow_fallback_labels=allow_fallback_labels,
             )
 
@@ -2432,4 +3070,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

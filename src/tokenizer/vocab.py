@@ -27,6 +27,58 @@ STRUCTURAL_TOKENS = [
     "<tuplet_7>",
 ]
 
+STAFF_INDEX_MARKER_TOKENS = [f"<staff_idx_{i}>" for i in range(8)]
+
+# v3 enharmonic extension: Cb/Fb/B#/E# × octaves 2-6 = 20 tokens.
+# These would otherwise collapse to B/E/C/F via semitone normalisation, losing
+# spelling fidelity that music21 preserves when parsing kern files.
+# APPEND-ONLY: keep after STAFF_INDEX_MARKER_TOKENS to preserve all prior IDs.
+EXTENDED_NOTE_TOKENS: list[str] = (
+    [f"note-Cb{o}" for o in range(2, 7)]
+    + [f"note-Fb{o}" for o in range(2, 7)]
+    + [f"note-B#{o}" for o in range(2, 7)]
+    + [f"note-E#{o}" for o in range(2, 7)]
+)
+
+# v3 phase 2: octave-1 sub-bass notes (F1, G1, A1, Bb1 etc.) were previously
+# absent from the vocab, causing _normalize_note_pitch_symbol to clamp them all
+# to note-C2 (the lowest available token).  Add the full 21-token set covering
+# the same pitch/accidental combinations as octaves 2-6.
+# APPEND-ONLY: keep after EXTENDED_NOTE_TOKENS to preserve all prior IDs.
+OCTAVE_1_NOTE_TOKENS: list[str] = [
+    "note-A1", "note-Ab1", "note-A#1",
+    "note-B1", "note-Bb1", "note-B#1",
+    "note-C1", "note-Cb1", "note-C#1",
+    "note-D1", "note-Db1", "note-D#1",
+    "note-E1", "note-Eb1", "note-E#1",
+    "note-F1", "note-Fb1", "note-F#1",
+    "note-G1", "note-Gb1", "note-G#1",
+]
+
+# v3 phase 3: double-flat and double-sharp tokens (14 spellings × 6 octaves = 84 tokens).
+# Music21 preserves these spellings when parsing kern `--` / `##` accidentals;
+# _normalize_pitch_symbol previously collapsed them to enharmonic naturals
+# (e.g. Bbb → A, F## → G), corrupting ~13% of training labels.
+# APPEND-ONLY: always kept after OCTAVE_1_NOTE_TOKENS to preserve all prior IDs.
+DOUBLE_ACCIDENTAL_NOTE_TOKENS: list[str] = [
+    # Double-flats
+    *[f"note-Abb{o}" for o in range(1, 7)],
+    *[f"note-Bbb{o}" for o in range(1, 7)],
+    *[f"note-Cbb{o}" for o in range(1, 7)],
+    *[f"note-Dbb{o}" for o in range(1, 7)],
+    *[f"note-Ebb{o}" for o in range(1, 7)],
+    *[f"note-Fbb{o}" for o in range(1, 7)],
+    *[f"note-Gbb{o}" for o in range(1, 7)],
+    # Double-sharps
+    *[f"note-A##{o}" for o in range(1, 7)],
+    *[f"note-B##{o}" for o in range(1, 7)],
+    *[f"note-C##{o}" for o in range(1, 7)],
+    *[f"note-D##{o}" for o in range(1, 7)],
+    *[f"note-E##{o}" for o in range(1, 7)],
+    *[f"note-F##{o}" for o in range(1, 7)],
+    *[f"note-G##{o}" for o in range(1, 7)],
+]
+
 DURATION_TOKENS = [
     "_whole",
     "_half",
@@ -382,6 +434,13 @@ def build_default_token_list() -> List[str]:
             *OTHER_NOTATION_TOKENS,
             *TEMPO_TOKENS,
             *EXPRESSION_TOKENS,
+            *STAFF_INDEX_MARKER_TOKENS,
+            # v3 extension: enharmonic spelling tokens (Cb/Fb/B#/E# × octaves 2-6)
+            *EXTENDED_NOTE_TOKENS,
+            # v3 phase 2: octave-1 sub-bass notes
+            *OCTAVE_1_NOTE_TOKENS,
+            # v3 phase 3: double-flat/double-sharp tokens — always appended last
+            *DOUBLE_ACCIDENTAL_NOTE_TOKENS,
         ]
     )
 
@@ -460,7 +519,7 @@ def build_default_vocabulary() -> OMRVocabulary:
         tokens=tokens,
         token_to_id=token_to_id,
         id_to_token=id_to_token,
-        structural_tokens=set(STRUCTURAL_TOKENS),
+        structural_tokens=set(STRUCTURAL_TOKENS) | set(STAFF_INDEX_MARKER_TOKENS),
         pitch_tokens=pitch_tokens,
         note_tokens=note_tokens,
         grace_tokens=grace_tokens,

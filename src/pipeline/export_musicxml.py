@@ -192,16 +192,38 @@ def _validate_musicxml_schema_file(musicxml_path: Path) -> Dict[str, object]:
     }
 
 
+def _vocab_pitch_to_music21(symbol: str) -> str:
+    """Convert a RADIO vocab pitch symbol to music21-compatible notation.
+
+    The RADIO vocab encodes double-flats as ``bb`` (e.g. ``Bbb2``) following
+    the kern ``--`` → ``b`` substitution used in ``token_from_music21_pitch``.
+    music21's ``Pitch`` / ``Note`` constructors require ``--`` for double-flats
+    (e.g. ``B--2``).  This function performs that one translation; single-flat
+    ``b``, single-sharp ``#``, and double-sharp ``##`` are already valid in
+    both systems.
+    """
+    import re
+
+    # Match [Letter][accidentals][octave] — accidentals may be bb, ##, b, or #
+    m = re.fullmatch(r"([A-G])(bb|##|b|#)?(-?\d+)", symbol)
+    if m is None:
+        return symbol  # pass through unrecognised tokens unchanged
+    letter, acc, octave = m.groups()
+    if acc == "bb":
+        acc = "--"
+    return f"{letter}{acc or ''}{octave}"
+
+
 def _parse_pitch_token(token: str) -> str:
     if not token.startswith("note-"):
         raise ValueError(f"Expected note token, got '{token}'")
-    return token[len("note-") :]
+    return _vocab_pitch_to_music21(token[len("note-") :])
 
 
 def _parse_grace_pitch_token(token: str) -> str:
     if not token.startswith("gracenote-"):
         raise ValueError(f"Expected gracenote token, got '{token}'")
-    return token[len("gracenote-") :]
+    return _vocab_pitch_to_music21(token[len("gracenote-") :])
 
 
 def _decode_duration(tokens: Sequence[str], start_index: int) -> Tuple[float, int]:
@@ -442,14 +464,38 @@ def _append_tokens_to_part_impl(
         except ValueError:
             return None
 
+    def _consume_post_duration_modifiers(start_index: int) -> int:
+        """Consume any tie_end / slur_end tokens immediately after a duration,
+        updating the pending flags so _apply_tie / _apply_slur_links see them.
+
+        Returns the index of the first token that is NOT a post-duration modifier.
+        """
+        nonlocal pending_tie_end, pending_slur_ends
+        idx2 = start_index
+        while idx2 < len(tokens):
+            tok2 = tokens[idx2]
+            if tok2 == "tie_end":
+                pending_tie_end = True
+                idx2 += 1
+            elif tok2 == "slur_end":
+                pending_slur_ends += 1
+                idx2 += 1
+            else:
+                break
+        return idx2
+
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
         if token == "<measure_start>":
             current_measure = stream.Measure(number=measure_number)
             measure_number += 1
-            voices = {1: stream.Voice(id="voice_1")}
+            voices = {1: stream.Voice(id="1")}
             active_voice = 1
+            # Tracks the highestTime of all existing voices at the moment the
+            # most-recent <voice_N> token fired.  Used to pad new voices so that
+            # their first event lands at the correct elapsed measure offset.
+            last_voice_switch_elapsed: float = 0.0
             if pending_clef is not None:
                 current_measure.insert(0, pending_clef)
                 pending_clef = None
@@ -483,7 +529,29 @@ def _append_tokens_to_part_impl(
         if token.startswith("<voice_"):
             raw = token.strip("<>").split("_")[-1]
             active_voice = int(raw)
-            voices.setdefault(active_voice, stream.Voice(id=f"voice_{active_voice}"))
+            if active_voice not in voices:
+                new_voice = stream.Voice(id=str(active_voice))
+                # Mid-measure split: pad new voice with a hidden rest so its first
+                # event lands at the correct elapsed offset within the measure.
+                # We use last_voice_switch_elapsed — the highestTime of existing
+                # voices recorded when the most-recent <voice_N> token fired —
+                # rather than the current highestTime, because voice_1 may have
+                # accumulated notes for the current row between its <voice_1> token
+                # and this <voice_N> token.
+                if last_voice_switch_elapsed > 0.0:
+                    from music21 import note as m21note
+                    pad = m21note.Rest(quarterLength=last_voice_switch_elapsed)
+                    pad.style.hideObjectOnPrint = True
+                    new_voice.append(pad)
+                voices[active_voice] = new_voice
+            else:
+                # Record elapsed for use when a new voice is created in this row.
+                last_voice_switch_elapsed = float(
+                    max(
+                        (getattr(v, "highestTime", None) or 0.0)
+                        for v in voices.values()
+                    )
+                )
             idx += 1
             continue
 
@@ -539,7 +607,7 @@ def _append_tokens_to_part_impl(
             continue
         if token in {"cresc_start", "cresc_end", "decresc_start", "decresc_end"}:
             if current_measure is not None:
-                current_voice = voices.setdefault(active_voice, stream.Voice(id=f"voice_{active_voice}"))
+                current_voice = voices.setdefault(active_voice, stream.Voice(id=str(active_voice)))
                 current_voice.append(expressions.TextExpression(token.replace("_", " ")))
             idx += 1
             continue
@@ -561,7 +629,35 @@ def _append_tokens_to_part_impl(
             idx += 1
             continue
 
-        if token in {"<bos>", "<staff_start>", "<staff_end>", "<eos>"}:
+        if token in {"<bos>", "<staff_start>", "<eos>"}:
+            idx += 1
+            continue
+
+        if token == "<staff_end>":
+            # Flush any pending clef/key/time that arrived after the final
+            # <measure_end> (kern sometimes emits *clefF4 after the last barline).
+            # Insert into the last measure in the part; if no measure exists, drop.
+            _trailing_pending = [
+                ("pending_clef", pending_clef),
+                ("pending_key", pending_key),
+                ("pending_time", pending_time),
+            ]
+            _has_trailing = any(v is not None for _, v in _trailing_pending)
+            if _has_trailing:
+                _target = current_measure
+                if _target is None:
+                    _measures = list(part.getElementsByClass(stream.Measure))
+                    _target = _measures[-1] if _measures else None
+                if _target is not None:
+                    if pending_clef is not None:
+                        _target.append(pending_clef)
+                        pending_clef = None
+                    if pending_key is not None:
+                        _target.append(pending_key)
+                        pending_key = None
+                    if pending_time is not None:
+                        _target.append(pending_time)
+                        pending_time = None
             idx += 1
             continue
 
@@ -569,7 +665,7 @@ def _append_tokens_to_part_impl(
             idx += 1
             continue
 
-        current_voice = voices.setdefault(active_voice, stream.Voice(id=f"voice_{active_voice}"))
+        current_voice = voices.setdefault(active_voice, stream.Voice(id=str(active_voice)))
         if pending_dynamic_tokens:
             for dynamic_mark in pending_dynamic_tokens:
                 try:
@@ -587,7 +683,10 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
-            _append_event_to_voice(current_voice, note.Rest(quarterLength=duration_q))
+            next_idx = _consume_post_duration_modifiers(next_idx)
+            rest_event = note.Rest(quarterLength=duration_q)
+            _apply_tie(rest_event)
+            _append_event_to_voice(current_voice, rest_event)
             idx = next_idx
             continue
 
@@ -620,6 +719,7 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
+            next_idx = _consume_post_duration_modifiers(next_idx)
             if chord_pitches:
                 chord_event = chord.Chord(chord_pitches, quarterLength=duration_q)
                 _apply_articulations_and_expressions(chord_event)
@@ -647,6 +747,7 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
+            next_idx = _consume_post_duration_modifiers(next_idx)
             note_event = note.Note(pitch, quarterLength=duration_q)
             _apply_articulations_and_expressions(note_event)
             _apply_tie(note_event)
@@ -666,6 +767,7 @@ def _append_tokens_to_part_impl(
                 idx += 1
                 continue
             duration_q, next_idx = duration_result
+            next_idx = _consume_post_duration_modifiers(next_idx)
             grace_event = note.Note(pitch, quarterLength=duration_q).getGrace()
             _apply_articulations_and_expressions(grace_event)
             _apply_tie(grace_event)
@@ -681,6 +783,94 @@ def _append_tokens_to_part_impl(
 
     for slur in created_spanners:
         part.insert(0, slur)
+
+    # End-of-tokens trailing-pending flush: when callers pass a token list with
+    # <staff_end> stripped (e.g. sp2_render_grandstaff_v2.py's split_staves),
+    # the in-loop <staff_end> handler never fires, so a pending clef/key/time
+    # arriving after the final <measure_end> stays in pending_* and is dropped.
+    # Mirror the in-loop flush as a fallback at end-of-loop.
+    if pending_clef is not None or pending_key is not None or pending_time is not None:
+        _measures = list(part.getElementsByClass(stream.Measure))
+        _target = current_measure if current_measure is not None else (_measures[-1] if _measures else None)
+        if _target is not None:
+            if pending_clef is not None:
+                _target.append(pending_clef)
+                pending_clef = None
+            if pending_key is not None:
+                _target.append(pending_key)
+                pending_key = None
+            if pending_time is not None:
+                _target.append(pending_time)
+                pending_time = None
+
+    # Auto-beam: kern's L/J beam markers aren't preserved in our token vocab,
+    # so without makeBeams every eighth/sixteenth/etc. renders as a separate
+    # flagged note. makeBeams uses time-signature beat boundaries to produce
+    # conventional groupings (e.g. 16ths beam in groups of 4 in 4/4 time),
+    # which is what the kern reference shows in nearly all cases.
+    try:
+        part.makeBeams(inPlace=True)
+    except Exception:
+        pass  # fall through silently on rare music21 edge cases
+
+    # Multi-voice stem direction fix: in MusicXML convention voice 1 = stems up,
+    # voice 2+ = stems down. music21 auto-assigns by pitch height, which leaves
+    # both voices with same direction in many cases, causing verovio layer overlap.
+    from music21 import stream as _stream
+    from music21 import note as _note
+    from music21 import chord as _chord
+    for measure in part.getElementsByClass(_stream.Measure):
+        measure_voices = list(measure.getElementsByClass(_stream.Voice))
+        if len(measure_voices) <= 1:
+            continue
+        for voice in measure_voices:
+            try:
+                vid = int(voice.id) if voice.id is not None else 1
+            except (ValueError, TypeError):
+                vid = 1
+            target_dir = "up" if vid == 1 else "down"
+            for elem in voice:
+                if isinstance(elem, (_note.Note, _chord.Chord)):
+                    elem.stemDirection = target_dir
+
+    # Suppress redundant accidentals: ones implied by key signature or already
+    # established by a prior note in the same measure. Without this, every
+    # explicit pitch token (note-Bb4 etc.) renders an accidental in MusicXML/SVG
+    # even when conventional notation would not display it.
+    #
+    # We call makeAccidentals per-measure on a flattened view so notes from
+    # multiple voices are processed in temporal order. Calling on the whole
+    # Part processes voices independently in voice-id order, which can put
+    # the visible accidental on the wrong note when an early-time note in
+    # voice 2 shares pitch class with a later-time note in voice 1.
+    #
+    # cautionaryPitchClass=False, cautionaryNotImmediateRepeat=False: strict
+    # modern notation — accidentals don't carry across measures or octaves.
+    from music21 import stream as _ms_stream
+    from music21 import key as _ms_key
+    # Track the most-recent key signature seen at the part level so per-measure
+    # makeAccidentals on a flattened measure has the right altered-pitch context.
+    altered_pitches = []
+    for measure in part.getElementsByClass(_ms_stream.Measure):
+        # Update altered_pitches if this measure carries a new KeySignature.
+        for ks in measure.recurse().getElementsByClass(_ms_key.KeySignature):
+            altered_pitches = list(ks.alteredPitches)
+            break
+        try:
+            # Use music21 defaults (cautionaryPitchClass=True,
+            # cautionaryNotImmediateRepeat=True). cautionaryNotImmediateRepeat
+            # is what makes music21 ALSO emit naturals on different-octave
+            # notes overriding the key signature within the same measure
+            # (e.g. C-flat key sig must show a natural on BOTH C5 and C6 if
+            # both appear in a measure as naturals). Setting it to False
+            # silently drops those required naturals — worse than the mild
+            # cross-measure courtesy naturals it would also suppress.
+            measure.flatten().makeAccidentals(
+                inPlace=True,
+                alteredPitches=altered_pitches,
+            )
+        except Exception:
+            pass  # fall through silently on rare music21 edge cases
 
 
 def assembled_score_to_music21(score: AssembledScore):
