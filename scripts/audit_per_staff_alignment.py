@@ -8,6 +8,15 @@ Checks (no labels-root):
 Checks (with labels-root):
 - Does each page's manifest entry count match the label file's line count?
   Mismatch indicates post-filter renumbering hiding dropped staves.
+
+Dataset filter (--dataset):
+- The production synthetic_v2 manifest carries both 'synthetic_fullpage' and
+  'synthetic_polyphonic' variants per (page, staff_index) for piano score types.
+  This causes a page with 3 physical staves to produce 6 entries with indices
+  [0, 0, 1, 1, 2, 2], which trips the duplicate-index check spuriously.
+- Pass --dataset <value> to restrict loading to entries whose 'dataset' field
+  matches the given value before grouping by page_id.  When omitted, all entries
+  are loaded (backward-compatible).
 """
 from __future__ import annotations
 
@@ -17,7 +26,19 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-def _load_manifest_indices(manifest_path: Path) -> dict[str, list[int]]:
+def _load_manifest_indices(
+    manifest_path: Path,
+    dataset_filter: str | None = None,
+) -> dict[str, list[int]]:
+    """Load per-page staff_index lists from *manifest_path*.
+
+    Args:
+        manifest_path: Path to the JSONL manifest file.
+        dataset_filter: When not ``None``, only entries whose ``dataset`` field
+            equals this value are included.  Entries without a ``dataset`` field
+            are excluded when a filter is active.  When ``None`` (the default),
+            all entries are included regardless of ``dataset``.
+    """
     by_page: dict[str, list[int]] = defaultdict(list)
     with manifest_path.open("r", encoding="utf-8") as fh:
         for line_num, line in enumerate(fh, start=1):
@@ -26,6 +47,8 @@ def _load_manifest_indices(manifest_path: Path) -> dict[str, list[int]]:
                 continue
             try:
                 entry = json.loads(line)
+                if dataset_filter is not None and entry.get("dataset") != dataset_filter:
+                    continue
                 by_page[entry["page_id"]].append(int(entry["staff_index"]))
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 raise ValueError(
@@ -50,9 +73,20 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sample-size", type=int, default=20,
                         help="How many drifted pages to include in the report sample.")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help=(
+            "When set, only manifest entries whose 'dataset' field equals this value "
+            "are loaded. Useful for manifests that carry multiple dataset variants per "
+            "(page, staff_index) — e.g. synthetic_v2 has both 'synthetic_fullpage' and "
+            "'synthetic_polyphonic' for piano pages, which would otherwise trigger the "
+            "duplicate-index check spuriously."
+        ),
+    )
     args = parser.parse_args()
 
-    by_page = _load_manifest_indices(args.manifest)
+    by_page = _load_manifest_indices(args.manifest, dataset_filter=args.dataset)
     pages_total = len(by_page)
     pages_with_gap = 0
     pages_non_contiguous = 0
@@ -97,6 +131,7 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({
         "manifest": str(args.manifest),
+        "dataset_filter": args.dataset,
         "labels_root": str(args.labels_root) if args.labels_root else None,
         "pages_total": pages_total,
         "pages_with_duplicate_indices": pages_with_duplicate_indices,
