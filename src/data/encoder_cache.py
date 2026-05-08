@@ -1,0 +1,93 @@
+"""Encoder feature cache I/O library for Stage 3.
+
+Provides content-addressed storage for RadioEncoder.forward() output tensors.
+Cache identity is derived from four inputs:
+  1. SHA-256 of the encoder checkpoint file bytes.
+  2. SHA-256 of the preprocessing config dict (sorted-keys JSON).
+  3. RADIO architecture version string.
+  4. Git HEAD SHA (optional; omit with git_head_sha=None for CI environments).
+
+Storage layout:
+  <cache_root>/<hash16>/<tier>/<sample_key>.pt
+    where each .pt file is a tuple (tensor, h16, w16) saved via torch.save.
+    tensor shape: (seq_tokens, 1280), dtype=bfloat16.
+    h16, w16: spatial dimensions of the encoder output before flattening.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    import torch
+
+
+# ---------------------------------------------------------------------------
+# Public exception
+# ---------------------------------------------------------------------------
+
+class CacheMiss(FileNotFoundError):
+    """Raised when the cache does not contain an entry for the given key."""
+
+
+# ---------------------------------------------------------------------------
+# Hash + sanitization helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_sample_key(sample_id: str) -> str:
+    """Derive a filesystem-safe filename stem from a manifest sample_id.
+
+    Rules:
+      1. If sample_id contains ':', strip everything up to and including the
+         first ':' (removes the '<dataset>:' prefix).
+      2. Replace any remaining '/', ':', '\\' with '__'.
+    """
+    if ":" in sample_id:
+        sample_id = sample_id.split(":", 1)[1]
+    sample_id = sample_id.replace("/", "__").replace(":", "__").replace("\\", "__")
+    return sample_id
+
+
+def compute_cache_hash(
+    encoder_weights_path: Path,
+    preproc_cfg: dict,
+    radio_arch_version: str,
+    *,
+    git_head_sha: Optional[str],
+) -> str:
+    """Return a 16-character hex string used as the cache directory name.
+
+    Args:
+        encoder_weights_path: Path to the Stage 2 v2 checkpoint file. Its
+            full bytes are SHA-256'd so any weight change invalidates the cache.
+        preproc_cfg: Preprocessing config dict. Hashed via sorted-key JSON so
+            key ordering and whitespace changes in YAML do not invalidate.
+        radio_arch_version: String like "c-radio_v4-h". Hashed as UTF-8 bytes.
+        git_head_sha: Current git HEAD SHA (hex string). Pass None to skip
+            (e.g. fresh-clone CI environments where git state is unstable).
+
+    Returns:
+        First 16 hex characters of the combined SHA-256 digest.
+    """
+    # Component 1: encoder weights file bytes
+    weights_sha = hashlib.sha256(
+        Path(encoder_weights_path).read_bytes()
+    ).hexdigest()
+
+    # Component 2: preprocessing config (sorted-key JSON, whitespace-insensitive)
+    preproc_json = json.dumps(preproc_cfg, sort_keys=True, default=str)
+    preproc_sha = hashlib.sha256(preproc_json.encode("utf-8")).hexdigest()
+
+    # Component 3: RADIO architecture version
+    arch_sha = hashlib.sha256(radio_arch_version.encode("utf-8")).hexdigest()
+
+    # Component 4: git HEAD SHA (optional drift protection)
+    components = [weights_sha, preproc_sha, arch_sha]
+    if git_head_sha is not None:
+        git_sha = hashlib.sha256(git_head_sha.encode("utf-8")).hexdigest()
+        components.append(git_sha)
+
+    combined = hashlib.sha256("".join(components).encode("utf-8")).hexdigest()
+    return combined[:16]
