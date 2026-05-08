@@ -276,8 +276,16 @@ def main() -> int:
     print(f"[builder] cache hash: {hash16}", flush=True)
     print(f"[builder] cache directory: {args.cache_root / hash16}", flush=True)
 
-    # Pre-flight disk check
-    free_bytes = shutil.disk_usage(args.cache_root.parent if not args.cache_root.exists() else args.cache_root).free
+    # Pre-flight disk check — walk up to the nearest existing ancestor
+    # so we still get a meaningful free-space reading even when the cache
+    # root and its parent haven't been created yet.
+    _probe = args.cache_root
+    while not _probe.exists():
+        if _probe == _probe.parent:
+            _probe = Path(".").resolve()
+            break
+        _probe = _probe.parent
+    free_bytes = shutil.disk_usage(_probe).free
     print(f"[builder] free disk: {free_bytes / 1e9:.1f} GB", flush=True)
 
     # Load manifest
