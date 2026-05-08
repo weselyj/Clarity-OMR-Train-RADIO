@@ -213,3 +213,63 @@ def test_write_returns_correct_path(tmp_path: Path) -> None:
     p = write_cache_entry(tmp_path, "hash0000hash0000", "grandstaff_systems", "my_sample", t, h16=4, w16=8)
     assert p == tmp_path / "hash0000hash0000" / "grandstaff_systems" / "my_sample.pt"
     assert p.exists()
+
+
+# ---------------------------------------------------------------------------
+# Resumability test (mocked encoder)
+# ---------------------------------------------------------------------------
+
+def test_builder_skips_already_cached_entries(tmp_path: Path) -> None:
+    """If 5 of 10 entries are already cached, builder calls encoder only 5 times."""
+    from unittest.mock import MagicMock, patch
+    from src.data.encoder_cache import write_cache_entry, _sanitize_sample_key
+
+    hash16 = "test0000test0000"
+    cache_root = tmp_path / "cache"
+
+    # Pre-write 5 entries
+    for i in range(5):
+        t = _make_fake_tensor(seq_tokens=8)
+        key = _sanitize_sample_key(f"synthetic_systems:sample_{i:03d}")
+        write_cache_entry(cache_root, hash16, "synthetic_systems", key, t, h16=2, w16=4)
+
+    # Simulate 10 manifest entries
+    entries = [
+        {"sample_id": f"synthetic_systems:sample_{i:03d}", "dataset": "synthetic_systems",
+         "image_path": str(tmp_path / f"img_{i}.png")}
+        for i in range(10)
+    ]
+    # Create fake image files
+    import numpy as np
+    from PIL import Image
+    for i in range(10):
+        img = Image.fromarray(np.ones((32, 64), dtype=np.uint8) * 200)
+        img.save(tmp_path / f"img_{i}.png")
+
+    encoder_call_count = [0]
+
+    def fake_encode(image_batch):
+        encoder_call_count[0] += image_batch.shape[0]
+        B = image_batch.shape[0]
+        return torch.ones(B, 1280, 2, 4, dtype=torch.bfloat16)
+
+    # Import the core builder loop. The repo root must be on sys.path so
+    # `scripts/` is discoverable; pytest is normally invoked from the repo root,
+    # which satisfies this. If the import fails, add a `scripts/__init__.py`
+    # or run pytest with `PYTHONPATH=.` from the repo root.
+    from scripts.build_encoder_cache import _build_cache_for_entries
+    _build_cache_for_entries(
+        entries=entries,
+        cache_root=cache_root,
+        hash16=hash16,
+        encode_fn=fake_encode,
+        project_root=tmp_path,
+        image_height=32,
+        image_width=64,
+        batch_size=2,
+        dry_run=False,
+    )
+
+    assert encoder_call_count[0] == 5, (
+        f"Expected 5 encoder calls (5 cache hits skipped), got {encoder_call_count[0]}"
+    )
