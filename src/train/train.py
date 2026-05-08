@@ -2291,6 +2291,7 @@ def run_execute_mode(
                         stage_step=stage_step,
                         stage_steps_total=stage_total_steps,
                         stage_b_config=stage_b_config_dict,
+                        best_val_loss=best_val_loss,
                     )
                     checkpoints_written.append(str(checkpoint_path))
                     _checkpoint_ms = (_time.perf_counter() - _ckpt_t0) * 1000.0
@@ -2384,6 +2385,7 @@ def run_execute_mode(
                     stage_steps_total=stage_total_steps,
                     stage_b_config=stage_b_config_dict,
                     name_suffix="final",
+                    best_val_loss=best_val_loss,
                 )
                 checkpoints_written.append(str(final_path))
 
