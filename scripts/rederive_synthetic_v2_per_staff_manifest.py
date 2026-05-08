@@ -74,6 +74,26 @@ def build_per_source_groups(
     return dict(groups)
 
 
+def _resolve_corpus_path(
+    raw_path: str, project_root: Path, corpus_root: Path
+) -> Optional[Path]:
+    """Resolve a manifest path against project_root or corpus_root.
+
+    Production manifests store paths with the corpus prefix included
+    (e.g. 'data/processed/synthetic_v2/pages/...'), so they resolve under
+    project_root. Test fixtures typically use corpus-relative paths
+    (e.g. 'pages/bravura-compact/...'), which resolve under corpus_root.
+    Try project_root first; fall back to corpus_root.
+    """
+    candidate = project_root / raw_path
+    if candidate.exists():
+        return candidate
+    candidate = corpus_root / raw_path
+    if candidate.exists():
+        return candidate
+    return None
+
+
 def process_page(
     *,
     page_entry: dict,
@@ -108,14 +128,17 @@ def process_page(
         return []
 
     # 1. Read SVG text.
-    # Defensive guard: svg_path may be None on invalid pages.
+    # svg_path and label_path in production manifests include the corpus prefix
+    # (e.g. 'data/processed/synthetic_v2/pages/...'), so they resolve against
+    # project_root. Test fixtures use corpus-relative paths (no prefix), so we
+    # fall back to corpus_root if project_root resolution misses.
     raw_svg_path = page_entry.get("svg_path")
     if raw_svg_path is None:
         print(f"  [SKIP] svg_path is null for {page_id}, skipping.", flush=True)
         return []
-    svg_path = corpus_root / raw_svg_path
-    if not svg_path.exists():
-        print(f"  [WARN] SVG not found, skipping: {svg_path}", flush=True)
+    svg_path = _resolve_corpus_path(raw_svg_path, project_root, corpus_root)
+    if svg_path is None:
+        print(f"  [WARN] SVG not found, skipping: {raw_svg_path}", flush=True)
         return []
     svg_text = svg_path.read_text(encoding="utf-8")
 
@@ -125,9 +148,9 @@ def process_page(
     if raw_label_path is None:
         print(f"  [SKIP] label_path is null for {page_id} (yolo_label_valid=false), skipping.", flush=True)
         return []
-    label_path = corpus_root / raw_label_path
-    if not label_path.exists():
-        print(f"  [WARN] Label file not found, skipping: {label_path}", flush=True)
+    label_path = _resolve_corpus_path(raw_label_path, project_root, corpus_root)
+    if label_path is None:
+        print(f"  [WARN] Label file not found, skipping: {raw_label_path}", flush=True)
         return []
 
     staff_boxes: List[Tuple[float, float, float, float]] = []
