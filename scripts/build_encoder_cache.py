@@ -41,6 +41,7 @@ if str(ROOT) not in sys.path:
 import torch
 import yaml
 
+from src.checkpoint_io import load_stage_b_checkpoint
 from src.data.encoder_cache import (
     _sanitize_sample_key,
     cache_entry_exists,
@@ -298,19 +299,38 @@ def main() -> int:
     # Load model
     from src.models.radio_stage_b import RadioStageB, RadioStageBConfig
     print(f"[builder] loading checkpoint: {args.checkpoint}", flush=True)
-    payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    state_dict = payload.get("model_state_dict", payload)
-    # Strip compile wrapper prefix if present
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
+    # Extract dora_config from checkpoint payload before building model
+    _payload_peek = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    dora_config = _payload_peek.get("dora_config") if isinstance(_payload_peek, dict) else None
+    del _payload_peek  # free memory before DoRA wrapping allocates
+
+    device = torch.device(args.device)
     config = RadioStageBConfig()
     model = RadioStageB(config)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"[builder] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+
+    ckpt_result = load_stage_b_checkpoint(
+        checkpoint_path=Path(args.checkpoint),
+        model=model,
+        device=device,
+        dora_config=dora_config,
+        min_coverage=0.95,
+    )
+    model = ckpt_result["_model"]
+    print(f"[builder] checkpoint format: {ckpt_result['checkpoint_format']}", flush=True)
+    print(
+        f"[builder] coverage: {ckpt_result['load_ratio']:.1%}"
+        f" ({ckpt_result['loaded_keys']}/{ckpt_result['total_keys']})",
+        flush=True,
+    )
+    print(
+        f"[builder] missing={ckpt_result['missing_keys']}"
+        f" unexpected={ckpt_result['unexpected_keys']}",
+        flush=True,
+    )
     model.encoder.eval()
     for p in model.encoder.parameters():
         p.requires_grad_(False)
-    device = torch.device(args.device)
     model.encoder.to(device)
     print(f"[builder] encoder on {device}", flush=True)
 
