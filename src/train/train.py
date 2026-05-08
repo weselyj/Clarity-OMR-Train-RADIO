@@ -1238,6 +1238,7 @@ def _save_checkpoint(
     stage_steps_total: Optional[int] = None,
     stage_b_config: Optional[Dict[str, object]] = None,
     name_suffix: Optional[str] = None,
+    best_val_loss: Optional[float] = None,
 ) -> Path:
     import torch
 
@@ -1255,6 +1256,7 @@ def _save_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "stage_b_config": stage_b_config,
+        "best_val_loss": best_val_loss,
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
@@ -1538,6 +1540,22 @@ def _step_window_corrupted(prior: "torch.Tensor", loss: "torch.Tensor") -> "torc
     return prior | is_nonfinite.to(prior.device)
 
 
+def _should_skip_backward_on_corrupt(loss: "torch.Tensor") -> bool:
+    """Return True if loss is non-finite and backward() should be skipped.
+
+    This is a per-micro-batch early-exit check that avoids running
+    backward() through NaN/Inf loss values, which can corrupt the gradient
+    state for subsequent micro-batches in the same accumulation window and
+    may trigger CUDA errors on certain architectures.
+
+    The accumulation-window corruption flag (_step_window_corrupted) must
+    still be updated BEFORE this check is consulted, so the boundary logic
+    correctly discards the window even when backward() was skipped.
+    """
+    import torch
+    return not bool(torch.isfinite(loss).all().item())
+
+
 def _apply_cuda_perf_toggles() -> None:
     """Enable cuDNN auto-tuner and TF32 matmuls when CUDA is available.
 
@@ -1670,6 +1688,7 @@ def run_execute_mode(
     resume_stage_name: Optional[str] = None
     resume_optimizer_state = None
     resume_scheduler_state = None
+    resume_best_val_loss: Optional[float] = None
     global_step = 0
     if resume_checkpoint is not None:
         checkpoint_payload = resume_payload
@@ -1755,6 +1774,10 @@ def run_execute_mode(
         resume_stage_name = str(checkpoint_payload.get("stage_name") or "")
         resume_optimizer_state = checkpoint_payload.get("optimizer_state_dict")
         resume_scheduler_state = checkpoint_payload.get("scheduler_state_dict")
+        # Restore best_val_loss so that resume does not unconditionally overwrite
+        # _best.pt on the first validation pass.  Fall back to None for checkpoints
+        # saved before this fix (backward compat).
+        resume_best_val_loss: Optional[float] = checkpoint_payload.get("best_val_loss", None)
         print(
             f"[train] resuming from checkpoint: {resume_checkpoint} "
             f"(global_step={global_step}, stage='{resume_stage_name}')",
@@ -1971,7 +1994,10 @@ def run_execute_mode(
             losses: List[float] = []
             non_finite_events = 0
             stage_grad_alerts = 0
-            best_val_loss: Optional[float] = None
+            # On resume, restore best_val_loss from the checkpoint so we don't
+            # unconditionally overwrite _best.pt on the first validation pass.
+            # For new runs (or checkpoints pre-dating this fix) this is None.
+            best_val_loss: Optional[float] = resume_best_val_loss if resumed_stage else None
             best_val_step: Optional[int] = None
 
             # Build a DataLoader for this stage's training set.
@@ -2119,10 +2145,22 @@ def run_execute_mode(
                             loss = loss / accum_steps
 
                 # On-device OR-accumulator: no sync. Boundary-only sync below.
+                # Update BEFORE the early-skip check so the corruption flag is
+                # always set even when backward() is skipped for this micro-batch.
                 accum_corruption = _step_window_corrupted(accum_corruption, loss)
 
-                with timer.gpu("backward"):
-                    loss.backward()
+                # Early skip: if this micro-batch's loss is non-finite, do NOT
+                # call backward() — it would propagate NaN/Inf gradients into
+                # subsequent micro-batches in the window, wasting GPU time and
+                # risking CUDA errors on some architectures.  The boundary logic
+                # below discards the whole window via accum_corruption.
+                if _should_skip_backward_on_corrupt(loss):
+                    if not is_accum_step:
+                        timer.micro_batch_done()
+                        continue
+                else:
+                    with timer.gpu("backward"):
+                        loss.backward()
 
                 if not is_accum_step:
                     # Single CPU sync per micro-batch; cache the python float so any
@@ -2236,6 +2274,7 @@ def run_execute_mode(
                                         stage_steps_total=stage_total_steps,
                                         stage_b_config=stage_b_config_dict,
                                         name_suffix="best",
+                                        best_val_loss=best_val_loss,
                                     )
 
                 _checkpoint_ms: Optional[float] = None
