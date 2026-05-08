@@ -20,12 +20,17 @@ from pathlib import Path
 def _load_manifest_indices(manifest_path: Path) -> dict[str, list[int]]:
     by_page: dict[str, list[int]] = defaultdict(list)
     with manifest_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
+        for line_num, line in enumerate(fh, start=1):
             line = line.strip()
             if not line:
                 continue
-            entry = json.loads(line)
-            by_page[entry["page_id"]].append(int(entry["staff_index"]))
+            try:
+                entry = json.loads(line)
+                by_page[entry["page_id"]].append(int(entry["staff_index"]))
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"Bad manifest line {line_num} in {manifest_path}: {line!r}"
+                ) from exc
     return by_page
 
 
@@ -51,9 +56,14 @@ def main() -> int:
     pages_total = len(by_page)
     pages_with_gap = 0
     pages_non_contiguous = 0
+    pages_with_duplicate_indices = 0
     sample_drift: list[dict] = []
 
     for page_id, indices in by_page.items():
+        # Check for duplicate indices before deduplicating
+        if len(indices) != len(set(indices)):
+            pages_with_duplicate_indices += 1
+
         unique_sorted = sorted(set(indices))
         expected = list(range(len(unique_sorted)))
         if unique_sorted != expected:
@@ -69,14 +79,18 @@ def main() -> int:
     sample_label_mismatch: list[dict] = []
     if args.labels_root is not None:
         for page_id, indices in by_page.items():
-            manifest_count = len(set(indices))
+            # manifest_entry_count is raw count; manifest_unique_count is deduplicated count.
+            # Compare unique count to label line count for post-filter renumbering detection.
+            manifest_entry_count = len(indices)
+            manifest_unique_count = len(set(indices))
             label_count = _count_label_lines(args.labels_root, page_id)
-            if label_count is not None and label_count != manifest_count:
+            if label_count is not None and label_count != manifest_unique_count:
                 label_mismatch_pages += 1
                 if len(sample_label_mismatch) < args.sample_size:
                     sample_label_mismatch.append({
                         "page_id": page_id,
-                        "manifest_count": manifest_count,
+                        "manifest_entry_count": manifest_entry_count,
+                        "manifest_unique_count": manifest_unique_count,
                         "label_count": label_count,
                     })
 
@@ -85,6 +99,7 @@ def main() -> int:
         "manifest": str(args.manifest),
         "labels_root": str(args.labels_root) if args.labels_root else None,
         "pages_total": pages_total,
+        "pages_with_duplicate_indices": pages_with_duplicate_indices,
         "pages_with_index_gap": pages_with_gap,
         "pages_with_non_contiguous_indices": pages_non_contiguous,
         "pages_with_label_count_mismatch": label_mismatch_pages,

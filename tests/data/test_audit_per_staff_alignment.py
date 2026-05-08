@@ -93,5 +93,44 @@ def test_audit_with_labels_root_detects_post_filter_renumber(tmp_path: Path) -> 
     )
     data = json.loads(out.read_text())
     assert data["pages_with_label_count_mismatch"] == 1
-    assert data["sample_label_mismatch_pages"][0]["manifest_count"] == 7
+    assert data["sample_label_mismatch_pages"][0]["manifest_entry_count"] == 7
+    assert data["sample_label_mismatch_pages"][0]["manifest_unique_count"] == 7
     assert data["sample_label_mismatch_pages"][0]["label_count"] == 9
+
+
+def test_audit_duplicate_indices_flagged(tmp_path: Path) -> None:
+    """A page with duplicate staff_index values (e.g., [0, 1, 1, 2])
+    should be flagged as having duplicates, separate from contiguity."""
+    manifest = tmp_path / "manifest.jsonl"
+    _write_manifest(manifest, [
+        {"page_id": "p001", "staff_index": idx, "token_sequence": ["<bos>"]}
+        for idx in [0, 1, 1, 2]
+    ])
+    out = tmp_path / "audit.json"
+    subprocess.run(
+        ["python3", "scripts/audit_per_staff_alignment.py",
+         "--manifest", str(manifest), "--output", str(out)],
+        cwd="/home/ari/work/Clarity-OMR-Train-RADIO",
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(out.read_text())
+    assert data["pages_with_duplicate_indices"] == 1
+    assert data["pages_with_non_contiguous_indices"] == 0
+
+
+def test_audit_raises_on_malformed_manifest_line(tmp_path: Path) -> None:
+    """A malformed JSON line should raise with line number context."""
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        '{"page_id": "p001", "staff_index": 0, "token_sequence": ["<bos>"]}\n'
+        '{not json\n'  # malformed
+    )
+    out = tmp_path / "audit.json"
+    result = subprocess.run(
+        ["python3", "scripts/audit_per_staff_alignment.py",
+         "--manifest", str(manifest), "--output", str(out)],
+        cwd="/home/ari/work/Clarity-OMR-Train-RADIO",
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "Bad manifest line 2" in result.stderr
