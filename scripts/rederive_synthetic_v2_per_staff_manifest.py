@@ -108,14 +108,24 @@ def process_page(
         return []
 
     # 1. Read SVG text.
-    svg_path = corpus_root / page_entry["svg_path"]
+    # Defensive guard: svg_path may be None on invalid pages.
+    raw_svg_path = page_entry.get("svg_path")
+    if raw_svg_path is None:
+        print(f"  [SKIP] svg_path is null for {page_id}, skipping.", flush=True)
+        return []
+    svg_path = corpus_root / raw_svg_path
     if not svg_path.exists():
         print(f"  [WARN] SVG not found, skipping: {svg_path}", flush=True)
         return []
     svg_text = svg_path.read_text(encoding="utf-8")
 
     # 2. Read per-staff YOLO labels → pixel-space staff_boxes.
-    label_path = corpus_root / page_entry["label_path"]
+    # Guard: label_path is null when yolo_label_valid is False.
+    raw_label_path = page_entry.get("label_path")
+    if raw_label_path is None:
+        print(f"  [SKIP] label_path is null for {page_id} (yolo_label_valid=false), skipping.", flush=True)
+        return []
+    label_path = corpus_root / raw_label_path
     if not label_path.exists():
         print(f"  [WARN] Label file not found, skipping: {label_path}", flush=True)
         return []
@@ -215,8 +225,12 @@ def process_page(
         dataset_variants=dataset_variants,
     )
 
-    # 10. Advance offset after processing this page.
-    state["offset"] += sum(svg_measures)
+    # 10. Advance offset only when crops survived — mirrors the original
+    #     generate_synthetic.py behavior where the offset is updated inside
+    #     the `if staff_crop_entries:` branch. Pages where all crops fail the
+    #     ink filter must not shift the measure-range window for subsequent pages.
+    if raw_crop_entries:
+        state["offset"] += sum(svg_measures)
 
     return new_rows
 

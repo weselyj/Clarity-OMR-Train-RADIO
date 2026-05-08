@@ -344,3 +344,209 @@ def test_rederive_offset_accumulates_per_source(tmp_path: Path) -> None:
     assert captured_offsets["B"] == [0, 2], (
         f"Source B offsets should be [0, 2], got {captured_offsets['B']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test A: pages with null label_path are skipped without crashing
+# ---------------------------------------------------------------------------
+
+
+def test_rederive_skips_pages_with_null_label_path(tmp_path: Path) -> None:
+    """process_page must return [] (not raise) when label_path is None.
+
+    synthetic_pages.jsonl stores label_path: null for pages where
+    yolo_label_valid is False. Before the fix, the code did:
+        label_path = corpus_root / page_entry["label_path"]
+    which raises TypeError: argument should be str or an os.PathLike object,
+    not 'NoneType'.
+    """
+    from scripts.rederive_synthetic_v2_per_staff_manifest import process_page
+
+    # Page entry with label_path explicitly null (mirrors JSONL with null value)
+    page_entry = _make_page_entry(
+        page_id="score__bravura__p001",
+        source_path="data/test/score.musicxml",
+        style_id="bravura-compact",
+        score_type="piano",
+        page_number=1,
+        page_width=1000.0,
+        page_height=1400.0,
+        svg_path="pages/bravura-compact/score__bravura__p001.svg",
+        label_path="labels/bravura-compact/score__bravura__p001.txt",
+    )
+    # Override to simulate yolo_label_valid=false → label_path=null
+    page_entry["label_path"] = None
+    page_entry["yolo_label_valid"] = False
+
+    # Minimal corpus on disk — SVG exists (should never be reached), no label file
+    corpus_root = tmp_path / "corpus"
+    svg_dir = corpus_root / "pages" / "bravura-compact"
+    svg_dir.mkdir(parents=True)
+    (svg_dir / "score__bravura__p001.svg").write_text("<svg/>", encoding="utf-8")
+
+    mock_token_seqs: List[List[str]] = [
+        ["<bos>", "<staff_start>", "<measure_start>", "tok", "<measure_end>", "<staff_end>", "<eos>"]
+    ]
+    state = {"offset": 0, "tokens": mock_token_seqs}
+    token_cache = {"data/test/score.musicxml": mock_token_seqs}
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    # Must not raise; must return an empty list
+    result = process_page(
+        page_entry=page_entry,
+        state=state,
+        token_cache=token_cache,
+        corpus_root=corpus_root,
+        data_root=data_root,
+        project_root=repo_root,
+    )
+
+    assert result == [], f"Expected [] for null label_path page, got {result}"
+    # Offset must NOT advance (page was skipped)
+    assert state["offset"] == 0, f"Offset should remain 0, got {state['offset']}"
+
+
+# ---------------------------------------------------------------------------
+# Test B: offset not advanced when no crops survive the filter
+# ---------------------------------------------------------------------------
+
+
+def test_offset_not_advanced_when_no_crops_survive(tmp_path: Path) -> None:
+    """When _write_staff_crops returns [] (all crops rejected by ink filter),
+    state["offset"] must NOT be advanced for that page.
+
+    This mirrors the original generate_synthetic.py behavior where
+    cumulative_measure_offset is only updated inside the branch that checks
+    `if staff_crop_entries:`.
+
+    Setup: 2 pages in the same source × style group, each with a 2-measure
+    SVG layout. Page 1 returns no crops (empty list from _write_staff_crops).
+    Page 2 returns 1 crop normally. After processing both pages:
+    - After page 1: offset must still be 0 (no crops → no advance).
+    - After page 2: offset must be 2 (page 2 advances by its 2 measures).
+    """
+    from scripts.rederive_synthetic_v2_per_staff_manifest import process_page
+
+    style = "bravura-compact"
+    src = "data/test/score.musicxml"
+    label_text = _make_yolo_label_lines([(0.5, 0.5, 0.9, 0.1)])
+
+    mock_token_seqs: List[List[str]] = [
+        ["<bos>", "<staff_start>"]
+        + [tok for m in range(6) for tok in ["<measure_start>", f"note_m{m}", "<measure_end>"]]
+        + ["<staff_end>", "<eos>"]
+    ]
+    state = {"offset": 0, "tokens": mock_token_seqs}
+    token_cache = {src: mock_token_seqs}
+
+    from src.data.generate_synthetic import _SvgSystemInfo
+
+    mock_svg_layout_2m = [
+        _SvgSystemInfo(
+            measure_count=2,
+            staves_per_system=1,
+            y_top=0.0,
+            y_bottom=1400.0,
+            x_left=10.0,
+        )
+    ]
+    mock_staff_to_system = {0: (0, 0)}
+
+    corpus_root = tmp_path / "corpus"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    for pno in [1, 2]:
+        page_id = f"score__bravura__p{pno:03d}"
+        svg_dir = corpus_root / "pages" / style
+        svg_dir.mkdir(parents=True, exist_ok=True)
+        (svg_dir / f"{page_id}.svg").write_text("<svg/>", encoding="utf-8")
+        lbl_dir = corpus_root / "labels" / style
+        lbl_dir.mkdir(parents=True, exist_ok=True)
+        (lbl_dir / f"{page_id}.txt").write_text(label_text, encoding="utf-8")
+        crops_dir = corpus_root / "staff_crops" / style
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        (crops_dir / f"{page_id}__staff01.png").touch()
+
+    entry_p1 = _make_page_entry(
+        page_id="score__bravura__p001",
+        source_path=src,
+        style_id=style,
+        score_type="vocal",
+        page_number=1,
+        svg_path=f"pages/{style}/score__bravura__p001.svg",
+        label_path=f"labels/{style}/score__bravura__p001.txt",
+    )
+    entry_p2 = _make_page_entry(
+        page_id="score__bravura__p002",
+        source_path=src,
+        style_id=style,
+        score_type="vocal",
+        page_number=2,
+        svg_path=f"pages/{style}/score__bravura__p002.svg",
+        label_path=f"labels/{style}/score__bravura__p002.txt",
+    )
+
+    # Page 1: _write_staff_crops returns [] (all crops rejected)
+    with (
+        patch(
+            "scripts.rederive_synthetic_v2_per_staff_manifest._write_staff_crops",
+            return_value=[],  # no crops survive
+        ),
+        patch(
+            "scripts.rederive_synthetic_v2_per_staff_manifest._extract_system_layout_from_svg",
+            return_value=mock_svg_layout_2m,
+        ),
+        patch(
+            "scripts.rederive_synthetic_v2_per_staff_manifest._assign_staff_boxes_to_systems",
+            return_value=mock_staff_to_system,
+        ),
+    ):
+        rows_p1 = process_page(
+            page_entry=entry_p1,
+            state=state,
+            token_cache=token_cache,
+            corpus_root=corpus_root,
+            data_root=data_root,
+            project_root=repo_root,
+        )
+
+    # After page 1 (no crops): offset must NOT advance
+    assert state["offset"] == 0, (
+        f"Offset should remain 0 after empty-crop page, got {state['offset']}"
+    )
+
+    # Page 2: one crop survives normally
+    with (
+        patch(
+            "scripts.rederive_synthetic_v2_per_staff_manifest._write_staff_crops",
+            return_value=[(tmp_path / "tmp_staff01.png", 0)],
+        ),
+        patch(
+            "scripts.rederive_synthetic_v2_per_staff_manifest._extract_system_layout_from_svg",
+            return_value=mock_svg_layout_2m,
+        ),
+        patch(
+            "scripts.rederive_synthetic_v2_per_staff_manifest._assign_staff_boxes_to_systems",
+            return_value=mock_staff_to_system,
+        ),
+    ):
+        rows_p2 = process_page(
+            page_entry=entry_p2,
+            state=state,
+            token_cache=token_cache,
+            corpus_root=corpus_root,
+            data_root=data_root,
+            project_root=repo_root,
+        )
+
+    # After page 2 (1 crop, 2 measures): offset must advance by 2
+    assert state["offset"] == 2, (
+        f"Offset should be 2 after normal page with 2 measures, got {state['offset']}"
+    )
