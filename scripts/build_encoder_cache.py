@@ -297,17 +297,30 @@ def main() -> int:
         print(f"[builder] DRY RUN: processing first {DRY_RUN_SAMPLE_LIMIT} entries", flush=True)
 
     # Load model
-    from src.models.radio_stage_b import RadioStageB, RadioStageBConfig
+    from src.tokenizer.vocab import build_default_vocabulary
+    from src.train.model_factory import (
+        ModelFactoryConfig,
+        build_stage_b_components,
+        model_factory_config_from_checkpoint_payload,
+    )
     print(f"[builder] loading checkpoint: {args.checkpoint}", flush=True)
 
-    # Extract dora_config from checkpoint payload before building model
-    _payload_peek = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    dora_config = _payload_peek.get("dora_config") if isinstance(_payload_peek, dict) else None
-    del _payload_peek  # free memory before DoRA wrapping allocates
+    # Reconstruct factory config from checkpoint metadata (encoder type, dora_rank, etc.)
+    # so that build_stage_b_components produces the correct model architecture and dora_config.
+    checkpoint_payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    vocab = build_default_vocabulary()
+    fallback_factory_cfg = ModelFactoryConfig(stage_b_vocab_size=vocab.size)
+    factory_cfg = model_factory_config_from_checkpoint_payload(
+        checkpoint_payload,
+        vocab_size=vocab.size,
+        fallback=fallback_factory_cfg,
+    )
+    del checkpoint_payload  # free memory before DoRA wrapping allocates
 
     device = torch.device(args.device)
-    config = RadioStageBConfig()
-    model = RadioStageB(config)
+    components = build_stage_b_components(factory_cfg)
+    model = components["model"]
+    dora_config = components.get("dora_config")
 
     ckpt_result = load_stage_b_checkpoint(
         checkpoint_path=Path(args.checkpoint),
