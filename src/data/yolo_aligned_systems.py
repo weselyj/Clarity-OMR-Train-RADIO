@@ -228,10 +228,12 @@ def process_page_systems(
             dropped_token_miss += 1
             continue
 
-        # Assemble multi-staff sequence; trap marker overflow as a drop, not a crash
+        # Assemble multi-staff sequence; trap marker overflow (ValueError) and
+        # malformed per-staff wrappers (AssertionError from assemble_multi_staff_tokens)
+        # as drops rather than crashes. The docstring contract is "no exceptions raised".
         try:
             multi_seq = assemble_multi_staff_tokens(per_staff_seqs)
-        except ValueError:
+        except (ValueError, AssertionError):
             dropped_marker_overflow += 1
             continue
 

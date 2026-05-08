@@ -119,3 +119,43 @@ def test_manifest_rows_emit_per_dataset_variant() -> None:
     assert "p__staff01__poly" in sample_ids
     assert "p__staff02" in sample_ids
     assert "p__staff02__poly" in sample_ids
+
+
+def test_manifest_rows_no_drop_equivalence_regression_guard() -> None:
+    """Regression guard: when zero crops are filtered, every emitted row has a
+    non-None image_path and staff_index matches its enumerate position. Pre-fix
+    code produced this same shape; post-fix must too. If a future refactor
+    breaks the no-drop equivalence, this test fails."""
+    from src.data.generate_synthetic import _build_manifest_rows_for_page
+
+    n = 5
+    staff_crop_entries = [(Path(f"crop_{i}.png"), i) for i in range(n)]
+    token_sequences_by_phys = {
+        i: ["<bos>", "<staff_start>", f"phys-{i}", "<staff_end>", "<eos>"]
+        for i in range(n)
+    }
+
+    rows = _build_manifest_rows_for_page(
+        page_basename="page",
+        staff_crop_entries=staff_crop_entries,
+        total_physical_staves=n,
+        token_sequences_by_phys=token_sequences_by_phys,
+        page_number=1,
+        style_id="x",
+        score_type="vocal",
+        source_relpath="src",
+        project_root=Path("/tmp"),
+        dataset_variants=[("synthetic_fullpage", "")],
+    )
+
+    # Equivalence properties of a no-drop page:
+    #   1. one row per physical position (no drops, no extras)
+    assert len(rows) == n
+    #   2. every row carries a non-None image_path (no filter rejections)
+    assert all(r["image_path"] is not None for r in rows), (
+        "no-drop page must produce non-None image_path for every row; "
+        "if this fails the producer regressed past the alignment fix"
+    )
+    #   3. staff_index matches the enumerate position (which equals physical index here)
+    for i, r in enumerate(rows):
+        assert r["staff_index"] == i

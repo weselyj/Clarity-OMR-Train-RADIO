@@ -293,6 +293,34 @@ def test_process_page_systems_handles_token_miss(tmp_path: Path):
     assert report["dropped_token_miss"] == 1
 
 
+def test_process_page_systems_drops_on_malformed_staff_tokens(tmp_path: Path):
+    """If a matched system's per-staff tokens are malformed (missing wrapper),
+    drop the system rather than crash. The docstring contract says
+    process_page_systems raises no exceptions."""
+    page = Image.new("RGB", (1000, 1500))
+    page_path = tmp_path / "page.png"
+    page.save(page_path)
+
+    (tmp_path / "page.txt").write_text("0 0.5 0.5 0.9 0.5\n")
+    (tmp_path / "page.staves.json").write_text("[2]")
+
+    yolo_model = _FakeYoloModel([((50, 375, 950, 1125), 0.99)])
+    token_lookup = {
+        ("p", 0): {"page_id": "p", "staff_index": 0, "style_id": "x", "page_number": 1, "split": "train", "source_path": "s", "source_format": "musicxml", "score_type": "piano",
+                   "token_sequence": ["<bos>", "<staff_start>", "x", "<staff_end>", "<eos>"], "token_count": 5, "dataset": "synthetic_fullpage"},
+        ("p", 1): {"page_id": "p", "staff_index": 1, "style_id": "x", "page_number": 1, "split": "train", "source_path": "s", "source_format": "musicxml", "score_type": "piano",
+                   "token_sequence": ["clef-G2", "note-C4"], "token_count": 2, "dataset": "synthetic_fullpage"},  # malformed: missing <bos>/<eos>/staff wrappers
+    }
+    entries, report = process_page_systems(
+        page_id="p", page_image_path=page_path, oracle_label_path=tmp_path / "page.txt",
+        oracle_staves_json_path=tmp_path / "page.staves.json",
+        yolo_model=yolo_model, token_lookup=token_lookup,
+        out_crops_dir=tmp_path / "crops", crop_path_template="crops/{filename}",
+    )
+    assert len(entries) == 0
+    assert report["dropped_marker_overflow"] == 1
+
+
 def test_process_page_systems_handles_non_contiguous_physical_indices(tmp_path: Path):
     """Contract test: token_lookup is keyed by (page_id, PHYSICAL staff index).
 

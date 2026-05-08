@@ -41,6 +41,11 @@ def main() -> int:
 
     print(f"[audit] auditing {len(krn_paths):,} .krn files", file=sys.stderr)
 
+    # `results` collects only successful comparisons. Files that throw during
+    # parsing are counted in `files_failed_to_compare` but NOT appended to
+    # `results`, so the comparable_total denominator excludes them. Previously
+    # we appended a synthetic empty-divergence CompareResult on errors, which
+    # silently inflated the pass-rate denominator.
     results: List[CompareResult] = []
     files_passed = 0
     files_failed_to_compare = 0
@@ -50,34 +55,34 @@ def main() -> int:
             results.append(r)
             if r.passed:
                 files_passed += 1
-        except Exception as e:
+        except Exception:
             files_failed_to_compare += 1
-            # Don't stop the audit; just record an error result.
-            results.append(
-                CompareResult(
-                    kern_path=kp,
-                    ref_canonical=[],
-                    our_canonical=[],
-                    divergences=[],
-                )
-            )
+            # Do not append to results — error files are tracked separately
+            # and excluded from the pass-rate denominator.
         if (i + 1) % args.progress_every == 0:
             print(f"[audit] {i+1}/{len(krn_paths)}  passed={files_passed}  errors={files_failed_to_compare}", file=sys.stderr)
 
     summary = summarize_divergences(results)
+    comparable_total = len(results)
+    files_with_divergences = sum(1 for r in results if not r.passed)
+    pass_rate = files_passed / comparable_total if comparable_total > 0 else 0.0
 
     report = {
         "audit_run_at": datetime.now(timezone.utc).isoformat(),
-        "files_audited": len(results),
+        "files_audited": len(krn_paths),
+        "files_compared": comparable_total,
         "files_passed": files_passed,
-        "files_with_divergences": sum(1 for r in results if not r.passed),
+        "files_with_divergences": files_with_divergences,
         "files_failed_to_compare": files_failed_to_compare,
+        "pass_rate": pass_rate,
         "divergence_categories": summary,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"[audit] report: {args.output}", file=sys.stderr)
-    print(f"[audit] {files_passed}/{len(results)} files passed", file=sys.stderr)
+    print(f"[audit] {files_passed}/{comparable_total} comparable files passed "
+          f"({pass_rate:.1%}); {files_failed_to_compare} files failed to compare",
+          file=sys.stderr)
     return 0
 
 
