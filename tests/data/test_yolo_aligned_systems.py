@@ -291,3 +291,91 @@ def test_process_page_systems_handles_token_miss(tmp_path: Path):
     )
     assert len(entries) == 0
     assert report["dropped_token_miss"] == 1
+
+
+def test_process_page_systems_handles_non_contiguous_physical_indices(tmp_path: Path):
+    """Contract test: token_lookup is keyed by (page_id, PHYSICAL staff index).
+
+    Reproduces the synthetic_v2 page Abbott_p001 scenario: 9 physical staves
+    arranged as 3 systems of 3, where physical positions 4, 7, and 8 are
+    missing from the per-staff manifest.
+
+    Expected behavior (which is the CURRENT behavior of process_page_systems
+    using physical-position cumsum lookup):
+    - system 0 expects physical staves [0, 1, 2] → all present → assembled.
+    - system 1 expects physical staves [3, 4, 5] → position 4 missing → drop via token_miss.
+    - system 2 expects physical staves [6, 7, 8] → positions 7,8 missing → drop via token_miss.
+
+    If anyone changes staff_indices_for_system to use post-filter contiguous
+    semantics (i.e., looking up [0..K-1] of the surviving entries instead of
+    physical positions [0..N-1]), this test fails because system 1 and system 2
+    would silently look up indices 3, 4, 5 of the surviving entries — which
+    map to physical positions 3, 5, 6 — producing wrong-staff tokens.
+    """
+    page = Image.new("RGB", (1000, 1500))
+    page_path = tmp_path / "page.png"
+    page.save(page_path)
+
+    # 3 systems, vertically stacked at y_centers 0.2, 0.5, 0.8
+    txt = tmp_path / "page.txt"
+    txt.write_text(
+        "0 0.5 0.2 0.9 0.18\n"
+        "0 0.5 0.5 0.9 0.18\n"
+        "0 0.5 0.8 0.9 0.18\n"
+    )
+    (tmp_path / "page.staves.json").write_text("[3, 3, 3]")
+
+    # Per-staff manifest has entries at PHYSICAL indices [0, 1, 2, 3, 5, 6].
+    # Indices 4, 7, 8 are missing — the synthetic_v2 filter dropped those crops.
+    def _staff_seq(label):
+        return ["<bos>", "<staff_start>", label, "<staff_end>", "<eos>"]
+    token_lookup = {}
+    for phys_idx in [0, 1, 2, 3, 5, 6]:
+        token_lookup[("p_canary", phys_idx)] = {
+            "page_id": "p_canary",
+            "staff_index": phys_idx,
+            "style_id": "x",
+            "page_number": 1,
+            "split": "train",
+            "source_path": "s",
+            "source_format": "musicxml",
+            "score_type": "vocal",
+            "token_sequence": _staff_seq(f"phys-{phys_idx}"),
+            "token_count": 5,
+            "dataset": "synthetic_fullpage",
+        }
+
+    # YOLO finds all 3 systems with high IoU
+    yolo_model = _FakeYoloModel([
+        ((50, 165, 950, 435), 0.99),   # system 0: y in [165, 435]
+        ((50, 615, 950, 885), 0.99),   # system 1: y in [615, 885]
+        ((50, 1065, 950, 1335), 0.99), # system 2: y in [1065, 1335]
+    ])
+
+    entries, report = process_page_systems(
+        page_id="p_canary",
+        page_image_path=page_path,
+        oracle_label_path=txt,
+        oracle_staves_json_path=tmp_path / "page.staves.json",
+        yolo_model=yolo_model,
+        token_lookup=token_lookup,
+        out_crops_dir=tmp_path / "crops",
+        crop_path_template="crops/{filename}",
+        iou_threshold=0.5,
+    )
+
+    # System 0 assembled cleanly; systems 1 and 2 dropped via token_miss.
+    assert report["yolo_boxes"] == 3
+    assert report["oracle_systems"] == 3
+    assert report["matches"] == 3
+    assert report["dropped_token_miss"] == 2
+    assert len(entries) == 1
+    assert entries[0]["system_index"] == 0
+    # System 0 carries the correct per-staff tokens: phys-0, phys-1, phys-2 (in that order).
+    seq = entries[0]["token_sequence"]
+    assert "phys-0" in seq
+    assert "phys-1" in seq
+    assert "phys-2" in seq
+    # And no tokens leaked from physical positions in other systems
+    for leaked in ["phys-3", "phys-5", "phys-6"]:
+        assert leaked not in seq
