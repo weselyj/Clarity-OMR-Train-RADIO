@@ -2014,6 +2014,67 @@ def _extract_measure_range_from_sequence(
     return result
 
 
+def _build_manifest_rows_for_page(
+    *,
+    page_basename: str,
+    staff_crop_entries: List[Tuple[Path, int]],
+    total_physical_staves: int,
+    token_sequences_by_phys: Dict[int, List[str]],
+    page_number: int,
+    style_id: str,
+    score_type: str,
+    source_relpath: str,
+    project_root: Path,
+    dataset_variants: Sequence[Tuple[str, str]],
+) -> List[dict]:
+    """Build per-staff manifest rows keyed by PHYSICAL staff position.
+
+    For each physical staff position 0..total_physical_staves-1, emit a manifest
+    entry IF a token sequence exists for that position. If the position has a
+    surviving crop in `staff_crop_entries`, the `image_path` is set; otherwise
+    `image_path` is None (the filter rejected the crop, but the token sequence
+    is still derivable from the source split).
+
+    Tokens come from `token_sequences_by_phys[physical_position]`. Callers are
+    responsible for computing that lookup according to whichever code path
+    (SVG primary or proportional fallback) they use.
+
+    The output is a list of row dicts ready to extend a `token_rows` list. Per
+    `dataset_variants`, each physical position emits one row per (dataset_name,
+    sample_suffix) pair.
+    """
+    crop_path_by_phys = {phys: path for path, phys in staff_crop_entries}
+
+    rows: List[dict] = []
+    for phys_idx in range(total_physical_staves):
+        token_sequence = token_sequences_by_phys.get(phys_idx)
+        if token_sequence is None:
+            continue
+        crop_path = crop_path_by_phys.get(phys_idx)
+        image_path = relpath(project_root, crop_path) if crop_path is not None else None
+        base_sample_id = f"{page_basename}__staff{phys_idx + 1:02d}"
+        for dataset_name, sample_suffix in dataset_variants:
+            sample_id = f"{base_sample_id}{sample_suffix}"
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "dataset": dataset_name,
+                    "split": "train",
+                    "image_path": image_path,
+                    "page_id": page_basename,
+                    "source_path": source_relpath,
+                    "style_id": style_id,
+                    "page_number": page_number,
+                    "staff_index": phys_idx,
+                    "source_format": "musicxml",
+                    "score_type": score_type,
+                    "token_sequence": token_sequence,
+                    "token_count": len(token_sequence),
+                }
+            )
+    return rows
+
+
 def _write_staff_crops(
     *,
     svg_text: str,
