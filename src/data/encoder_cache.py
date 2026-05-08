@@ -129,7 +129,12 @@ def write_cache_entry(
     dest_dir = Path(cache_root) / hash16 / tier
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{sample_key}.pt"
-    payload = (tensor.cpu().to(torch.bfloat16), int(h16), int(w16))
+    # `.clone()` materializes a fresh contiguous storage. Without it, a tensor
+    # that's a slice of a larger batch (e.g. `feature_map[i]` from an encoder
+    # forward over a batch of B samples) would serialize the entire batch's
+    # underlying storage — bloating each .pt file by ~B× on disk.
+    payload = (tensor.detach().cpu().to(torch.bfloat16).contiguous().clone(),
+               int(h16), int(w16))
     torch.save(payload, dest)
     return dest
 

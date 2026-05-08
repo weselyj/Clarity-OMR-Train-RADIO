@@ -215,6 +215,41 @@ def test_write_returns_correct_path(tmp_path: Path) -> None:
     assert p.exists()
 
 
+def test_write_cache_entry_does_not_serialize_full_batch_storage(tmp_path: Path) -> None:
+    """Regression: writing a sliced tensor must not bloat the file by the batch factor.
+
+    `feature_map[i]` from a batched encoder forward is a slice that shares storage
+    with the full batch. Without `.clone()` in the writer, torch.save would serialize
+    the entire batch's underlying storage per sample, bloating each file ~B× on disk.
+    This test fakes that scenario and asserts the file size matches the tensor data
+    size (with small torch-pickle header overhead), NOT the full batch storage.
+    """
+    import torch
+    from src.data.encoder_cache import write_cache_entry
+
+    batch_size = 8
+    h16, w16 = 4, 6
+    seq_tokens = h16 * w16
+    hidden_dim = 1280
+
+    # Simulate the build script's pattern: a (B, C, H, W) batch tensor, then
+    # take a per-sample slice and reshape to (seq_tokens, C).
+    full_batch = torch.randn(batch_size, hidden_dim, h16, w16, dtype=torch.bfloat16)
+    sample_slice = full_batch[3].flatten(1).transpose(0, 1)  # (seq_tokens, 1280)
+    # The slice shares storage with the full batch:
+    assert sample_slice.untyped_storage().nbytes() == full_batch.numel() * 2
+
+    p = write_cache_entry(tmp_path, "h" * 16, "synthetic_systems", "s0", sample_slice, h16=h16, w16=w16)
+
+    actual_bytes = p.stat().st_size
+    data_bytes = seq_tokens * hidden_dim * 2  # bf16
+    # Allow up to 32 KB of pickle/header overhead, but reject 8× bloat (full batch).
+    assert actual_bytes < data_bytes + 32_768, (
+        f"file size {actual_bytes} bytes exceeds tensor data size {data_bytes} + 32KB header. "
+        f"Likely the slice's full-batch storage was serialized — clone before save."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Resumability test (mocked encoder)
 # ---------------------------------------------------------------------------

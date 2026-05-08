@@ -223,8 +223,12 @@ def _build_cache_for_entries(
 
         # Write per-sample files
         for b_idx, (entry, ds, key) in enumerate(valid_pending):
-            tensor = feature_map[b_idx].cpu().to(torch.bfloat16)
-            flat = tensor.flatten(1).transpose(0, 1)  # (h16*w16, 1280) = (seq_tokens, 1280)
+            # `.clone()` here too belt-and-suspenders alongside the clone in
+            # `write_cache_entry`: the slice `feature_map[b_idx]` references
+            # the entire batch's storage, so naive serialization would write
+            # ~8× the actual sample data per file.
+            tensor = feature_map[b_idx].detach().cpu().to(torch.bfloat16).contiguous().clone()
+            flat = tensor.flatten(1).transpose(0, 1).contiguous()  # (seq_tokens, 1280)
             p = write_cache_entry(cache_root, hash16, ds, key, flat, h16=h16, w16=w16)
             stats["written"] += 1
             stats["total_bytes"] += p.stat().st_size
