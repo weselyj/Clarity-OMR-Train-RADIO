@@ -251,8 +251,10 @@ def main() -> int:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("data"),
-        help="Repo data root; source_path entries in the pages manifest are relative to this.",
+        default=Path("."),
+        help="Path source_path entries resolve against. Default '.' (repo root) "
+             "matches the convention in synthetic_pages.jsonl where source_path "
+             "starts with 'data/'.",
     )
     parser.add_argument(
         "--output-manifest",
