@@ -2520,6 +2520,15 @@ def _render_single_job(
                         cumulative_measure_offset += sum(svg_measures)
                     else:
                         # --- Fallback: proportional slicing (old behaviour) ---
+                        # Like the SVG primary path, this branch builds
+                        # token_sequences_by_phys keyed by physical staff index.
+                        # Unlike the SVG path, we don't have a system mapping
+                        # for filter-dropped positions, so we only emit token
+                        # sequences for surviving crops (their source_staff_index
+                        # IS the physical position). The helper skips filtered
+                        # positions automatically (their key is absent), matching
+                        # the old fallback behavior of not emitting rows for
+                        # filtered staves in this branch.
                         page_staff_sequences = [
                             _slice_staff_sequence_for_page(
                                 sequence,
@@ -2538,77 +2547,52 @@ def _render_single_job(
                                 weight = max(1, int(staff_measure_weights[source_staff_index]))
                             fragment_weights_fb[pi_fb].append(weight)
 
+                        token_sequences_by_phys: Dict[int, List[str]] = {}
                         if min(fragment_counts) <= 0:
                             token_pairing_mismatches += 1
                             pair_count = min(len(staff_crop_entries), part_count)
-                            for staff_index in range(pair_count):
-                                crop_path, _ = staff_crop_entries[staff_index]
-                                token_sequence = page_staff_sequences[staff_index]
-                                base_sample_id = f"{page_basename}__staff{staff_index + 1:02d}"
-                                dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
-                                if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
-                                    dataset_variants.append(("synthetic_polyphonic", "__poly"))
-                                for dataset_name, sample_suffix in dataset_variants:
-                                    sample_id = f"{base_sample_id}{sample_suffix}"
-                                    token_rows.append(
-                                        {
-                                            "sample_id": sample_id,
-                                            "dataset": dataset_name,
-                                            "split": "train",
-                                            "image_path": relpath(project_root, crop_path),
-                                            "page_id": page_basename,
-                                            "source_path": job.source_relpath,
-                                            "style_id": job.style_id,
-                                            "page_number": page_no,
-                                            "staff_index": staff_index,
-                                            "source_format": "musicxml",
-                                            "score_type": job.score_type,
-                                            "token_sequence": token_sequence,
-                                            "token_count": len(token_sequence),
-                                        }
-                                    )
-                                    token_entries_written += 1
-                                    token_entries_by_dataset[dataset_name] = token_entries_by_dataset.get(dataset_name, 0) + 1
-                                staff_token_pairs += 1
+                            for i in range(pair_count):
+                                _, source_staff_index = staff_crop_entries[i]
+                                # In the degenerate path the i-th survivor takes
+                                # the i-th per-page sequence; key by physical pos.
+                                token_sequences_by_phys[source_staff_index] = page_staff_sequences[i]
                         else:
                             part_fragment_seen = [0 for _ in range(part_count)]
-                            for staff_index, (crop_path, source_staff_index) in enumerate(staff_crop_entries):
+                            for _, source_staff_index in staff_crop_entries:
                                 pi_fb = source_staff_index % part_count
                                 part_fragment_seen[pi_fb] += 1
                                 fragment_index = part_fragment_seen[pi_fb]
                                 part_weights = fragment_weights_fb[pi_fb] if pi_fb < len(fragment_weights_fb) else None
-                                token_sequence = _slice_staff_sequence_for_fragment(
+                                token_sequences_by_phys[source_staff_index] = _slice_staff_sequence_for_fragment(
                                     page_staff_sequences[pi_fb],
                                     fragment_index=fragment_index,
                                     fragment_count=fragment_counts[pi_fb],
                                     fragment_weights=part_weights,
                                 )
-                                base_sample_id = f"{page_basename}__staff{staff_index + 1:02d}"
-                                dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
-                                if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
-                                    dataset_variants.append(("synthetic_polyphonic", "__poly"))
-                                for dataset_name, sample_suffix in dataset_variants:
-                                    sample_id = f"{base_sample_id}{sample_suffix}"
-                                    token_rows.append(
-                                        {
-                                            "sample_id": sample_id,
-                                            "dataset": dataset_name,
-                                            "split": "train",
-                                            "image_path": relpath(project_root, crop_path),
-                                            "page_id": page_basename,
-                                            "source_path": job.source_relpath,
-                                            "style_id": job.style_id,
-                                            "page_number": page_no,
-                                            "staff_index": staff_index,
-                                            "source_format": "musicxml",
-                                            "score_type": job.score_type,
-                                            "token_sequence": token_sequence,
-                                            "token_count": len(token_sequence),
-                                        }
-                                    )
-                                    token_entries_written += 1
-                                    token_entries_by_dataset[dataset_name] = token_entries_by_dataset.get(dataset_name, 0) + 1
-                                staff_token_pairs += 1
+
+                        dataset_variants: List[Tuple[str, str]] = [("synthetic_fullpage", "")]
+                        if job.score_type in {"piano", "chamber", "solo_instrument_with_piano"}:
+                            dataset_variants.append(("synthetic_polyphonic", "__poly"))
+
+                        new_rows = _build_manifest_rows_for_page(
+                            page_basename=page_basename,
+                            staff_crop_entries=staff_crop_entries,
+                            total_physical_staves=len(staff_boxes),
+                            token_sequences_by_phys=token_sequences_by_phys,
+                            page_number=page_no,
+                            style_id=job.style_id,
+                            score_type=job.score_type,
+                            source_relpath=job.source_relpath,
+                            project_root=project_root,
+                            dataset_variants=dataset_variants,
+                        )
+                        token_rows.extend(new_rows)
+                        token_entries_written += len(new_rows)
+                        for row in new_rows:
+                            token_entries_by_dataset[row["dataset"]] = (
+                                token_entries_by_dataset.get(row["dataset"], 0) + 1
+                            )
+                        staff_token_pairs += len(token_sequences_by_phys)
 
                         # Estimate cumulative offset for fallback path
                         if page_count_for_job > 0:
