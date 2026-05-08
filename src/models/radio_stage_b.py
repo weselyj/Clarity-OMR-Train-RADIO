@@ -191,6 +191,9 @@ class RadioStageB(nn.Module):
         image: Optional[torch.Tensor] = None,
         tgt: Optional[torch.Tensor] = None,
         *,
+        cached_features: Optional[torch.Tensor] = None,  # (B, seq_tokens, 1280) bf16
+        _h16: Optional[int] = None,   # spatial height before flatten (required if cached_features given)
+        _w16: Optional[int] = None,   # spatial width before flatten (required if cached_features given)
         pixel_values: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
@@ -200,6 +203,35 @@ class RadioStageB(nn.Module):
             image = pixel_values
         if tgt is None:
             tgt = decoder_input_ids if decoder_input_ids is not None else input_ids
+
+        if cached_features is not None:
+            # --- Cached path: bypass RadioEncoder entirely ---
+            # cached_features: (B, seq_tokens, 1280) — the raw encoder spatial output
+            # stored per-sample as (seq_tokens, 1280) and collated to (B, seq_tokens, 1280).
+            # Reshape back to (B, 1280, H/16, W/16) for deformable_attention.
+            if _h16 is None or _w16 is None:
+                raise ValueError(
+                    "RadioStageB.forward: _h16 and _w16 are required when cached_features is provided. "
+                    "These encode the original spatial dimensions (H/16, W/16) before flattening."
+                )
+            if tgt is None:
+                raise ValueError(
+                    "RadioStageB.forward requires a target token tensor (tgt) when using cached_features."
+                )
+            B, seq_tokens, C = cached_features.shape
+            # Reshape: (B, seq_tokens, C) → (B, C, H/16, W/16)
+            feature_map = cached_features.transpose(1, 2).reshape(B, C, int(_h16), int(_w16))
+            # Run trainable deformable_attention + positional_bridge (same as live path)
+            batch, channels, height, width = feature_map.shape
+            sequence = feature_map.flatten(2).transpose(1, 2)
+            sequence = self.deformable_attention(sequence, height, width)
+            sequence = sequence.transpose(1, 2).reshape(batch, channels, height, width)
+            memory, _ = self.positional_bridge(sequence)
+            contour_logits = self.contour_head(memory.mean(dim=1))
+            logits, _, _ = self.decode_tokens(tgt, memory)
+            return {"logits": logits, "contour_logits": contour_logits}
+
+        # --- Live path: run encoder ---
         if image is None or tgt is None:
             raise ValueError(
                 "RadioStageB.forward requires an image tensor and a target/input token tensor."
