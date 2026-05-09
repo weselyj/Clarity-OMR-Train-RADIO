@@ -205,6 +205,13 @@ class RadioStageB(nn.Module):
             tgt = decoder_input_ids if decoder_input_ids is not None else input_ids
 
         if cached_features is not None:
+            if getattr(self.config, "pool_to_stride32", False):
+                raise ValueError(
+                    "cached_features path is not compatible with pool_to_stride32=True; "
+                    "the cache writer would need to apply avg_pool2d before flattening, "
+                    "and the cache hash should include pool_to_stride32 to invalidate "
+                    "across this setting. Bake this into the cache hash before enabling."
+                )
             # --- Cached path: bypass RadioEncoder entirely ---
             # cached_features: (B, seq_tokens, 1280) — the raw encoder spatial output
             # stored per-sample as (seq_tokens, 1280) and collated to (B, seq_tokens, 1280).

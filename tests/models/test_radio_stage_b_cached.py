@@ -112,3 +112,46 @@ def test_cached_features_skips_encoder_call() -> None:
         model.forward(cached_features=cached, tgt=tgt, _h16=2, _w16=4)
 
     assert call_count[0] == 0, "encoder.forward was called despite cached_features being provided"
+
+
+def test_forward_cached_raises_on_pool_to_stride32() -> None:
+    """forward() with cached_features and pool_to_stride32=True must raise ValueError."""
+    import torch.nn as nn
+    from src.models.radio_stage_b import RadioStageB, RadioStageBConfig
+
+    config = RadioStageBConfig(
+        decoder_dim=64,
+        decoder_layers=2,
+        decoder_heads=4,
+        vocab_size=10,
+        max_decode_len=16,
+        contour_classes=3,
+        pool_to_stride32=True,
+    )
+    model = RadioStageB.__new__(RadioStageB)
+    nn.Module.__init__(model)
+    model.config = config
+
+    # Stub out all sub-modules so we never hit the actual RadioEncoder hub download
+    class _StubEncoder(nn.Module):
+        hidden_dim = 1280
+        def forward(self, x):
+            B = x.shape[0]
+            return torch.ones(B, 1280, 2, 4, dtype=x.dtype, device=x.device)
+
+    from src.models.davit_stage_b import DecoderBlock, DeformableContextBlock, PositionalBridge, RMSNorm
+    model.encoder = _StubEncoder()
+    model.deformable_attention = DeformableContextBlock(dim=1280, heads=4)
+    model.positional_bridge = PositionalBridge(encoder_dim=1280, decoder_dim=64)
+    model.token_embedding = nn.Embedding(10, 64)
+    model.decoder_blocks = nn.ModuleList([DecoderBlock(64, 4) for _ in range(2)])
+    model.decoder_norm = RMSNorm(64)
+    model.lm_head = nn.Linear(64, 10)
+    model.contour_head = nn.Sequential(nn.Linear(64, 32), nn.GELU(), nn.Linear(32, 3))
+    model.max_decode_length = 16
+    model.eval()
+
+    cached = torch.randn(1, 8, 1280)
+    tgt = torch.zeros(1, 3, dtype=torch.long)
+    with pytest.raises(ValueError, match="pool_to_stride32"):
+        model.forward(cached_features=cached, tgt=tgt, _h16=2, _w16=4)
