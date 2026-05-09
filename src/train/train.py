@@ -1580,6 +1580,7 @@ def _save_checkpoint(
     stage_b_config: Optional[Dict[str, object]] = None,
     name_suffix: Optional[str] = None,
     best_val_loss: Optional[float] = None,
+    last_batch_idx: Optional[int] = None,
 ) -> Path:
     import torch
 
@@ -1598,6 +1599,13 @@ def _save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "stage_b_config": stage_b_config,
         "best_val_loss": best_val_loss,
+        # Tier-grouped sampler resume (Stage 3+, Decision #6): records the
+        # number of micro-batches consumed so a resumed run rebuilds the same
+        # sampler list (same seed) and skips the consumed prefix via
+        # _TierGroupedBatchSampler.set_start_idx.  None for non-tier-grouped
+        # stages (Stage 1 / Stage 2 v2) where weighted random sampling makes
+        # batch-prefix skipping meaningless.
+        "last_batch_idx": last_batch_idx,
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
@@ -2449,6 +2457,24 @@ def run_execute_mode(
                     collate_fn=StageBDataset.collate_fn,
                     worker_init_fn=stage_b_worker_init_fn,
                 )
+            # Resume support (Decision #6): for tier-grouped stages, skip the
+            # first N micro-batches in the freshly-rebuilt sampler so a resumed
+            # run does not re-train the prefix already consumed.  The legacy
+            # WeightedRandomSampler path uses replacement=True with a stage-seed
+            # generator and does not need (or support) prefix skipping.
+            #
+            # CRITICAL: set_start_idx must be called BEFORE iter(_train_loader);
+            # the sampler captures self._batches[self._start_idx:] inside
+            # __iter__, so any later mutation has no effect on the live iterator.
+            if stage.tier_grouped_sampling and resumed_stage:
+                _resume_last_batch_idx = int(resume_payload.get("last_batch_idx") or 0) if resume_payload is not None else 0
+                if _resume_last_batch_idx > 0:
+                    _train_loader.batch_sampler.set_start_idx(_resume_last_batch_idx)
+                    _batch_idx_consumed = _resume_last_batch_idx
+                else:
+                    _batch_idx_consumed = 0
+            else:
+                _batch_idx_consumed = 0
             _train_iter = iter(_train_loader)
             # vocab size is constant; grab from the dataset's vocab object.
             vocab_size = _stage_ds._vocab.size
@@ -2591,6 +2617,12 @@ def run_execute_mode(
                         _batch_dict = next(_train_iter)
                 if _batch_dict is None:
                     break
+                # Tier-grouped resume bookkeeping (Decision #6): count every
+                # micro-batch successfully consumed by the iterator, NOT every
+                # opt-step.  Persisted into the checkpoint so a resumed run can
+                # call _TierGroupedBatchSampler.set_start_idx and skip past the
+                # already-consumed prefix.
+                _batch_idx_consumed += 1
                 epoch_index = ((stage_step - 1) // stage_steps_per_epoch) + 1
                 epoch_step = ((stage_step - 1) % stage_steps_per_epoch) + 1
                 with timer.cpu("h2d"):
@@ -2823,6 +2855,11 @@ def run_execute_mode(
                                         stage_b_config=stage_b_config_dict,
                                         name_suffix="best",
                                         best_val_loss=best_val_loss,
+                                        last_batch_idx=(
+                                            _batch_idx_consumed
+                                            if stage.tier_grouped_sampling
+                                            else None
+                                        ),
                                     )
 
                 _checkpoint_ms: Optional[float] = None
@@ -2840,6 +2877,11 @@ def run_execute_mode(
                         stage_steps_total=stage_total_steps,
                         stage_b_config=stage_b_config_dict,
                         best_val_loss=best_val_loss,
+                        last_batch_idx=(
+                            _batch_idx_consumed
+                            if stage.tier_grouped_sampling
+                            else None
+                        ),
                     )
                     checkpoints_written.append(str(checkpoint_path))
                     _checkpoint_ms = (_time.perf_counter() - _ckpt_t0) * 1000.0
@@ -2947,6 +2989,11 @@ def run_execute_mode(
                     stage_b_config=stage_b_config_dict,
                     name_suffix="final",
                     best_val_loss=best_val_loss,
+                    last_batch_idx=(
+                        _batch_idx_consumed
+                        if stage.tier_grouped_sampling
+                        else None
+                    ),
                 )
                 checkpoints_written.append(str(final_path))
 
