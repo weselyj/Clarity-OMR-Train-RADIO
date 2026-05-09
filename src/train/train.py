@@ -90,6 +90,15 @@ class StageTrainingConfig:
     loraplus_lr_ratio: float
     dataset_mix: Tuple[DatasetMix, ...]
     stage_b_encoder: str = "davit"
+    # --- Stage 3 tier-aware fields (all None for legacy stages) ---
+    tier_grouped_sampling: bool = False
+    b_cached: Optional[int] = None
+    b_live: Optional[int] = None
+    grad_accumulation_steps_cached: Optional[int] = None
+    grad_accumulation_steps_live: Optional[int] = None
+    cached_data_ratio: Optional[float] = None
+    cache_root: Optional[str] = None
+    cache_hash16: Optional[str] = None
 
 
 def load_yaml(path: Path) -> Dict[str, object]:
@@ -125,6 +134,21 @@ def load_stage_config(path: Path) -> StageTrainingConfig:
     if not math.isclose(ratio_sum, 1.0, rel_tol=0.0, abs_tol=1e-6):
         raise ValueError(f"dataset_mix ratios must sum to 1.0 in {path}, got {ratio_sum}")
 
+    tier_grouped = bool(raw.get("tier_grouped_sampling", False))
+    tier_field_names = (
+        "b_cached", "b_live",
+        "grad_accumulation_steps_cached", "grad_accumulation_steps_live",
+        "cached_data_ratio", "cache_root", "cache_hash16",
+    )
+    tier_field_values = {name: raw.get(name) for name in tier_field_names}
+    if tier_grouped:
+        missing = [n for n, v in tier_field_values.items() if v is None]
+        if missing:
+            raise ValueError(
+                f"tier_grouped_sampling=true requires all tier fields to be set in {path}; "
+                f"missing: {missing}"
+            )
+
     return StageTrainingConfig(
         stage_name=str(raw["stage_name"]),
         epochs=int(raw["epochs"]),
@@ -144,6 +168,14 @@ def load_stage_config(path: Path) -> StageTrainingConfig:
         loraplus_lr_ratio=float(raw.get("loraplus_lr_ratio", 1.0)),
         dataset_mix=tuple(mix),
         stage_b_encoder=str(raw.get("stage_b_encoder", "davit")).lower().strip(),
+        tier_grouped_sampling=tier_grouped,
+        b_cached=int(tier_field_values["b_cached"]) if tier_field_values["b_cached"] is not None else None,
+        b_live=int(tier_field_values["b_live"]) if tier_field_values["b_live"] is not None else None,
+        grad_accumulation_steps_cached=int(tier_field_values["grad_accumulation_steps_cached"]) if tier_field_values["grad_accumulation_steps_cached"] is not None else None,
+        grad_accumulation_steps_live=int(tier_field_values["grad_accumulation_steps_live"]) if tier_field_values["grad_accumulation_steps_live"] is not None else None,
+        cached_data_ratio=float(tier_field_values["cached_data_ratio"]) if tier_field_values["cached_data_ratio"] is not None else None,
+        cache_root=str(tier_field_values["cache_root"]) if tier_field_values["cache_root"] is not None else None,
+        cache_hash16=str(tier_field_values["cache_hash16"]) if tier_field_values["cache_hash16"] is not None else None,
     )
 
 
