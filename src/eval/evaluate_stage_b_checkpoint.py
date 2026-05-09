@@ -504,6 +504,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="Inference device (e.g. cuda, cpu).")
     parser.add_argument("--quantize", action="store_true", help="INT8 dynamic quantization on decoder (CPU: 2-3x faster, GPU: needs torchao).")
     parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Run decoder forward in float16 (CUDA only). ~1.5-2x speedup on GPU; minor accuracy noise vs fp32.",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="Speed-oriented eval profile: beam=1, max_decode_steps<=192, image_max_width<=1024.",
@@ -632,6 +637,7 @@ def main() -> None:
         quiet=bool(args.quiet),
         length_penalty_alpha=float(args.length_penalty_alpha),
         use_kv_cache=bool(args.kv_cache),
+        use_fp16=bool(getattr(args, "fp16", False)),
         quantize=bool(getattr(args, "quantize", False)),
         encoder_cache_root=getattr(args, "encoder_cache_root", None),
         encoder_cache_hash=getattr(args, "encoder_cache_hash", None),

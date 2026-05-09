@@ -105,9 +105,11 @@ class TestCachedDatasetUsesCacheWhenRootProvided:
         from src.eval.evaluate_stage_b_checkpoint import _resolve_cache_memory
 
         device = _fake_device("cpu")
+        sentinel_memory = MagicMock(name="post_bridge_memory")
 
         with patch(f"{_CACHE_MOD}.read_cache_entry", return_value=_fake_cached_entry()) as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image") as mock_encode:
+             patch(f"{_CLI_MOD}._encode_staff_image") as mock_encode, \
+             patch(f"{_MOD}._encode_from_cached_features", return_value=sentinel_memory) as mock_bridge:
 
             result = _resolve_cache_memory(
                 decode_model=MagicMock(),
@@ -121,8 +123,9 @@ class TestCachedDatasetUsesCacheWhenRootProvided:
             )
 
         mock_read.assert_called_once()
-        mock_encode.assert_not_called()
-        assert result is not None
+        mock_bridge.assert_called_once()  # cache hit → bridge runs
+        mock_encode.assert_not_called()  # encoder skipped
+        assert result is sentinel_memory
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +259,10 @@ class TestLegacyKeyFallbackOnFileNotFound:
                 return fake_entry
             raise FileNotFoundError(f"unexpected key: {key}")
 
+        sentinel_memory = MagicMock(name="post_bridge_memory")
         with patch(f"{_CACHE_MOD}.read_cache_entry", side_effect=side_effect) as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image") as mock_encode:
+             patch(f"{_CLI_MOD}._encode_staff_image") as mock_encode, \
+             patch(f"{_MOD}._encode_from_cached_features", return_value=sentinel_memory) as mock_bridge:
 
             result = _resolve_cache_memory(
                 decode_model=MagicMock(),
