@@ -76,7 +76,13 @@ def main() -> int:
             metadata_path = cache_dir / "metadata.json"
             if metadata_path.exists():
                 meta = json.loads(metadata_path.read_text())
-                samples = meta.get("samples_processed", 0)
+                # `sample_count` is the canonical key — number of rows actually
+                # written to .npy (== stats["written"] in build_encoder_cache.py).
+                # Older metadata files only have `samples_processed`; fall back
+                # to it for legacy caches.
+                samples = meta.get("sample_count")
+                if samples is None:
+                    samples = meta.get("samples_processed", 0)
                 print(f"[preflight] cache OK: {samples} samples at {cache_dir}")
                 if samples != 215985:
                     fails.append(
