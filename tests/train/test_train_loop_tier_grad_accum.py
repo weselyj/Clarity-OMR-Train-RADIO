@@ -100,6 +100,29 @@ def test_tier_block_micro_idx_arithmetic_across_transitions():
     assert _tier_block_micro_idx == 0
 
 
+def test_for_loop_bound_uses_total_batches_in_tier_grouped_mode():
+    """The for-loop in _run_stage must iterate _plan.total_batches times in tier-grouped mode,
+    not stage_total_steps times — otherwise training stops short of the opt-step target."""
+    from src.train.train import _compute_tier_grouped_batch_plan
+
+    # Stage 3 production config
+    plan = _compute_tier_grouped_batch_plan(
+        target_opt_steps=4500,
+        cached_data_ratio=0.9,
+        b_cached=16,
+        b_live=2,
+        grad_accum_cached=1,
+        grad_accum_live=8,
+    )
+    # Iterating _plan.total_batches times must complete exactly target_opt_steps opt-steps:
+    # - n_cached_opt_steps cached batches × 1 = n_cached_opt_steps opt-steps
+    # - n_live_opt_steps live blocks × 8 micros = n_live_opt_steps opt-steps
+    cached_opt_steps_completed = plan.n_cached_batches // 1  # grad_accum_cached
+    live_opt_steps_completed = plan.n_live_batches // 8       # grad_accum_live
+    assert cached_opt_steps_completed + live_opt_steps_completed == 4500
+    assert plan.total_batches == 7650
+
+
 def test_tier_block_micro_idx_resets_on_partial_block_discard():
     """When the StopIteration recovery discards a partial block, _tier_block_micro_idx must reset to 0.
 

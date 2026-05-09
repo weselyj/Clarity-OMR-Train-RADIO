@@ -2286,6 +2286,14 @@ def run_execute_mode(
                     grad_accum_cached=stage.grad_accumulation_steps_cached,
                     grad_accum_live=stage.grad_accumulation_steps_live,
                 )
+                # The for-loop below counts MICRO-BATCH iterations, while
+                # stage_total_steps counts OPT-STEPS (the planner's input).  In
+                # tier-grouped mode one opt-step costs 1 cached batch OR
+                # grad_accumulation_steps_live live batches, so total_batches >
+                # stage_total_steps.  Using stage_total_steps as the loop bound
+                # would silently truncate training to ~58% of the opt-step
+                # target.  Use _plan.total_batches instead.
+                _loop_bound = _plan.total_batches
                 _batch_list = build_tier_grouped_sampler_by_opt_steps(
                     entries=_stage_ds.entries,
                     cached_datasets=_CACHED_DATASETS,
@@ -2329,6 +2337,11 @@ def run_execute_mode(
                 _stage_total_train_samples = (
                     stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
                 )
+                # Legacy path: stage_total_steps IS the micro-batch loop count
+                # (Stage 1/2 historical semantics — every for-loop iteration
+                # pulls one micro-batch and is_accum_step fires every
+                # grad_accumulation_steps iterations).  Preserved unchanged.
+                _loop_bound = stage_total_steps
                 _train_sampler = build_stage_b_sampler(
                     stage, _stage_ds,
                     total_samples=_stage_total_train_samples,
@@ -2392,7 +2405,7 @@ def run_execute_mode(
             # stage.tier_grouped_sampling=True; legacy path uses stage_step % accum.
             _tier_block_micro_idx = 0
 
-            for stage_step in range(stage_start_step, stage_total_steps + 1):
+            for stage_step in range(stage_start_step, _loop_bound + 1):
                 if stage.tier_grouped_sampling:
                     # Reset step timer at every tier-block boundary (start of a
                     # new opt-step block). _tier_block_micro_idx==0 means the
@@ -2447,9 +2460,17 @@ def run_execute_mode(
                         grad_accum_cached=stage.grad_accumulation_steps_cached,
                         grad_accum_live=stage.grad_accumulation_steps_live,
                     )
+                    # The fallback `stage_step == _loop_bound` is technically
+                    # redundant — the tier-grouped sampler emits contiguous
+                    # tier blocks, so the LAST batch of the schedule is always
+                    # a tier-block boundary and the primary check fires.  Keep
+                    # the fallback as belt-and-suspenders, comparing against
+                    # _loop_bound (total_batches) rather than stage_total_steps
+                    # (opt-step target) so the comparison is dimensionally
+                    # correct.
                     is_accum_step = (
                         _tier_block_micro_idx + 1 == accum_steps
-                    ) or stage_step == stage_total_steps
+                    ) or stage_step == _loop_bound
                     if _tier_block_micro_idx == 0:
                         optimizer.zero_grad(set_to_none=True)
                         accum_corruption = torch.zeros((), dtype=torch.bool, device=device)

@@ -25,7 +25,7 @@ stage_b_encoder: radio_h
 # Step target: 4500 opt-steps. Manual extension protocol at 4500 → 6000 → 7500
 # (see spec lines 201–210).
 epochs: 1
-effective_samples_per_epoch: 4500    # With batch_size=1 grad_accum=1, this IS the opt-step target consumed by the tier-grouped planner
+effective_samples_per_epoch: 4500    # OPT-STEP target consumed by the tier-grouped planner; the planner derives total_batches=7650 (4050 cached × 1 + 450 live × 8) so the for-loop iterates 7650 times to complete all 4500 opt-steps.
 batch_size: 1                        # SENTINEL — unused when tier_grouped_sampling=True
 max_sequence_length: 512
 grad_accumulation_steps: 1           # SENTINEL — unused when tier_grouped_sampling=True
