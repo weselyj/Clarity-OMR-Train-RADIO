@@ -142,43 +142,68 @@ def _radio_shaped_stage_b_config_dict() -> Dict[str, Any]:
 def _build_dora_state_dict(model: nn.Module, rank: int = 4) -> Dict[str, torch.Tensor]:
     """Take a freshly-built model and emit a Stage 2 v2-shaped state dict.
 
-    The trainer wraps the model with PEFT before saving, so saved keys carry
-    the ``base_model.model.<orig>.base_layer.weight`` / ``...lora_A.default.weight``
-    pattern.  Reproduce that here for the encoder linear leaves the DoRA
-    recipe targets (qkv/proj/fc1/fc2), and the ``modules_to_save`` pattern
-    for positional_bridge / token_embedding / decoder_norm / lm_head.
+    PEFT wraps every targeted ``nn.Linear`` so its weight/bias migrate from
+    ``<name>.weight`` to ``<name>.base_layer.weight`` and gain three companion
+    ``lora_*`` tensors.  Modules in ``modules_to_save`` get duplicated under a
+    ``.modules_to_save.default.<param>`` path while the original copy stays as
+    ``.original_module.<param>``.  Reproduce that exact naming so
+    ``load_stage_b_checkpoint`` sees a realistic Stage 2 v2 state dict.
     """
+    src_state = dict(model.state_dict())
     out: Dict[str, torch.Tensor] = {}
-    base = {f"base_model.model.{k}": v.clone() for k, v in model.state_dict().items()}
-    out.update(base)
 
-    # DoRA-adapted encoder leaves.  Names mirror what _prepare_model_for_dora
-    # would produce given the RADIO target list.
-    encoder_dora_targets = [
-        ("encoder.block0.qkv", 8, 24),
-        ("encoder.block0.proj", 8, 8),
-        ("encoder.block0.fc1", 8, 16),
-        ("encoder.block0.fc2", 16, 8),
-    ]
-    for prefix, in_dim, out_dim in encoder_dora_targets:
-        out[f"base_model.model.{prefix}.lora_A.default.weight"] = torch.randn(rank, in_dim)
-        out[f"base_model.model.{prefix}.lora_B.default.weight"] = torch.randn(out_dim, rank)
-        out[f"base_model.model.{prefix}.lora_magnitude_vector.default.weight"] = torch.ones(out_dim)
+    # Modules covered by _prepare_model_for_dora's modules_to_save list.
+    # PEFT keeps two copies of each modules_to_save tensor: one under
+    # ``.original_module.<name>`` (pristine), one under
+    # ``.modules_to_save.default.<name>`` (live, finetuned).  The trainer
+    # saves both, so reproduce both here.
+    modules_to_save_prefixes = (
+        "token_embedding",
+        "lm_head",
+        "decoder_norm",
+        "positional_bridge",
+        # contour_head and deformable_attention also live in this set, but
+        # the minimal model omits them; that's fine -- the loader only cares
+        # about coverage of keys present in the saved state dict.
+    )
 
-    # modules_to_save entries -- positional_bridge, token_embedding,
-    # decoder_norm, lm_head (full-finetuned, no LoRA).
-    for full_name in (
-        "positional_bridge.proj.weight",
-        "token_embedding.weight",
-        "decoder_norm.weight",
-        "lm_head.weight",
-    ):
-        # Resolve the existing tensor shape from the real model.
-        tensor = dict(model.state_dict())[full_name]
-        out[
-            f"base_model.model.{full_name.rsplit('.', 1)[0]}"
-            f".modules_to_save.default.{full_name.rsplit('.', 1)[1]}"
-        ] = tensor.clone()
+    # DoRA-adapted leaf modules (Linear) -- names match
+    # list_radio_dora_target_modules() for the encoder + decoder.
+    dora_leaf_suffixes = (
+        "qkv", "proj", "fc1", "fc2",
+        "q_proj", "k_proj", "v_proj", "out_proj",
+    )
+
+    def _is_in_modules_to_save(param_name: str) -> bool:
+        head = param_name.split(".", 1)[0]
+        return head in modules_to_save_prefixes
+
+    def _is_dora_leaf(param_name: str) -> bool:
+        # Param like "encoder.block0.qkv.weight" -> module path "encoder.block0.qkv"
+        module_path, _, _leaf = param_name.rpartition(".")
+        return any(module_path.endswith(suf) for suf in dora_leaf_suffixes)
+
+    for name, tensor in src_state.items():
+        if _is_in_modules_to_save(name):
+            head, _, leaf = name.rpartition(".")  # "positional_bridge.proj" / "weight"
+            out[f"base_model.model.{head}.original_module.{leaf}"] = tensor.clone()
+            out[f"base_model.model.{head}.modules_to_save.default.{leaf}"] = tensor.clone()
+        elif _is_dora_leaf(name):
+            module_path, _, leaf = name.rpartition(".")
+            # Base weight migrates under ``base_layer``.
+            out[f"base_model.model.{module_path}.base_layer.{leaf}"] = tensor.clone()
+            # Add the LoRA companions only once (when we hit the .weight key).
+            if leaf == "weight":
+                in_dim, out_dim = int(tensor.shape[1]), int(tensor.shape[0])
+                out[f"base_model.model.{module_path}.lora_A.default.weight"] = torch.randn(rank, in_dim)
+                out[f"base_model.model.{module_path}.lora_B.default.weight"] = torch.randn(out_dim, rank)
+                out[
+                    f"base_model.model.{module_path}.lora_magnitude_vector.default.weight"
+                ] = torch.ones(out_dim)
+        else:
+            # Plain (un-DoRA'd, un-modules_to_save'd) param -- e.g. norm
+            # weights inside an encoder block, biases that aren't targeted.
+            out[f"base_model.model.{name}"] = tensor.clone()
     return out
 
 
