@@ -28,6 +28,7 @@ from src.train.model_factory import (
     build_stage_b_components,
     model_factory_config_from_checkpoint_payload,
 )
+from src.train.tier_sampler import build_tier_grouped_sampler_by_opt_steps
 
 
 # Datasets whose encoder features are pre-computed and stored in the cache.
@@ -923,6 +924,34 @@ def build_stage_b_sampler(
     )
 
 
+class _TierGroupedBatchSampler(torch.utils.data.Sampler):
+    """Wraps a pre-computed list of batched index lists for use with DataLoader.
+
+    Yields each inner list (one batch worth of indices). DataLoader's
+    batch_sampler arg expects exactly this shape: an iterable that yields
+    lists of indices.
+    """
+
+    def __init__(self, batches: List[List[int]]) -> None:
+        super().__init__(data_source=None)
+        self._batches = batches
+        # Resume support (Task 8): on resume, set this to the consumed prefix length.
+        self._start_idx: int = 0
+
+    def set_start_idx(self, idx: int) -> None:
+        """Skip the first ``idx`` batches when iterating (used on resume)."""
+        if idx < 0 or idx > len(self._batches):
+            raise ValueError(f"start_idx={idx} out of range [0, {len(self._batches)}]")
+        self._start_idx = idx
+
+    def __iter__(self):
+        for batch in self._batches[self._start_idx:]:
+            yield batch
+
+    def __len__(self) -> int:
+        return len(self._batches) - self._start_idx
+
+
 def stage_b_worker_init_fn(worker_id: int) -> None:
     """Re-seed each DataLoader worker's dataset RNG to avoid augmentation collisions.
 
@@ -1397,6 +1426,55 @@ def _forward_batch_for_train(
             images = batch_dict["images"].to(device, non_blocking=True)
         outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
     return outputs
+
+
+@dataclass(frozen=True)
+class _TierGroupedBatchPlan:
+    """Result of converting opt-step targets into batch counts."""
+    n_cached_opt_steps: int
+    n_live_opt_steps: int
+    n_cached_batches: int
+    n_live_batches: int
+    total_batches: int
+
+
+def _compute_tier_grouped_batch_plan(
+    *,
+    target_opt_steps: int,
+    cached_data_ratio: float,
+    b_cached: int,
+    b_live: int,
+    grad_accum_cached: int,
+    grad_accum_live: int,
+) -> "_TierGroupedBatchPlan":
+    """Convert (target_opt_steps, cached_data_ratio) into tier batch counts.
+
+    cached_data_ratio is the OPT-STEP gradient share (locked decision #1).
+    Cached opt-steps = round(target_opt_steps * cached_data_ratio); live
+    opt-steps = target_opt_steps - cached_opt_steps.
+    """
+    n_cached_opt = int(round(target_opt_steps * cached_data_ratio))
+    n_live_opt = max(0, target_opt_steps - n_cached_opt)
+    n_cached_batches = n_cached_opt * grad_accum_cached
+    n_live_batches = n_live_opt * grad_accum_live
+    return _TierGroupedBatchPlan(
+        n_cached_opt_steps=n_cached_opt,
+        n_live_opt_steps=n_live_opt,
+        n_cached_batches=n_cached_batches,
+        n_live_batches=n_live_batches,
+        total_batches=n_cached_batches + n_live_batches,
+    )
+
+
+def _grad_accum_for_batch(
+    batch_dict: "Dict[str, object]",
+    *,
+    grad_accum_cached: int,
+    grad_accum_live: int,
+) -> int:
+    """Return the per-tier grad_accum for the batch's tier."""
+    tier = batch_dict.get("tier", "live")
+    return grad_accum_cached if tier == "cached" else grad_accum_live
 
 
 def _save_checkpoint(
@@ -2178,43 +2256,96 @@ def run_execute_mode(
             # via the WeightedRandomSampler (which preserves dataset_mix ratios).
             # persistent_workers=True avoids per-epoch worker respawn overhead.
             # pin_memory=True enables async H2D transfers via non_blocking=True.
-            _stage_ds = StageBDataset(
-                stage,
-                grouped_entries,
-                project_root=project_root,
-                image_height=image_height,
-                image_width=image_width,
-                max_sequence_length=stage.max_sequence_length,
-                augment=True,
-                rng_seed=seed,
-            )
-            # Compute total micro-batch draws needed for the full stage.
-            # stage_total_steps is OPT-steps; each OPT-step consumes
-            # grad_accumulation_steps micro-batches.  Sizing the sampler to
-            # cover the full count guarantees the iterator never exhausts
-            # mid-accumulation-window (the StopIteration handler below is
-            # purely defensive against bugs / checkpoint restarts).
-            _stage_total_train_samples = (
-                stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
-            )
-            _train_sampler = build_stage_b_sampler(
-                stage, _stage_ds,
-                total_samples=_stage_total_train_samples,
-                seed=seed,
-            )
             _pin_memory = device.type == "cuda"
             _effective_prefetch = prefetch_factor if num_workers > 0 else None
-            _train_loader = torch.utils.data.DataLoader(
-                _stage_ds,
-                batch_size=stage.batch_size,
-                sampler=_train_sampler,
-                num_workers=num_workers,
-                pin_memory=_pin_memory,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=_effective_prefetch,
-                collate_fn=StageBDataset.collate_fn,
-                worker_init_fn=stage_b_worker_init_fn,
-            )
+            if stage.tier_grouped_sampling:
+                # Stage 3: tier-grouped sampler path.
+                # Pass cache pointers to the dataset so cached entries route through
+                # read_cache_entry.
+                cache_root_path = (
+                    (project_root / stage.cache_root).resolve() if stage.cache_root else None
+                )
+                _stage_ds = StageBDataset(
+                    stage,
+                    grouped_entries,
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                    max_sequence_length=stage.max_sequence_length,
+                    augment=True,
+                    rng_seed=seed,
+                    cache_root=cache_root_path,
+                    cache_hash16=stage.cache_hash16,
+                )
+                # Compute opt-step → batch plan. stage_total_steps comes from
+                # the existing scheduler arithmetic and counts opt-steps.
+                _plan = _compute_tier_grouped_batch_plan(
+                    target_opt_steps=stage_total_steps,
+                    cached_data_ratio=stage.cached_data_ratio,
+                    b_cached=stage.b_cached,
+                    b_live=stage.b_live,
+                    grad_accum_cached=stage.grad_accumulation_steps_cached,
+                    grad_accum_live=stage.grad_accumulation_steps_live,
+                )
+                _batch_list = build_tier_grouped_sampler_by_opt_steps(
+                    entries=_stage_ds.entries,
+                    cached_datasets=_CACHED_DATASETS,
+                    live_datasets={"cameraprimus_systems"},
+                    n_cached_opt_steps=_plan.n_cached_opt_steps,
+                    n_live_opt_steps=_plan.n_live_opt_steps,
+                    b_cached=stage.b_cached,
+                    b_live=stage.b_live,
+                    grad_accum_cached=stage.grad_accumulation_steps_cached,
+                    grad_accum_live=stage.grad_accumulation_steps_live,
+                    seed=seed,
+                )
+                _train_loader = torch.utils.data.DataLoader(
+                    _stage_ds,
+                    batch_sampler=_TierGroupedBatchSampler(_batch_list),
+                    num_workers=num_workers,
+                    pin_memory=_pin_memory,
+                    persistent_workers=(num_workers > 0),
+                    prefetch_factor=_effective_prefetch,
+                    collate_fn=StageBDataset.collate_fn,
+                    worker_init_fn=stage_b_worker_init_fn,
+                )
+            else:
+                # Legacy path (Stage 1, Stage 2 v2): unchanged.
+                _stage_ds = StageBDataset(
+                    stage,
+                    grouped_entries,
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                    max_sequence_length=stage.max_sequence_length,
+                    augment=True,
+                    rng_seed=seed,
+                )
+                # Compute total micro-batch draws needed for the full stage.
+                # stage_total_steps is OPT-steps; each OPT-step consumes
+                # grad_accumulation_steps micro-batches.  Sizing the sampler to
+                # cover the full count guarantees the iterator never exhausts
+                # mid-accumulation-window (the StopIteration handler below is
+                # purely defensive against bugs / checkpoint restarts).
+                _stage_total_train_samples = (
+                    stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
+                )
+                _train_sampler = build_stage_b_sampler(
+                    stage, _stage_ds,
+                    total_samples=_stage_total_train_samples,
+                    seed=seed,
+                )
+                _train_loader = torch.utils.data.DataLoader(
+                    _stage_ds,
+                    batch_size=stage.batch_size,
+                    sampler=_train_sampler,
+                    num_workers=num_workers,
+                    pin_memory=_pin_memory,
+                    persistent_workers=(num_workers > 0),
+                    prefetch_factor=_effective_prefetch,
+                    collate_fn=StageBDataset.collate_fn,
+                    worker_init_fn=stage_b_worker_init_fn,
+                )
             _train_iter = iter(_train_loader)
             # vocab size is constant; grab from the dataset's vocab object.
             vocab_size = _stage_ds._vocab.size
@@ -2257,6 +2388,10 @@ def run_execute_mode(
             )
 
             timer.reset_step()
+            # Tier-grouped accumulation: tracks position within the current tier
+            # block. Reset to 0 at each opt-step boundary. Only used when
+            # stage.tier_grouped_sampling=True; legacy path uses stage_step % accum.
+            _tier_block_micro_idx = 0
 
             for stage_step in range(stage_start_step, stage_total_steps + 1):
                 if (stage_step - 1) % stage.grad_accumulation_steps == 0:
@@ -2289,13 +2424,29 @@ def run_execute_mode(
                     labels = _batch_dict["labels"].to(device, non_blocking=True)
                     contour_targets = _batch_dict["contour_targets"].to(device, non_blocking=True)
 
-                # Per-tier accum_steps (Task 4 will wire this into a tier-aware path).
-                # Until then this still uses stage.grad_accumulation_steps for legacy stages.
-                accum_steps = stage.grad_accumulation_steps
-                is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
-                if (stage_step - 1) % accum_steps == 0:
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
+                # Per-batch accum_steps: tier-aware when tier_grouped_sampling is on.
+                # Tier-grouped sampler emits batches in contiguous tier blocks of
+                # size accum_steps; the opt-step boundary is the LAST batch of each
+                # block, tracked by per-tier-block micro-batch index.
+                if stage.tier_grouped_sampling:
+                    accum_steps = _grad_accum_for_batch(
+                        _batch_dict,
+                        grad_accum_cached=stage.grad_accumulation_steps_cached,
+                        grad_accum_live=stage.grad_accumulation_steps_live,
+                    )
+                    is_accum_step = (
+                        _tier_block_micro_idx + 1 == accum_steps
+                    ) or stage_step == stage_total_steps
+                    if _tier_block_micro_idx == 0:
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
+                    _tier_block_micro_idx = (_tier_block_micro_idx + 1) % accum_steps
+                else:
+                    accum_steps = stage.grad_accumulation_steps
+                    is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
+                    if (stage_step - 1) % accum_steps == 0:
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
                 with timer.gpu("forward"):
                     with torch.autocast(
                         device_type=device.type,
