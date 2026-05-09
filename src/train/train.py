@@ -1359,6 +1359,56 @@ def _run_validation(
     }
 
 
+def _forward_batch_for_train(
+    model,
+    batch_dict: "Dict[str, object]",
+    device: "torch.device",
+    *,
+    bf16_enabled: bool,
+    channels_last: bool,
+) -> "Dict[str, object]":
+    """Dispatch a batch through the model based on its tier.
+
+    Returns the model output dict (logits + contour_logits + ...). Does NOT
+    move decoder_inputs / labels / contour_targets to device — caller is
+    responsible for that (kept here for symmetry with the existing _run_stage
+    h2d block).
+
+    For cached batches: passes ``cached_features=encoder_hidden``, ``_h16``, ``_w16``.
+    For live batches: passes ``pixel_values=images``.
+    """
+    import torch as _torch
+
+    tier = batch_dict.get("tier", "live")
+    decoder_inputs = batch_dict["decoder_inputs"].to(device, non_blocking=True)
+    if tier == "cached":
+        cached_features = batch_dict["encoder_hidden"].to(device, non_blocking=True)
+        with _torch.autocast(
+            device_type=device.type,
+            dtype=_torch.bfloat16,
+            enabled=bf16_enabled,
+        ):
+            outputs = model(
+                cached_features=cached_features,
+                input_ids=decoder_inputs,
+                _h16=int(batch_dict["_h16"]),
+                _w16=int(batch_dict["_w16"]),
+                return_aux=True,
+            )
+    else:
+        if channels_last:
+            images = batch_dict["images"].to(device, non_blocking=True, memory_format=_torch.channels_last)
+        else:
+            images = batch_dict["images"].to(device, non_blocking=True)
+        with _torch.autocast(
+            device_type=device.type,
+            dtype=_torch.bfloat16,
+            enabled=bf16_enabled,
+        ):
+            outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+    return outputs
+
+
 def _save_checkpoint(
     checkpoint_dir: Path,
     model,
@@ -2246,26 +2296,26 @@ def run_execute_mode(
                 epoch_index = ((stage_step - 1) // stage_steps_per_epoch) + 1
                 epoch_step = ((stage_step - 1) % stage_steps_per_epoch) + 1
                 with timer.cpu("h2d"):
-                    if channels_last:
-                        images = _batch_dict["images"].to(device, non_blocking=True, memory_format=torch.channels_last)
-                    else:
-                        images = _batch_dict["images"].to(device, non_blocking=True)
-                    decoder_inputs = _batch_dict["decoder_inputs"].to(device, non_blocking=True)
                     labels = _batch_dict["labels"].to(device, non_blocking=True)
                     contour_targets = _batch_dict["contour_targets"].to(device, non_blocking=True)
 
+                # Per-tier accum_steps (Task 4 will wire this into a tier-aware path).
+                # Until then this still uses stage.grad_accumulation_steps for legacy stages.
                 accum_steps = stage.grad_accumulation_steps
                 is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
                 if (stage_step - 1) % accum_steps == 0:
                     optimizer.zero_grad(set_to_none=True)
                     accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
                 with timer.gpu("forward"):
+                    outputs = _forward_batch_for_train(
+                        model, _batch_dict, device,
+                        bf16_enabled=bf16_enabled, channels_last=channels_last,
+                    )
                     with torch.autocast(
                         device_type=device.type,
                         dtype=torch.bfloat16,
                         enabled=bf16_enabled,
                     ):
-                        outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
                         token_loss = F.cross_entropy(
                             outputs["logits"].reshape(-1, vocab_size),
                             labels.reshape(-1),
