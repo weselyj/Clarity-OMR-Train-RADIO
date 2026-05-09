@@ -1406,11 +1406,12 @@ def _run_validation_per_dataset(
     """Run validation as N disjoint passes (one per dataset).
 
     Calls :func:`_run_validation` once per dataset's loader and combines the
-    results.  The aggregate ``val_loss`` is the ``stage.dataset_mix`` ratio-
-    weighted mean of the per-dataset losses, so it remains consistent with the
-    previous single-pass aggregate when the val loader had the same sampling
-    distribution — this preserves backward compatibility with
-    ``best_val_loss`` tracking in ``_run_stage``.
+    results.  In tier-grouped mode (with ``cached_data_ratio`` set), the
+    aggregate ``val_loss`` is re-projected from per-tier ``dataset_mix`` shares
+    into the spec's global cached/live weighting (Decision #4): cached datasets
+    share ``cached_data_ratio`` proportional to their ``dm.ratio``; live
+    datasets share ``1 - cached_data_ratio``. In legacy (non-tier-grouped)
+    mode, falls back to ``dm.ratio`` directly.
 
     Args:
         model: The model to evaluate.
@@ -1453,7 +1454,45 @@ def _run_validation_per_dataset(
         per_loss[dataset_name] = result["val_loss"]
         per_contour[dataset_name] = result["val_contour_loss"]
 
-    weights = {dm.dataset: dm.ratio for dm in stage.dataset_mix}
+    # Spec Decision #4: aggregate val_loss is cached_data_ratio-weighted across
+    # cached/live tiers, with each tier's share split among its datasets by their
+    # dataset_mix ratios. In tier-grouped mode, dm.ratio describes the
+    # cached-tier WeightedRandomSampler weighting only — cameraprimus_systems is
+    # set to 0.0 in production YAML because it lives in the LIVE tier. Using
+    # dm.ratio directly would silently drop cameraprimus from best_val_loss
+    # tracking and sanity halt inputs — exactly the wrong behavior since
+    # cameraprimus is the dataset most likely to regress.
+    if stage.tier_grouped_sampling and stage.cached_data_ratio is not None:
+        cached_share = stage.cached_data_ratio
+        live_share = 1.0 - cached_share
+        cached_total = sum(
+            dm.ratio for dm in stage.dataset_mix if dm.dataset in _CACHED_DATASETS
+        )
+        live_total = sum(
+            dm.ratio for dm in stage.dataset_mix if dm.dataset not in _CACHED_DATASETS
+        )
+        weights: Dict[str, float] = {}
+        for dm in stage.dataset_mix:
+            if dm.dataset in _CACHED_DATASETS:
+                weights[dm.dataset] = (
+                    cached_share * (dm.ratio / cached_total) if cached_total > 0 else 0.0
+                )
+            else:
+                if live_total > 0:
+                    weights[dm.dataset] = live_share * (dm.ratio / live_total)
+                else:
+                    # All live datasets have ratio 0 in YAML (production case:
+                    # cameraprimus_systems ratio=0.0). Distribute live_share
+                    # evenly among live datasets so cameraprimus still gets
+                    # weighted into the aggregate.
+                    n_live = sum(
+                        1 for dm2 in stage.dataset_mix
+                        if dm2.dataset not in _CACHED_DATASETS
+                    )
+                    weights[dm.dataset] = live_share / n_live if n_live > 0 else 0.0
+    else:
+        weights = {dm.dataset: dm.ratio for dm in stage.dataset_mix}
+
     weight_sum = sum(weights.get(k, 0.0) for k in per_loss.keys())
     if weight_sum <= 0:
         return None
