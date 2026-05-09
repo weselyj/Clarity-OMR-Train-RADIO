@@ -1752,6 +1752,26 @@ def _compute_resume_position(
     return resume_stage_index, resume_stage_completed_steps
 
 
+def _resync_batch_idx_after_rebuild(batch_sampler) -> int:
+    """Return the value ``_batch_idx_consumed`` must be reset to after a
+    StopIteration-driven DataLoader rebuild, so the loop's standard
+    ``_batch_idx_consumed += 1`` ends up matching the rebuilt iterator's
+    actual next position.
+
+    The rebuilt iterator's first batch is at ``batch_sampler._start_idx``
+    (set at resume time and not advanced during the in-flight iterator).
+    Without this resync, ``_batch_idx_consumed`` would continue counting
+    from its pre-rebuild value, inflating the next checkpoint's
+    ``last_batch_idx`` and causing future resumes to skip too many batches
+    via ``_TierGroupedBatchSampler.set_start_idx``.
+
+    Returns 0 for samplers without a ``_start_idx`` attribute (non-tier-
+    grouped legacy path; ``_batch_idx_consumed`` is irrelevant there because
+    ``last_batch_idx`` is saved as None).
+    """
+    return int(getattr(batch_sampler, "_start_idx", 0))
+
+
 class _CpuPhase:
     """Inner context manager for CPU phase timing. See _StepTimer."""
     __slots__ = ("_parent", "_name", "_t0")
@@ -2756,6 +2776,17 @@ def run_execute_mode(
                                 _tier_block_micro_idx = 0
                         _train_iter = iter(_train_loader)
                         _batch_dict = next(_train_iter)
+                        if stage.tier_grouped_sampling:
+                            # Resync _batch_idx_consumed to the rebuilt
+                            # iterator's actual position. The standard
+                            # `_batch_idx_consumed += 1` below then leaves it
+                            # at (_start_idx + 1), the position of the next
+                            # un-consumed batch — without this resync the
+                            # counter inflates and the next checkpoint's
+                            # last_batch_idx skips too far on resume.
+                            _batch_idx_consumed = _resync_batch_idx_after_rebuild(
+                                _train_loader.batch_sampler
+                            )
                 if _batch_dict is None:
                     break
                 # Tier-grouped resume bookkeeping (Decision #6): count every

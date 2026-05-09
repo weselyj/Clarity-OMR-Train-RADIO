@@ -43,3 +43,39 @@ def test_tier_grouped_batch_sampler_set_start_idx_out_of_range():
         sampler.set_start_idx(10)
     with pytest.raises(ValueError):
         sampler.set_start_idx(-1)
+
+
+def test_resync_batch_idx_after_rebuild_returns_sampler_start_idx():
+    """After a StopIteration rebuild, _batch_idx_consumed must be reset to the
+    rebuilt iterator's actual position (== sampler._start_idx) so the loop's
+    standard `_batch_idx_consumed += 1` ends up matching the next un-consumed
+    micro-batch.
+
+    Without the resync, _batch_idx_consumed continues counting from its
+    pre-rebuild value, inflating the next checkpoint's last_batch_idx and
+    causing future resumes to skip too many batches via set_start_idx.
+    """
+    from src.train.train import _TierGroupedBatchSampler, _resync_batch_idx_after_rebuild
+
+    sampler = _TierGroupedBatchSampler([[i] for i in range(10)])
+    sampler.set_start_idx(2)
+    # Iterator yields batches starting at index 2; helper returns 2 so the
+    # loop's `_batch_idx_consumed += 1` afterwards leaves it at 3 — the
+    # position of the next un-consumed batch.
+    assert _resync_batch_idx_after_rebuild(sampler) == 2
+
+    sampler_default = _TierGroupedBatchSampler([[i] for i in range(4)])
+    # Default _start_idx is 0 (no set_start_idx call).
+    assert _resync_batch_idx_after_rebuild(sampler_default) == 0
+
+
+def test_resync_batch_idx_after_rebuild_defaults_to_zero_without_start_idx():
+    """Defensive: samplers without a _start_idx attribute (legacy/non-tier-grouped
+    path) yield 0. _batch_idx_consumed is irrelevant in those modes (last_batch_idx
+    is None on save) but the helper must not crash."""
+    from src.train.train import _resync_batch_idx_after_rebuild
+
+    class FakeSampler:
+        pass
+
+    assert _resync_batch_idx_after_rebuild(FakeSampler()) == 0
