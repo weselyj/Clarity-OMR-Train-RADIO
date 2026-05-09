@@ -658,11 +658,25 @@ class StageBDataset(torch.utils.data.Dataset):
 
         # --- Cached path: load pre-computed encoder features from disk ---
         if is_cached_tier and self.cache_root is not None and self.cache_hash16 is not None:
-            from src.data.encoder_cache import _sanitize_sample_key, read_cache_entry
-            key = _sanitize_sample_key(sample_id)
-            encoder_hidden, h16, w16 = read_cache_entry(
-                self.cache_root, self.cache_hash16, dataset_name, key
+            from src.data.encoder_cache import (
+                CacheMiss,
+                _sanitize_sample_key,
+                _sanitize_sample_key_legacy,
+                read_cache_entry,
             )
+            key = _sanitize_sample_key(sample_id)
+            try:
+                encoder_hidden, h16, w16 = read_cache_entry(
+                    self.cache_root, self.cache_hash16, dataset_name, key
+                )
+            except CacheMiss:
+                # Backwards-compat: caches built before 2026-05-09 used a lossy
+                # '__' escape. Fall back to that scheme so existing caches keep
+                # working without a 5h rebuild.
+                legacy_key = _sanitize_sample_key_legacy(sample_id)
+                encoder_hidden, h16, w16 = read_cache_entry(
+                    self.cache_root, self.cache_hash16, dataset_name, legacy_key
+                )
             # Token encode (same as live path)
             sequence = entry.get("token_sequence", [])
             if not isinstance(sequence, list) or not sequence:
