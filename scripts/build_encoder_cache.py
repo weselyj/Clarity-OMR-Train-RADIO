@@ -193,7 +193,10 @@ def _build_cache_for_entries(
 
         if dry_run:
             # In dry-run mode: run encoder on first real batch to measure sizes,
-            # then count remaining samples for projection
+            # then count remaining samples for projection.
+            # Hard-fail on OOM: a size estimate that silently excludes OOM'd
+            # batches would undercount the projection, defeating Phase 0a's
+            # ≤2 TB gate check. Caller must reduce --batch-size and retry.
             try:
                 feature_map = encode_fn(image_batch)  # (B, 1280, h16, w16)
                 h16 = feature_map.shape[2]
@@ -204,7 +207,15 @@ def _build_cache_for_entries(
                 stats["total_bytes"] += bytes_per_sample * len(valid_pending)
                 stats["samples_processed"] += len(valid_pending)
             except torch.cuda.OutOfMemoryError:
-                stats["oom_count"] += len(valid_pending)
+                print(
+                    f"\n[builder] FATAL: OOM during dry-run (batch_size={batch_size}). "
+                    f"Dry-run sizing requires successful encoding of every batch; "
+                    f"a partial projection would undercount the disk estimate. "
+                    f"Reduce --batch-size and retry.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise SystemExit(2)
             continue
 
         # Run encoder forward with OOM protection
