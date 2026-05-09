@@ -187,11 +187,30 @@ eval/results/cache/
 !data/README.md
 !data/**/README.md
 
-# Training logs
-logs/*.log
-logs/*.jsonl
+# Training logs and operator helpers (keep on disk for reference, don't track)
+logs/*
+!logs/.gitkeep
 
 # Generated manifests and training summaries
 src/data/manifests/*.jsonl
 src/data/manifests/*.json
 src/train/curriculum_summary.json
+
+# Eval outputs (keep on disk for analysis, don't track per-run results)
+eval/results/*
+!eval/results/.gitkeep
+!eval/results/baseline_davit_lieder.csv
+!eval/results/lieder_mvp.csv
+!eval/results/baseline_pre_rebuild/
+eval/results/baseline_pre_rebuild/*
+!eval/results/baseline_pre_rebuild/measure_stage_a.py
+!eval/results/baseline_pre_rebuild/stage_a_recall.csv
+
+# Local-only top-level dirs (training runs, audit/bench outputs, scratch)
+audit/
+bench/
+runs/
+scratch/
+
+# Model weight files at repo root (use checkpoints/ instead)
+/*.pt
