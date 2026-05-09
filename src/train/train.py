@@ -1557,9 +1557,9 @@ def _should_sanity_halt(*, val_loss: float, global_step: int) -> Tuple[str, bool
     """Spec sanity halt: val_loss > 5.0 in first 200 steps OR NaN at any step.
 
     Returns (message, should_halt). message is the human-readable reason; only
-    meaningful when should_halt=True.
+    meaningful when should_halt=True. The val_loss>5 message string is
+    intentionally stable so post-mortem tooling can grep for it.
     """
-    import math
     if math.isnan(val_loss):
         return ("val_loss is NaN", True)
     if global_step < 200 and val_loss > 5.0:
@@ -2785,14 +2785,23 @@ def run_execute_mode(
                                 f"[train] HALT (sanity): {halt_msg} at global_step={global_step}",
                                 flush=True,
                             )
-                            if step_log_path is not None:
-                                with step_log_path.open("a") as fh:
-                                    fh.write(json.dumps({
-                                        "event": "sanity_halt",
-                                        "global_step": global_step,
-                                        "val_loss": validation_result["val_loss"],
-                                        "reason": halt_msg,
-                                    }) + "\n")
+                            # Use the already-open step_writer rather than
+                            # re-opening step_log_path (which would race with
+                            # the buffered writer on Windows). Drain any
+                            # pending buffered rows first so they precede the
+                            # halt event in the log.
+                            if step_writer is not None:
+                                if _step_log_buffer:
+                                    step_writer.writelines(_step_log_buffer)
+                                    _step_log_buffer.clear()
+                                step_writer.write(json.dumps({
+                                    "event": "sanity_halt",
+                                    "global_step": global_step,
+                                    "val_loss": validation_result["val_loss"],
+                                    "reason": halt_msg,
+                                }) + "\n")
+                                step_writer.flush()
+                                step_writer.close()
                             sys.exit(1)
                         # Save a stable _best.pt whenever val_loss improves.
                         if checkpoint_dir is not None:
