@@ -1485,12 +1485,25 @@ def _run_validation_per_dataset(
         live_total = sum(
             dm.ratio for dm in stage.dataset_mix if dm.dataset not in _CACHED_DATASETS
         )
+        # Hoisted out of the per-dataset loop: tier sizes are stage-wide
+        # constants, not dependent on the iterating dm.
+        n_cached = sum(
+            1 for dm in stage.dataset_mix if dm.dataset in _CACHED_DATASETS
+        )
+        n_live = sum(
+            1 for dm in stage.dataset_mix if dm.dataset not in _CACHED_DATASETS
+        )
         weights: Dict[str, float] = {}
         for dm in stage.dataset_mix:
             if dm.dataset in _CACHED_DATASETS:
-                weights[dm.dataset] = (
-                    cached_share * (dm.ratio / cached_total) if cached_total > 0 else 0.0
-                )
+                if cached_total > 0:
+                    weights[dm.dataset] = cached_share * (dm.ratio / cached_total)
+                else:
+                    # Symmetric to the live-tier fallback below: if every
+                    # cached dataset has ratio 0 in the YAML (degenerate but
+                    # representable), distribute cached_share evenly so the
+                    # cached tier still contributes to the aggregate.
+                    weights[dm.dataset] = cached_share / n_cached if n_cached > 0 else 0.0
             else:
                 if live_total > 0:
                     weights[dm.dataset] = live_share * (dm.ratio / live_total)
@@ -1499,10 +1512,6 @@ def _run_validation_per_dataset(
                     # cameraprimus_systems ratio=0.0). Distribute live_share
                     # evenly among live datasets so cameraprimus still gets
                     # weighted into the aggregate.
-                    n_live = sum(
-                        1 for dm2 in stage.dataset_mix
-                        if dm2.dataset not in _CACHED_DATASETS
-                    )
                     weights[dm.dataset] = live_share / n_live if n_live > 0 else 0.0
     else:
         weights = {dm.dataset: dm.ratio for dm in stage.dataset_mix}

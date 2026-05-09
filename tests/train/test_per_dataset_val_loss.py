@@ -210,6 +210,69 @@ def test_aggregate_uses_cached_data_ratio_not_dataset_mix_directly(monkeypatch):
     )
 
 
+def test_aggregate_distributes_cached_share_evenly_when_all_cached_ratios_zero(monkeypatch):
+    """Symmetric to the live-tier fallback at train.py:1497-1506. If a YAML
+    sets every cached dataset's ratio to 0 (degenerate but representable),
+    the previous code silently weighted only live datasets, dropping the
+    cached tier entirely from best_val_loss / sanity-halt inputs — the
+    same class of bug the cameraprimus fix solved on the live side.
+
+    Defensive fallback: distribute cached_share evenly among cached
+    datasets so each tier still contributes its share of the aggregate.
+    """
+    from src.train import train as train_mod
+
+    stage = _mk_stage(
+        dataset_mix_tuple=(
+            ("synthetic_systems", 0.0),
+            ("grandstaff_systems", 0.0),
+            ("primus_systems", 0.0),
+            ("cameraprimus_systems", 1.0),
+        ),
+        cached_data_ratio=0.9,
+        tier_grouped=True,
+    )
+
+    preset_losses = {
+        "synthetic_systems": 0.5,
+        "grandstaff_systems": 1.0,
+        "primus_systems": 1.5,
+        "cameraprimus_systems": 2.0,
+    }
+    loaders = {name: object() for name in preset_losses}
+    id_to_name = {id(loader): name for name, loader in loaders.items()}
+
+    def fake_run_validation(model, stage_arg, loader, device, **_kwargs):
+        name = id_to_name[id(loader)]
+        return {"val_loss": preset_losses[name], "val_contour_loss": 0.0}
+
+    monkeypatch.setattr(train_mod, "_run_validation", fake_run_validation)
+
+    result = train_mod._run_validation_per_dataset(
+        model=MagicMock(),
+        stage=stage,
+        per_dataset_loaders=loaders,
+        device=torch.device("cpu"),
+        bf16_enabled=False,
+        validation_batches=1,
+        vocab_size=100,
+    )
+
+    # Expected: cached_share=0.9 distributed evenly across 3 cached datasets
+    # (each 0.3); live_share=0.1 fully on cameraprimus.
+    expected = (
+        0.3 * 0.5 + 0.3 * 1.0 + 0.3 * 1.5 + 0.1 * 2.0
+    )
+    assert result["val_loss"] == pytest.approx(expected, rel=1e-6)
+
+    # Regression guard: buggy code would set all cached weights to 0 and
+    # weight_sum=0.1 (live only), giving an aggregate equal to cameraprimus.
+    assert result["val_loss"] != pytest.approx(2.0, rel=1e-6), (
+        "Aggregate equals cameraprimus loss alone; cached tier was dropped "
+        "from the aggregate (cached_total=0 fallback did not engage)."
+    )
+
+
 def test_aggregate_falls_back_to_dataset_mix_for_legacy_stages(monkeypatch):
     """Legacy (non-tier-grouped) stages do not set cached_data_ratio. The
     aggregator must fall back to dataset_mix.ratio directly so existing
