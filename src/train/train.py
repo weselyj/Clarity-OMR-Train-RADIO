@@ -2471,6 +2471,22 @@ def run_execute_mode(
                         continue
 
             optimizer = _build_optimizer(model, stage)
+            # In tier-grouped mode, opt-step count == stage_total_steps directly
+            # (the per-tier grad-accumulation is tracked via grad_accumulation_steps_cached
+            # / grad_accumulation_steps_live, NOT the legacy grad_accumulation_steps field).
+            # The legacy field is kept at 1 in tier-grouped YAMLs so this division is a no-op.
+            # Asserting that here would be wrong (legacy YAMLs use grad_accumulation_steps>1
+            # with tier_grouped_sampling=False), but flag the assumption in case a future
+            # YAML mixes the two and the LR cosine span ends up wrong.
+            if stage.tier_grouped_sampling and stage.grad_accumulation_steps != 1:
+                print(
+                    f"[train] warning: tier_grouped_sampling=True with "
+                    f"grad_accumulation_steps={stage.grad_accumulation_steps}; the LR scheduler "
+                    "horizon is computed as stage_total_steps // grad_accumulation_steps, "
+                    "but tier-grouped opt-steps count via stage_total_steps directly. "
+                    "Set grad_accumulation_steps=1 in the YAML for tier-grouped stages.",
+                    file=sys.stderr,
+                )
             optimizer_steps = max(1, stage_total_steps // stage.grad_accumulation_steps)
             scheduler = _build_scheduler(optimizer, stage, total_steps=optimizer_steps)
             if resumed_stage:
@@ -2479,7 +2495,8 @@ def run_execute_mode(
                         optimizer.load_state_dict(resume_optimizer_state)
                     except Exception as exc:
                         print(
-                            f"[train] warning: failed to restore optimizer state; continuing with fresh optimizer ({exc})",
+                            f"[train] warning: failed to restore optimizer state ({type(exc).__name__}: {exc}); "
+                            "continuing with fresh optimizer",
                             file=sys.stderr,
                         )
                 if resume_scheduler_state is not None:
@@ -2487,7 +2504,8 @@ def run_execute_mode(
                         scheduler.load_state_dict(resume_scheduler_state)
                     except Exception as exc:
                         print(
-                            f"[train] warning: failed to restore scheduler state; using step-aligned scheduler ({exc})",
+                            f"[train] warning: failed to restore scheduler state ({type(exc).__name__}: {exc}); "
+                            "using step-aligned scheduler",
                             file=sys.stderr,
                         )
                         scheduler.step(max(0, stage_start_step // stage.grad_accumulation_steps - 1))
@@ -2620,7 +2638,11 @@ def run_execute_mode(
             # the sampler captures self._batches[self._start_idx:] inside
             # __iter__, so any later mutation has no effect on the live iterator.
             if stage.tier_grouped_sampling and resumed_stage:
-                _resume_last_batch_idx = int(resume_payload.get("last_batch_idx") or 0) if resume_payload is not None else 0
+                _resume_last_batch_idx = (
+                    int(checkpoint_payload.get("last_batch_idx") or 0)
+                    if isinstance(checkpoint_payload, dict)
+                    else 0
+                )
                 if _resume_last_batch_idx > 0:
                     _train_loader.batch_sampler.set_start_idx(_resume_last_batch_idx)
                     _batch_idx_consumed = _resume_last_batch_idx
@@ -2796,8 +2818,6 @@ def run_execute_mode(
                             _batch_idx_consumed = _resync_batch_idx_after_rebuild(
                                 _train_loader.batch_sampler
                             )
-                if _batch_dict is None:
-                    break
                 # Tier-grouped resume bookkeeping (Decision #6): count every
                 # micro-batch successfully consumed by the iterator, NOT every
                 # opt-step.  Persisted into the checkpoint so a resumed run can
