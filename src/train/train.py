@@ -1553,6 +1553,20 @@ def _grad_accum_for_batch(
     return grad_accum_cached if tier == "cached" else grad_accum_live
 
 
+def _should_sanity_halt(*, val_loss: float, global_step: int) -> Tuple[str, bool]:
+    """Spec sanity halt: val_loss > 5.0 in first 200 steps OR NaN at any step.
+
+    Returns (message, should_halt). message is the human-readable reason; only
+    meaningful when should_halt=True.
+    """
+    import math
+    if math.isnan(val_loss):
+        return ("val_loss is NaN", True)
+    if global_step < 200 and val_loss > 5.0:
+        return ("val_loss>5 in first 200 steps", True)
+    return ("", False)
+
+
 def _save_checkpoint(
     checkpoint_dir: Path,
     model,
@@ -2758,6 +2772,28 @@ def run_execute_mode(
                                 **validation_result,
                             }
                         )
+                        # Sanity halt (Spec line 226): val_loss > 5.0 in first
+                        # 200 steps OR NaN at any step. Fires BEFORE best.pt
+                        # write so a corrupt validation never overwrites the
+                        # stable best checkpoint.
+                        halt_msg, should_halt = _should_sanity_halt(
+                            val_loss=validation_result["val_loss"],
+                            global_step=global_step,
+                        )
+                        if should_halt:
+                            print(
+                                f"[train] HALT (sanity): {halt_msg} at global_step={global_step}",
+                                flush=True,
+                            )
+                            if step_log_path is not None:
+                                with step_log_path.open("a") as fh:
+                                    fh.write(json.dumps({
+                                        "event": "sanity_halt",
+                                        "global_step": global_step,
+                                        "val_loss": validation_result["val_loss"],
+                                        "reason": halt_msg,
+                                    }) + "\n")
+                            sys.exit(1)
                         # Save a stable _best.pt whenever val_loss improves.
                         if checkpoint_dir is not None:
                             current_val = validation_result.get("val_loss")
