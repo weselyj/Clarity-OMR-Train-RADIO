@@ -1387,6 +1387,83 @@ def _run_validation(
     }
 
 
+def _run_validation_per_dataset(
+    model,
+    stage: "StageTrainingConfig",
+    per_dataset_loaders: "Dict[str, object]",
+    device,
+    *,
+    bf16_enabled: bool,
+    validation_batches: int,
+    vocab_size: int,
+    channels_last: bool = False,
+) -> "Optional[Dict[str, object]]":
+    """Run validation as N disjoint passes (one per dataset).
+
+    Calls :func:`_run_validation` once per dataset's loader and combines the
+    results.  The aggregate ``val_loss`` is the ``stage.dataset_mix`` ratio-
+    weighted mean of the per-dataset losses, so it remains consistent with the
+    previous single-pass aggregate when the val loader had the same sampling
+    distribution — this preserves backward compatibility with
+    ``best_val_loss`` tracking in ``_run_stage``.
+
+    Args:
+        model: The model to evaluate.
+        stage: StageTrainingConfig (only ``dataset_mix``,
+            ``label_smoothing`` and ``contour_loss_weight`` are read).
+        per_dataset_loaders: Mapping of dataset name → DataLoader (or any
+            iterable) of val batches for that dataset.  One disjoint
+            validation pass is run per entry.
+        device: torch.device to move tensors onto.
+        bf16_enabled: Whether to enable bfloat16 autocast.
+        validation_batches: Maximum number of batches to evaluate per dataset.
+        vocab_size: Vocabulary size for cross-entropy logits reshape.
+        channels_last: When True, move images with channels_last memory format.
+
+    Returns:
+        Dict with::
+
+            {
+                "val_loss": float,                 # sample-weighted aggregate
+                "val_contour_loss": float,         # sample-weighted aggregate
+                "val_loss_per_dataset": Dict[str, float],
+                "val_contour_loss_per_dataset": Dict[str, float],
+            }
+
+        Returns ``None`` if every per-dataset loader is empty (or all weights
+        are zero).
+    """
+    per_loss: Dict[str, float] = {}
+    per_contour: Dict[str, float] = {}
+    for dataset_name, loader in per_dataset_loaders.items():
+        result = _run_validation(
+            model, stage, loader, device,
+            bf16_enabled=bf16_enabled,
+            validation_batches=validation_batches,
+            vocab_size=vocab_size,
+            channels_last=channels_last,
+        )
+        if result is None:
+            continue
+        per_loss[dataset_name] = result["val_loss"]
+        per_contour[dataset_name] = result["val_contour_loss"]
+
+    weights = {dm.dataset: dm.ratio for dm in stage.dataset_mix}
+    weight_sum = sum(weights.get(k, 0.0) for k in per_loss.keys())
+    if weight_sum <= 0:
+        return None
+    val_loss_agg = sum(weights.get(k, 0.0) * v for k, v in per_loss.items()) / weight_sum
+    val_contour_agg = sum(
+        weights.get(k, 0.0) * v for k, v in per_contour.items()
+    ) / weight_sum
+    return {
+        "val_loss": float(val_loss_agg),
+        "val_contour_loss": float(val_contour_agg),
+        "val_loss_per_dataset": per_loss,
+        "val_contour_loss_per_dataset": per_contour,
+    }
+
+
 def _forward_batch_for_train(
     model,
     batch_dict: "Dict[str, object]",
@@ -2362,42 +2439,98 @@ def run_execute_mode(
             # vocab size is constant; grab from the dataset's vocab object.
             vocab_size = _stage_ds._vocab.size
 
-            # Build a val-side DataLoader for _run_validation.
-            # Uses the same dataset_mix ratios as training but fetches from
-            # split="val" entries.  augment=False: no augmentation during eval.
-            # The sampler is sized to cover validation_batches * batch_size draws
-            # (with replacement) so the iterator never exhausts during a single
-            # validation cycle.  A fresh iter() is called inside _run_validation.
-            _val_dataset = StageBDataset(
-                stage,
-                grouped_entries,
-                split="val",
-                project_root=project_root,
-                image_height=image_height,
-                image_width=image_width,
-                max_sequence_length=stage.max_sequence_length,
-                augment=False,
-                rng_seed=seed,
-            )
-            _val_total_samples = validation_batches * stage.batch_size
-            _val_sampler = build_stage_b_sampler(
-                stage,
-                _val_dataset,
-                total_samples=_val_total_samples,
-                seed=seed,
-                split_override="val",
-            )
-            _val_loader = torch.utils.data.DataLoader(
-                _val_dataset,
-                batch_size=stage.batch_size,
-                sampler=_val_sampler,
-                num_workers=num_workers,
-                pin_memory=_pin_memory,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=_effective_prefetch,
-                collate_fn=StageBDataset.collate_fn,
-                worker_init_fn=stage_b_worker_init_fn,
-            )
+            # Build val-side DataLoader(s) for validation.
+            #
+            # Tier-grouped (Stage 3+): build ONE loader per dataset so we can
+            # report stratified per-dataset val_loss (Decision #4 of the Stage 3
+            # plan: 4 disjoint validation passes).  Each per-dataset loader uses
+            # the tier-appropriate batch size (b_cached / b_live) since cached
+            # tensors are tiny relative to live images.
+            #
+            # Legacy (Stage 1 / Stage 2 v2): a single mixed loader sampled from
+            # all datasets at once via the WeightedRandomSampler.  Behavior
+            # unchanged from previous releases.
+            if stage.tier_grouped_sampling:
+                cache_root_path = (
+                    (project_root / stage.cache_root).resolve() if stage.cache_root else None
+                )
+                _per_dataset_val_loaders: "Optional[Dict[str, object]]" = {}
+                for mix_item in stage.dataset_mix:
+                    _ds_entries = grouped_entries.get((mix_item.dataset, "val"), [])
+                    if not _ds_entries:
+                        continue
+                    _val_ds_for_dataset = StageBDataset(
+                        stage,
+                        # Restrict to a single (dataset, "val") key so the
+                        # dataset's `entries` only contains this dataset's rows.
+                        {(mix_item.dataset, "val"): _ds_entries},
+                        split="val",
+                        project_root=project_root,
+                        image_height=image_height,
+                        image_width=image_width,
+                        max_sequence_length=stage.max_sequence_length,
+                        augment=False,
+                        rng_seed=seed,
+                        cache_root=cache_root_path,
+                        cache_hash16=stage.cache_hash16,
+                    )
+                    if len(_val_ds_for_dataset) == 0:
+                        continue
+                    _bs_for_ds = (
+                        stage.b_cached if mix_item.dataset in _CACHED_DATASETS else stage.b_live
+                    )
+                    _val_total_for_ds = validation_batches * _bs_for_ds
+                    _ds_sampler = torch.utils.data.RandomSampler(
+                        _val_ds_for_dataset,
+                        replacement=True,
+                        num_samples=_val_total_for_ds,
+                        generator=torch.Generator().manual_seed(seed),
+                    )
+                    _per_dataset_val_loaders[mix_item.dataset] = torch.utils.data.DataLoader(
+                        _val_ds_for_dataset,
+                        batch_size=_bs_for_ds,
+                        sampler=_ds_sampler,
+                        num_workers=num_workers,
+                        pin_memory=_pin_memory,
+                        persistent_workers=(num_workers > 0),
+                        prefetch_factor=_effective_prefetch,
+                        collate_fn=StageBDataset.collate_fn,
+                        worker_init_fn=stage_b_worker_init_fn,
+                    )
+                _val_loader = None  # Sentinel: dispatch uses _per_dataset_val_loaders below.
+            else:
+                # Legacy single-pass val loader (Stage 1 / Stage 2 v2). Unchanged.
+                _val_dataset = StageBDataset(
+                    stage,
+                    grouped_entries,
+                    split="val",
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                    max_sequence_length=stage.max_sequence_length,
+                    augment=False,
+                    rng_seed=seed,
+                )
+                _val_total_samples = validation_batches * stage.batch_size
+                _val_sampler = build_stage_b_sampler(
+                    stage,
+                    _val_dataset,
+                    total_samples=_val_total_samples,
+                    seed=seed,
+                    split_override="val",
+                )
+                _val_loader = torch.utils.data.DataLoader(
+                    _val_dataset,
+                    batch_size=stage.batch_size,
+                    sampler=_val_sampler,
+                    num_workers=num_workers,
+                    pin_memory=_pin_memory,
+                    persistent_workers=(num_workers > 0),
+                    prefetch_factor=_effective_prefetch,
+                    collate_fn=StageBDataset.collate_fn,
+                    worker_init_fn=stage_b_worker_init_fn,
+                )
+                _per_dataset_val_loaders = None
 
             timer.reset_step()
             # Tier-grouped accumulation: tracks position within the current tier
@@ -2594,16 +2727,28 @@ def run_execute_mode(
                 if global_step % stage.validate_every_steps == 0:
                     import time as _time
                     _val_t0 = _time.perf_counter()
-                    validation_result = _run_validation(
-                        model=model,
-                        stage=stage,
-                        val_loader=_val_loader,
-                        device=device,
-                        bf16_enabled=bf16_enabled,
-                        validation_batches=validation_batches,
-                        vocab_size=vocab_size,
-                        channels_last=channels_last,
-                    )
+                    if stage.tier_grouped_sampling and _per_dataset_val_loaders is not None:
+                        # Stage 3+: 4 disjoint per-dataset passes with
+                        # sample-weighted aggregate val_loss (Decision #4).
+                        validation_result = _run_validation_per_dataset(
+                            model, stage, _per_dataset_val_loaders, device,
+                            bf16_enabled=bf16_enabled,
+                            validation_batches=validation_batches,
+                            vocab_size=vocab_size,
+                            channels_last=channels_last,
+                        )
+                    else:
+                        # Legacy Stage 1 / Stage 2 v2 path. Unchanged.
+                        validation_result = _run_validation(
+                            model=model,
+                            stage=stage,
+                            val_loader=_val_loader,
+                            device=device,
+                            bf16_enabled=bf16_enabled,
+                            validation_batches=validation_batches,
+                            vocab_size=vocab_size,
+                            channels_last=channels_last,
+                        )
                     _validation_ms = (_time.perf_counter() - _val_t0) * 1000.0
                     if validation_result is not None:
                         validation_events.append(
@@ -2706,6 +2851,19 @@ def run_execute_mode(
                             "bf16_enabled": bf16_enabled,
                             "validation": validation_result,
                         }
+                        # Stage 3 stratified val_loss: surface per-dataset
+                        # losses at the top level of the row so downstream
+                        # log consumers don't need to dig into "validation".
+                        # Legacy stages (no per-dataset key) write nothing.
+                        if validation_result is not None:
+                            if "val_loss_per_dataset" in validation_result:
+                                record["val_loss_per_dataset"] = validation_result[
+                                    "val_loss_per_dataset"
+                                ]
+                            if "val_contour_loss_per_dataset" in validation_result:
+                                record["val_contour_loss_per_dataset"] = validation_result[
+                                    "val_contour_loss_per_dataset"
+                                ]
                         _step_log_buffer.append(json.dumps(record) + "\n")
                         # Flush buffer to disk on: cadence step, validation event,
                         # checkpoint event, or when a validation result is present.
