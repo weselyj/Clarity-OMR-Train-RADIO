@@ -693,6 +693,78 @@ def musicxml_validity(paths: Sequence[str]) -> float:
     return valid / float(len(paths))
 
 
+# Root tags that identify a well-formed MusicXML document. MusicXML supports
+# both partwise and timewise scores; everything we render uses partwise but we
+# accept either to match the spec ("did it produce MusicXML at all").
+_MUSICXML_ROOT_TAGS = {"score-partwise", "score-timewise"}
+
+
+def _render_tokens_to_musicxml_bytes(tokens: Sequence[str]) -> bytes:
+    """Render a Stage-B token sequence to MusicXML bytes via music21.
+
+    Mirrors the production export pipeline (one-Part / one-Score wrapper used by
+    ``src.eval.reconstruct_tokens_image._render_single_staff_png``) but emits
+    the MusicXML directly to a byte string instead of writing to disk — so the
+    eval-time validity check has no temp-file IO.
+
+    Raises any exception from ``append_tokens_to_part`` or the music21 exporter
+    so the caller can count it as an invalid sample. We intentionally do NOT
+    swallow errors here; ``musicxml_validity_from_tokens`` is the place that
+    converts exceptions into a 0/1 vote.
+    """
+    from music21 import stream
+    from music21.musicxml.m21ToXml import GeneralObjectExporter
+
+    from src.pipeline.export_musicxml import append_tokens_to_part
+
+    score = stream.Score()
+    part = stream.Part()
+    append_tokens_to_part(part, list(tokens))
+    score.append(part)
+    exporter = GeneralObjectExporter(score)
+    return exporter.parse()
+
+
+def musicxml_validity_from_tokens(token_lists: Sequence[Sequence[str]]) -> Optional[float]:
+    """Fraction of token sequences that decode into well-formed MusicXML.
+
+    For each input sequence we attempt to render it to MusicXML via music21
+    (matching the production ``src.pipeline.export_musicxml`` path) and then
+    parse the result with ``xml.etree.ElementTree.fromstring``. A sequence
+    counts as *valid* when:
+
+    1. ``append_tokens_to_part`` + the music21 exporter return without raising
+    2. The bytes parse as well-formed XML
+    3. The root tag is one of ``score-partwise`` / ``score-timewise``
+
+    Any failure at any stage counts as invalid. Returns ``None`` for an empty
+    input — the metric is undefined when there are no samples, mirroring the
+    file-path-based ``musicxml_validity`` callsite in ``run_eval.evaluate_rows``
+    which also reports None when there are no inputs.
+    """
+    if not token_lists:
+        return None
+
+    import xml.etree.ElementTree as ET
+
+    valid = 0
+    for tokens in token_lists:
+        try:
+            xml_bytes = _render_tokens_to_musicxml_bytes(tokens)
+            root = ET.fromstring(xml_bytes)
+        except Exception:
+            # Any failure (token decode, music21 export, XML parse) counts as
+            # invalid. The metric exists precisely to detect these regressions
+            # in aggregate; we don't want a single bad sample to crash eval.
+            continue
+        # Strip any XML namespace before comparing (music21's exporter does not
+        # set one today, but defend against future changes).
+        tag = root.tag.split("}", 1)[-1] if "}" in root.tag else root.tag
+        if tag in _MUSICXML_ROOT_TAGS:
+            valid += 1
+    return valid / float(len(token_lists))
+
+
 def musicxml_musical_similarity(
     pairs: Sequence[Tuple[str, str]],
 ) -> Dict[str, Optional[float] | int]:

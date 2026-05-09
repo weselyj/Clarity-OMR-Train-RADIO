@@ -17,6 +17,7 @@ from src.eval.metrics import (
     default_ablation_matrix,
     musicxml_musical_similarity,
     musicxml_validity,
+    musicxml_validity_from_tokens,
 )
 
 
@@ -64,7 +65,18 @@ def evaluate_rows(rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
         by_dataset[dataset] = aggregate_metrics(pairs)
 
     musicxml_paths = [str(row["pred_musicxml_path"]) for row in rows if row.get("pred_musicxml_path")]
-    musicxml_rate = musicxml_validity(musicxml_paths) if musicxml_paths else None
+    if musicxml_paths:
+        # Some rows already carry rendered MusicXML files — validate them via
+        # music21 (heavy but most accurate; matches Stage-B production output).
+        musicxml_rate = musicxml_validity(musicxml_paths)
+    else:
+        # Stage 3 / Plan C path: rows only carry pred_tokens. Decode tokens to
+        # MusicXML in-memory and validate via etree. Spec §3 (line 264) — the
+        # eval driver was leaving this metric at None because no path was
+        # available; this branch enables it always-on so Phase 2 / Plan D can
+        # gate on the value without further changes.
+        token_lists = [row["pred_tokens"] for row in rows if row.get("pred_tokens")]
+        musicxml_rate = musicxml_validity_from_tokens(token_lists)
     roundtrip_pairs: List[Tuple[str, str]] = []
     for row in rows:
         pred_musicxml = row.get("pred_musicxml_path")
