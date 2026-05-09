@@ -229,6 +229,79 @@ def test_write_cache_metadata_creates_json(tmp_path: Path) -> None:
     assert loaded["hidden_dim"] == 1280
 
 
+def test_builder_metadata_contains_required_fields(tmp_path: Path) -> None:
+    """metadata.json written by _build_cache_for_entries caller must include
+    build_batch_size, samples_processed, skipped_cached, skipped_load_fail,
+    and elapsed_sec to support post-hoc auditing without the original log.
+    """
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    from scripts.build_encoder_cache import _build_cache_for_entries
+    from src.data.encoder_cache import write_cache_metadata
+
+    hash16 = "metafield0000000"
+    cache_root = tmp_path / "cache"
+
+    # Create a small set of fake PNG images
+    for i in range(4):
+        img = Image.fromarray(np.ones((32, 64), dtype=np.uint8) * 200)
+        img.save(tmp_path / f"img_{i}.png")
+
+    entries = [
+        {"sample_id": f"synthetic_systems:sample_{i:03d}", "dataset": "synthetic_systems",
+         "image_path": str(tmp_path / f"img_{i}.png")}
+        for i in range(4)
+    ]
+
+    def fake_encode(image_batch):
+        B = image_batch.shape[0]
+        return torch.ones(B, 1280, 2, 4, dtype=torch.bfloat16)
+
+    import time
+    t0 = time.time()
+    stats = _build_cache_for_entries(
+        entries=entries,
+        cache_root=cache_root,
+        hash16=hash16,
+        encode_fn=fake_encode,
+        project_root=tmp_path,
+        image_height=32,
+        image_width=64,
+        batch_size=4,
+        dry_run=False,
+    )
+    elapsed = round(time.time() - t0, 1)
+
+    # Simulate what main() does: write metadata with the new required fields.
+    write_cache_metadata(cache_root, hash16, {
+        "hidden_dim": 1280,
+        "dtype": "bfloat16",
+        "build_batch_size": 4,
+        "sample_count": stats["written"],
+        "samples_processed": stats["samples_processed"],
+        "skipped_cached": stats["skipped_cached"],
+        "skipped_load_fail": stats["skipped_load_fail"],
+        "total_bytes": stats["total_bytes"],
+        "oom_count": stats["oom_count"],
+        "elapsed_sec": elapsed,
+    })
+
+    md_path = cache_root / hash16 / "metadata.json"
+    assert md_path.exists()
+    loaded = json.loads(md_path.read_text())
+
+    assert "build_batch_size" in loaded, "metadata.json must record build_batch_size"
+    assert loaded["build_batch_size"] == 4
+    assert "samples_processed" in loaded, "metadata.json must record samples_processed"
+    assert loaded["samples_processed"] == 4
+    assert "skipped_cached" in loaded, "metadata.json must record skipped_cached"
+    assert "skipped_load_fail" in loaded, "metadata.json must record skipped_load_fail"
+    assert "elapsed_sec" in loaded, "metadata.json must record elapsed_sec"
+    assert isinstance(loaded["elapsed_sec"], (int, float))
+
+
 def test_write_returns_correct_path(tmp_path: Path) -> None:
     from src.data.encoder_cache import write_cache_entry
     t = _make_fake_tensor()

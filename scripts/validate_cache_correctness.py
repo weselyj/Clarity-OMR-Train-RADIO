@@ -68,15 +68,42 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--tolerance", type=float, default=1e-3)
-    parser.add_argument("--match-batch-size", type=int, default=8,
+    parser.add_argument("--match-batch-size", type=int, default=None,
                         help="Encode each validation image at this batch size by replicating it. "
                              "Matches the build's batch size to neutralize flash-attention kernel "
                              "variance. Set to 1 to skip replication (will produce false failures "
-                             "if the cache was built with batch_size > 1).")
+                             "if the cache was built with batch_size > 1). "
+                             "Defaults to build_batch_size from metadata.json if present, "
+                             "otherwise 8.")
     args = parser.parse_args()
 
     with args.preproc_cfg.open() as fh:
         preproc_cfg = yaml.safe_load(fh)
+
+    # Resolve match_batch_size: CLI wins; fall back to metadata.json; then default 8.
+    if args.match_batch_size is None:
+        metadata_path = args.cache_root / args.hash16 / "metadata.json"
+        if metadata_path.exists():
+            try:
+                meta = json.loads(metadata_path.read_text())
+                args.match_batch_size = int(meta["build_batch_size"])
+                print(
+                    f"[validate] match_batch_size={args.match_batch_size} "
+                    f"(read from metadata.json)",
+                    flush=True,
+                )
+            except (KeyError, ValueError, TypeError):
+                args.match_batch_size = 8
+                print(
+                    f"[validate] match_batch_size=8 (metadata.json missing build_batch_size; using default)",
+                    flush=True,
+                )
+        else:
+            args.match_batch_size = 8
+            print(
+                f"[validate] match_batch_size=8 (no metadata.json found; using default)",
+                flush=True,
+            )
     image_height = preproc_cfg.get("image_height", 250)
     image_width = preproc_cfg.get("image_width", 2500)
 
@@ -208,7 +235,7 @@ def main() -> int:
         status = "PASS" if max_d <= args.tolerance else "FAIL"
         if status == "FAIL":
             failed.append({"sample_id": sid, "max_diff": max_d})
-        if i % 10 == 0:
+        if i % 10 == 0 or status == "FAIL" or i == args.n_samples - 1:
             print(
                 f"[validate] {i + 1}/{len(sample_entries)} {status}"
                 f" max_diff={max_d:.2e} mean_diff={mean_d:.2e}",

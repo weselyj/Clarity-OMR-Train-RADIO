@@ -414,9 +414,14 @@ def main() -> int:
             "hash16": hash16,
             "hidden_dim": 1280,
             "dtype": "bfloat16",
+            "build_batch_size": args.batch_size,
             "sample_count": stats["written"],
+            "samples_processed": stats["samples_processed"],
+            "skipped_cached": stats["skipped_cached"],
+            "skipped_load_fail": stats["skipped_load_fail"],
             "total_bytes": stats["total_bytes"],
             "oom_count": stats["oom_count"],
+            "elapsed_sec": round(elapsed, 1),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
         print(f"[builder] metadata written to {args.cache_root / hash16 / 'metadata.json'}", flush=True)
