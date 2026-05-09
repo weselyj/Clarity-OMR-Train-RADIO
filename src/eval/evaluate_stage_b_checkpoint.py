@@ -159,6 +159,46 @@ def _build_eval_rows(prediction_rows: Sequence[Dict[str, object]]) -> List[Dict[
     return rows
 
 
+def _encode_from_cached_features(decode_model, cached_features, h16: int, w16: int):
+    """Run deformable_attention + positional_bridge on cached raw RADIO features.
+
+    The encoder cache stores raw RADIO spatial output (seq_tokens, 1280) before
+    the deformable attention and positional bridge (1280→768).  This function
+    re-runs those two trainable stages so the output ``memory`` tensor has the
+    correct 768-dim shape expected by cross_attn_k in each decoder block.
+
+    Args:
+        decode_model: The unwrapped RadioStageB instance (or a compatible model
+            with ``deformable_attention`` and ``positional_bridge`` attributes).
+        cached_features: Tensor of shape (seq_tokens, 1280) as loaded from cache
+            (typically bfloat16; will be cast to match the model parameter dtype).
+        h16: spatial height (H/16) before flattening.
+        w16: spatial width (W/16) before flattening.
+
+    Returns:
+        memory tensor of shape (1, seq_tokens, 768) ready for decode_tokens.
+    """
+    import torch
+
+    # Cast cached bfloat16 features to the model's working dtype so the
+    # deformable_attention and positional_bridge matmuls do not type-mismatch.
+    model_dtype = next(decode_model.deformable_attention.parameters()).dtype
+    cached_features = cached_features.to(dtype=model_dtype)
+
+    # cached_features: (seq_tokens, 1280) — add batch dim → (1, seq_tokens, 1280)
+    seq_tensor = cached_features.unsqueeze(0)  # (1, seq_tokens, 1280)
+    B, seq_tokens, C = seq_tensor.shape
+    # Reshape to (B, C, H/16, W/16) for deformable attention
+    feature_map = seq_tensor.transpose(1, 2).reshape(B, C, h16, w16)
+    # Deformable attention (same as live encode_staff path)
+    sequence = feature_map.flatten(2).transpose(1, 2)
+    with torch.inference_mode():
+        sequence = decode_model.deformable_attention(sequence, h16, w16)
+        sequence = sequence.transpose(1, 2).reshape(B, C, h16, w16)
+        memory, _ = decode_model.positional_bridge(sequence)
+    return memory  # (1, seq_tokens, 768)
+
+
 def _resolve_cache_memory(
     *,
     decode_model,
@@ -169,9 +209,14 @@ def _resolve_cache_memory(
     cache_hash: Optional[str],
     device,
     use_fp16: bool,
-    model_dtype=None,
 ):
     """Return encoder memory for one sample, using the cache when available.
+
+    The encoder cache stores raw RADIO spatial output (seq_tokens, 1280) before
+    the deformable attention and positional bridge.  When a cache hit occurs,
+    this function runs those two trainable stages (deformable_attention +
+    positional_bridge) to produce the 768-dim memory tensor expected by the
+    decoder cross-attention, skipping only the expensive RADIO encoder forward.
 
     Lookup order:
       1. If ``cache_root`` is provided AND ``dataset`` is in ``_CACHED_DATASETS``:
@@ -187,19 +232,9 @@ def _resolve_cache_memory(
     corruption surfaces as a failure rather than a silent accuracy regression.
 
     Returns:
-        memory tensor — same semantics as ``_encode_staff_image`` return value,
-        moved to ``device`` and cast to the model's dtype (``model_dtype`` when
-        provided; falls back to fp16 if ``use_fp16`` is True, else float32).
+        memory tensor of shape (1, seq_tokens, 768), dtype matching the model.
     """
-    import torch
     from src.cli import _encode_staff_image
-
-    # Determine target dtype: prefer the explicit model_dtype so the cached
-    # bfloat16 tensor is always cast to match the model (fp32 by default).
-    if model_dtype is None:
-        target_dtype = torch.float16 if use_fp16 else torch.float32
-    else:
-        target_dtype = model_dtype
 
     if cache_root is not None and dataset in _CACHED_DATASETS:
         from src.data.encoder_cache import (
@@ -209,19 +244,23 @@ def _resolve_cache_memory(
         )
         new_key = _sanitize_sample_key(sample_id)
         try:
-            tensor, _h16, _w16 = read_cache_entry(
+            raw_tensor, h16, w16 = read_cache_entry(
                 cache_root, cache_hash, dataset, new_key
             )
-            return tensor.to(device=device, dtype=target_dtype)
+            # Move to device (keep bfloat16 from cache; bridge will produce fp32/fp16
+            # as dictated by the model's parameter dtype).
+            raw_tensor = raw_tensor.to(device=device)
+            return _encode_from_cached_features(decode_model, raw_tensor, h16, w16)
         except FileNotFoundError:
             pass  # try legacy key
 
         legacy_key = _sanitize_sample_key_legacy(sample_id)
         try:
-            tensor, _h16, _w16 = read_cache_entry(
+            raw_tensor, h16, w16 = read_cache_entry(
                 cache_root, cache_hash, dataset, legacy_key
             )
-            return tensor.to(device=device, dtype=target_dtype)
+            raw_tensor = raw_tensor.to(device=device)
+            return _encode_from_cached_features(decode_model, raw_tensor, h16, w16)
         except FileNotFoundError:
             pass  # both schemes missed; fall through to live encoder
 
@@ -303,9 +342,6 @@ def _run_stage_b_inference_with_progress(
 
     # Prepare model once for all crops
     decode_model, use_fp16 = _prepare_model_for_inference(model, device, use_fp16=use_fp16, quantize=quantize)
-    # Determine model dtype so cached bfloat16 tensors are cast to match the model.
-    import torch as _torch
-    _model_dtype = next(decode_model.parameters()).dtype
     _token_to_idx = {token: idx for idx, token in enumerate(vocab.tokens)}
 
     output_predictions.parent.mkdir(parents=True, exist_ok=True)
@@ -355,7 +391,6 @@ def _run_stage_b_inference_with_progress(
                 cache_hash=_cache_hash,
                 device=device,
                 use_fp16=use_fp16,
-                model_dtype=_model_dtype,
             )
 
             tokens = _decode_stage_b_tokens(
