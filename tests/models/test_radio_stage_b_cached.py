@@ -155,3 +155,13 @@ def test_forward_cached_raises_on_pool_to_stride32() -> None:
     tgt = torch.zeros(1, 3, dtype=torch.long)
     with pytest.raises(ValueError, match="pool_to_stride32"):
         model.forward(cached_features=cached, tgt=tgt, _h16=2, _w16=4)
+
+
+def test_forward_raises_with_both_image_and_cached() -> None:
+    """forward() with both image= and cached_features= must raise ValueError."""
+    model = _build_tiny_model()
+    image = torch.rand(1, 1, 32, 64)
+    cached = torch.randn(1, 8, 1280)
+    tgt = torch.zeros(1, 3, dtype=torch.long)
+    with pytest.raises(ValueError, match="not both"):
+        model.forward(image=image, cached_features=cached, tgt=tgt, _h16=2, _w16=4)

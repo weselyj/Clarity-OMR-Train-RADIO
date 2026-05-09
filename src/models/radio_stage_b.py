@@ -204,6 +204,12 @@ class RadioStageB(nn.Module):
         if tgt is None:
             tgt = decoder_input_ids if decoder_input_ids is not None else input_ids
 
+        if cached_features is not None and image is not None:
+            raise ValueError(
+                "RadioStageB.forward accepts either image= (live path) or "
+                "cached_features= (cache path), not both"
+            )
+
         if cached_features is not None:
             if getattr(self.config, "pool_to_stride32", False):
                 raise ValueError(
