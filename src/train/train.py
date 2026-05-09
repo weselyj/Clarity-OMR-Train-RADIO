@@ -1369,43 +1369,33 @@ def _forward_batch_for_train(
 ) -> "Dict[str, object]":
     """Dispatch a batch through the model based on its tier.
 
-    Returns the model output dict (logits + contour_logits + ...). Does NOT
-    move decoder_inputs / labels / contour_targets to device — caller is
-    responsible for that (kept here for symmetry with the existing _run_stage
-    h2d block).
+    Returns the model output dict (logits + contour_logits + ...). The caller
+    is responsible for h2d of labels/contour_targets AND for the surrounding
+    ``torch.autocast`` scope (kept on the caller side for consistency with
+    ``_run_validation``).
 
     For cached batches: passes ``cached_features=encoder_hidden``, ``_h16``, ``_w16``.
     For live batches: passes ``pixel_values=images``.
     """
-    import torch as _torch
+    import torch
 
     tier = batch_dict.get("tier", "live")
     decoder_inputs = batch_dict["decoder_inputs"].to(device, non_blocking=True)
     if tier == "cached":
         cached_features = batch_dict["encoder_hidden"].to(device, non_blocking=True)
-        with _torch.autocast(
-            device_type=device.type,
-            dtype=_torch.bfloat16,
-            enabled=bf16_enabled,
-        ):
-            outputs = model(
-                cached_features=cached_features,
-                input_ids=decoder_inputs,
-                _h16=int(batch_dict["_h16"]),
-                _w16=int(batch_dict["_w16"]),
-                return_aux=True,
-            )
+        outputs = model(
+            cached_features=cached_features,
+            input_ids=decoder_inputs,
+            _h16=int(batch_dict["_h16"]),
+            _w16=int(batch_dict["_w16"]),
+            return_aux=True,
+        )
     else:
         if channels_last:
-            images = batch_dict["images"].to(device, non_blocking=True, memory_format=_torch.channels_last)
+            images = batch_dict["images"].to(device, non_blocking=True, memory_format=torch.channels_last)
         else:
             images = batch_dict["images"].to(device, non_blocking=True)
-        with _torch.autocast(
-            device_type=device.type,
-            dtype=_torch.bfloat16,
-            enabled=bf16_enabled,
-        ):
-            outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+        outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
     return outputs
 
 
@@ -2307,15 +2297,15 @@ def run_execute_mode(
                     optimizer.zero_grad(set_to_none=True)
                     accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
                 with timer.gpu("forward"):
-                    outputs = _forward_batch_for_train(
-                        model, _batch_dict, device,
-                        bf16_enabled=bf16_enabled, channels_last=channels_last,
-                    )
                     with torch.autocast(
                         device_type=device.type,
                         dtype=torch.bfloat16,
                         enabled=bf16_enabled,
                     ):
+                        outputs = _forward_batch_for_train(
+                            model, _batch_dict, device,
+                            bf16_enabled=bf16_enabled, channels_last=channels_last,
+                        )
                         token_loss = F.cross_entropy(
                             outputs["logits"].reshape(-1, vocab_size),
                             labels.reshape(-1),
