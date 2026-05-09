@@ -2394,8 +2394,15 @@ def run_execute_mode(
             _tier_block_micro_idx = 0
 
             for stage_step in range(stage_start_step, stage_total_steps + 1):
-                if (stage_step - 1) % stage.grad_accumulation_steps == 0:
-                    timer.reset_step()
+                if stage.tier_grouped_sampling:
+                    # Reset step timer at every tier-block boundary (start of a
+                    # new opt-step block). _tier_block_micro_idx==0 means the
+                    # previous opt-step (if any) just completed cleanly.
+                    if _tier_block_micro_idx == 0:
+                        timer.reset_step()
+                else:
+                    if (stage_step - 1) % stage.grad_accumulation_steps == 0:
+                        timer.reset_step()
                 with timer.cpu("sample"):
                     try:
                         _batch_dict = next(_train_iter)
@@ -2403,7 +2410,10 @@ def run_execute_mode(
                         # Defensive rebuild: iterator exhausted (correct
                         # total_samples sizing should prevent this, but guard
                         # against checkpoint restarts / sampler edge cases).
-                        _mid_window = (stage_step - 1) % stage.grad_accumulation_steps != 0
+                        if stage.tier_grouped_sampling:
+                            _mid_window = _tier_block_micro_idx != 0
+                        else:
+                            _mid_window = (stage_step - 1) % stage.grad_accumulation_steps != 0
                         if _mid_window:
                             # Partial accumulation window: accumulated gradients
                             # represent fewer micro-batches than expected.
@@ -2414,6 +2424,10 @@ def run_execute_mode(
                                 " window — gradient discarded",
                                 flush=True,
                             )
+                            if stage.tier_grouped_sampling:
+                                # Abandon the partial block: reset block index so
+                                # the rebuilt iterator's first batch starts fresh.
+                                _tier_block_micro_idx = 0
                         _train_iter = iter(_train_loader)
                         _batch_dict = next(_train_iter)
                 if _batch_dict is None:
