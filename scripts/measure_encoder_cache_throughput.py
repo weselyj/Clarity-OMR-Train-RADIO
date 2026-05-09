@@ -90,6 +90,20 @@ def _measure_cached_forward(
             h16s.append(h16)
             w16s.append(w16)
 
+        # Assert that all samples in the batch share the same spatial dimensions.
+        # Mixed h16/w16 would silently apply wrong positional encoding to all
+        # but the first sample, since the bridge is applied uniformly.
+        h16s_set = set(h16s)
+        w16s_set = set(w16s)
+        if len(h16s_set) > 1 or len(w16s_set) > 1:
+            raise ValueError(
+                f"cached batch has mixed spatial shapes: h16={h16s_set} w16={w16s_set}; "
+                f"all cached features in a batch must share spatial dims for the "
+                f"positional bridge to be applied correctly"
+            )
+        h16 = h16s_set.pop()
+        w16 = w16s_set.pop()
+
         # Stack to (B, seq_tokens, 1280) on device
         encoder_hidden = torch.stack(tensors, dim=0).to(device)
         tgt = torch.zeros(batch_size, MAX_SEQ_LEN - 1, dtype=torch.long, device=device)
@@ -101,8 +115,8 @@ def _measure_cached_forward(
             out = model.forward(
                 cached_features=encoder_hidden,
                 tgt=tgt,
-                _h16=h16s[0],
-                _w16=w16s[0],
+                _h16=h16,
+                _w16=w16,
             )
             loss = F.cross_entropy(
                 out["logits"].reshape(-1, out["logits"].shape[-1]),

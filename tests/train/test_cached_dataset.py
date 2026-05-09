@@ -198,3 +198,23 @@ def test_collate_fn_raises_on_mixed_tiers() -> None:
     ]
     with pytest.raises(ValueError, match="[Mm]ixed"):
         StageBDataset.collate_fn(samples)
+
+
+def test_collate_fn_raises_on_mixed_h16() -> None:
+    """collate_fn must raise ValueError if cached samples have inconsistent _h16 values."""
+    from src.train.train import StageBDataset
+
+    samples = [
+        {"tier": "cached", "encoder_hidden": torch.randn(8, 1280, dtype=torch.bfloat16),
+         "_h16": 2, "_w16": 4,
+         "decoder_inputs": torch.zeros(10, dtype=torch.long),
+         "labels": torch.zeros(10, dtype=torch.long),
+         "contour_targets": torch.tensor(0, dtype=torch.long)},
+        {"tier": "cached", "encoder_hidden": torch.randn(8, 1280, dtype=torch.bfloat16),
+         "_h16": 4, "_w16": 4,  # different h16 — should trigger the assertion
+         "decoder_inputs": torch.zeros(10, dtype=torch.long),
+         "labels": torch.zeros(10, dtype=torch.long),
+         "contour_targets": torch.tensor(1, dtype=torch.long)},
+    ]
+    with pytest.raises(ValueError, match="mixed spatial shapes"):
+        StageBDataset.collate_fn(samples)

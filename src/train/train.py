@@ -762,8 +762,15 @@ class StageBDataset(torch.utils.data.Dataset):
 
         if tier == "cached":
             encoder_hidden = torch.stack([s["encoder_hidden"] for s in samples], dim=0)
-            h16 = samples[0]["_h16"]
-            w16 = samples[0]["_w16"]
+            h16s_set = {int(s["_h16"]) for s in samples}
+            w16s_set = {int(s["_w16"]) for s in samples}
+            if len(h16s_set) > 1 or len(w16s_set) > 1:
+                raise ValueError(
+                    f"cached batch has mixed spatial shapes: h16={h16s_set} w16={w16s_set}; "
+                    f"all cached features in a batch must share spatial dims for the "
+                    f"positional bridge to be applied correctly"
+                )
+            h16, w16 = h16s_set.pop(), w16s_set.pop()
             return {
                 "tier": "cached",
                 "encoder_hidden": encoder_hidden,  # (B, seq_tokens, 1280)
