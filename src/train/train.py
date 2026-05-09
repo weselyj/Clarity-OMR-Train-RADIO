@@ -1671,6 +1671,87 @@ def _save_checkpoint(
     return checkpoint_path
 
 
+def _compute_resume_position(
+    *,
+    checkpoint_payload: Optional[Dict[str, object]],
+    stages: Sequence["StageTrainingConfig"],
+    stage_runtime: Sequence[Dict[str, object]],
+    resume_stage_name: str,
+    global_step: int,
+) -> Tuple[int, int]:
+    """Determine (resume_stage_index, resume_stage_completed_steps) from a checkpoint.
+
+    Prefers stage_name matching when the checkpoint advertises one — this supports
+    the spec's incremental extension protocol (raise YAML target 4500 → 6000 → 7500
+    and resume mid-stage). Falls back to a global_step walk for older multi-stage
+    checkpoints that lack a stage_name.
+
+    Detects pre-715a89b checkpoints where ``stage_step`` was stored in micro-batch
+    units instead of opt-step units. The signal is ``stage_step > stage_steps_total``
+    in the saved payload — impossible under the new opt-step convention but typical
+    of an end-of-run legacy save (e.g. 7650 micro-batches vs 4500 opt-steps for a
+    Stage 3 v1 run with 90/10 cached/live mix and grad_accum_live=8). When detected,
+    routing falls back to the walk so ``stage_start_step > stage_total_steps``
+    doesn't fire and silently skip the stage at train.py:2370.
+
+    Note: legacy *intermediate* checkpoints where micro-batch count happens to be
+    less than stage_steps_total cannot be detected from the payload alone. The
+    documented workaround is ``--start-stage <name>`` to restart the stage from
+    micro-batch 1 (resume_stage_completed_steps is reset to 0 unconditionally).
+    """
+    if checkpoint_payload is None:
+        return 0, 0
+
+    ckpt_stage_step = checkpoint_payload.get("stage_step") if isinstance(checkpoint_payload, dict) else None
+    ckpt_stage_steps_total = (
+        checkpoint_payload.get("stage_steps_total") if isinstance(checkpoint_payload, dict) else None
+    )
+
+    matched_idx: Optional[int] = None
+    if resume_stage_name:
+        for _idx, _s in enumerate(stages):
+            if _s.stage_name == resume_stage_name:
+                matched_idx = _idx
+                break
+
+    if matched_idx is not None and ckpt_stage_step is not None:
+        is_legacy_micro_batch_units = (
+            ckpt_stage_steps_total is not None
+            and int(ckpt_stage_step) > int(ckpt_stage_steps_total)
+        )
+        if is_legacy_micro_batch_units:
+            print(
+                "[train] checkpoint detected as pre-715a89b (legacy micro-batch units): "
+                f"stage_step={int(ckpt_stage_step)} > stage_steps_total={int(ckpt_stage_steps_total)}. "
+                "Falling back to global_step walk; for clean extension of v1/v2 use "
+                "--start-stage <name>.",
+                file=sys.stderr,
+            )
+        else:
+            return matched_idx, max(0, int(ckpt_stage_step))
+
+    remaining_steps = global_step
+    resume_stage_index = len(stages)
+    resume_stage_completed_steps = 0
+    for stage_index, runtime in enumerate(stage_runtime):
+        stage_total_steps = int(runtime["stage_total_steps"])
+        if remaining_steps >= stage_total_steps:
+            remaining_steps -= stage_total_steps
+            continue
+        resume_stage_index = stage_index
+        resume_stage_completed_steps = remaining_steps
+        break
+    if resume_stage_index < len(stages):
+        resolved_stage_name = stages[resume_stage_index].stage_name
+        if resume_stage_name and resume_stage_name != resolved_stage_name:
+            print(
+                "[train] warning: checkpoint stage name does not match computed stage boundary. "
+                f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
+                file=sys.stderr,
+            )
+    return resume_stage_index, resume_stage_completed_steps
+
+
 class _CpuPhase:
     """Inner context manager for CPU phase timing. See _StepTimer."""
     __slots__ = ("_parent", "_name", "_t0")
@@ -2253,45 +2334,13 @@ def run_execute_mode(
             if requested_stage_index is not None:
                 requested_stage_label = stages[requested_stage_index].stage_name
 
-    resume_stage_index = 0
-    resume_stage_completed_steps = 0
-    if resume_checkpoint is not None:
-        # Prefer stage_name matching when the checkpoint advertises one — this
-        # supports the spec's incremental extension protocol (raise YAML target
-        # 4500 → 6000 → 7500 and resume mid-stage). The legacy global_step walk
-        # would treat global_step >= stage_total_steps as "stage done" and skip
-        # the stage entirely on a target raise. Falls back to the walk for
-        # multi-stage configs or checkpoints lacking a stage_step / stage_name.
-        ckpt_stage_step = checkpoint_payload.get("stage_step") if isinstance(checkpoint_payload, dict) else None
-        matched_idx = None
-        if resume_stage_name:
-            for _idx, _s in enumerate(stages):
-                if _s.stage_name == resume_stage_name:
-                    matched_idx = _idx
-                    break
-        if matched_idx is not None and ckpt_stage_step is not None:
-            resume_stage_index = matched_idx
-            resume_stage_completed_steps = max(0, int(ckpt_stage_step))
-        else:
-            remaining_steps = global_step
-            resume_stage_index = len(stages)
-            resume_stage_completed_steps = 0
-            for stage_index, runtime in enumerate(stage_runtime):
-                stage_total_steps = int(runtime["stage_total_steps"])
-                if remaining_steps >= stage_total_steps:
-                    remaining_steps -= stage_total_steps
-                    continue
-                resume_stage_index = stage_index
-                resume_stage_completed_steps = remaining_steps
-                break
-            if resume_stage_index < len(stages):
-                resolved_stage_name = stages[resume_stage_index].stage_name
-                if resume_stage_name and resume_stage_name != resolved_stage_name:
-                    print(
-                        "[train] warning: checkpoint stage name does not match computed stage boundary. "
-                        f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
-                        file=sys.stderr,
-                    )
+    resume_stage_index, resume_stage_completed_steps = _compute_resume_position(
+        checkpoint_payload=checkpoint_payload if resume_checkpoint is not None else None,
+        stages=stages,
+        stage_runtime=stage_runtime,
+        resume_stage_name=resume_stage_name,
+        global_step=global_step,
+    )
 
     if requested_stage_index is not None:
         baseline_step = sum(int(runtime["stage_total_steps"]) for runtime in stage_runtime[:requested_stage_index])
