@@ -30,6 +30,13 @@ from src.train.model_factory import (
 )
 
 
+# Datasets whose encoder features are pre-computed and stored in the cache.
+# Tests and the tier-grouped sampler import this constant so the source of truth
+# lives in one place. Keep in sync with the build_encoder_cache.py dataset list.
+_CACHED_DATASETS: frozenset[str] = frozenset(
+    {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+)
+
 PITCH_CLASS_TO_SEMITONE = {
     "C": 0,
     "C#": 1,
@@ -614,7 +621,6 @@ class StageBDataset(torch.utils.data.Dataset):
         dataset_name = str(entry.get("dataset", ""))
 
         # Determine tier
-        _CACHED_DATASETS = {"synthetic_systems", "grandstaff_systems", "primus_systems"}
         is_cached_tier = dataset_name in _CACHED_DATASETS
 
         # --- Cached path: load pre-computed encoder features from disk ---

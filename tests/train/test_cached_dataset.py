@@ -8,7 +8,7 @@ import pytest
 import torch
 
 
-CACHED_DATASETS = {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+from src.train.train import _CACHED_DATASETS as CACHED_DATASETS
 
 
 def _write_manifest(path: Path, entries: list[dict]) -> None:

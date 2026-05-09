@@ -7,7 +7,8 @@ from collections import Counter
 import pytest
 
 
-CACHED_DATASETS = {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+from src.train.train import _CACHED_DATASETS as CACHED_DATASETS
+
 LIVE_DATASETS = {"cameraprimus_systems"}
 
 
