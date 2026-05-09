@@ -169,6 +169,7 @@ def _resolve_cache_memory(
     cache_hash: Optional[str],
     device,
     use_fp16: bool,
+    model_dtype=None,
 ):
     """Return encoder memory for one sample, using the cache when available.
 
@@ -187,9 +188,18 @@ def _resolve_cache_memory(
 
     Returns:
         memory tensor — same semantics as ``_encode_staff_image`` return value,
-        moved to ``device`` and cast to fp16 if ``use_fp16`` is True.
+        moved to ``device`` and cast to the model's dtype (``model_dtype`` when
+        provided; falls back to fp16 if ``use_fp16`` is True, else float32).
     """
+    import torch
     from src.cli import _encode_staff_image
+
+    # Determine target dtype: prefer the explicit model_dtype so the cached
+    # bfloat16 tensor is always cast to match the model (fp32 by default).
+    if model_dtype is None:
+        target_dtype = torch.float16 if use_fp16 else torch.float32
+    else:
+        target_dtype = model_dtype
 
     if cache_root is not None and dataset in _CACHED_DATASETS:
         from src.data.encoder_cache import (
@@ -202,10 +212,7 @@ def _resolve_cache_memory(
             tensor, _h16, _w16 = read_cache_entry(
                 cache_root, cache_hash, dataset, new_key
             )
-            memory = tensor.to(device=device)
-            if use_fp16:
-                memory = memory.half()
-            return memory
+            return tensor.to(device=device, dtype=target_dtype)
         except FileNotFoundError:
             pass  # try legacy key
 
@@ -214,10 +221,7 @@ def _resolve_cache_memory(
             tensor, _h16, _w16 = read_cache_entry(
                 cache_root, cache_hash, dataset, legacy_key
             )
-            memory = tensor.to(device=device)
-            if use_fp16:
-                memory = memory.half()
-            return memory
+            return tensor.to(device=device, dtype=target_dtype)
         except FileNotFoundError:
             pass  # both schemes missed; fall through to live encoder
 
@@ -299,6 +303,9 @@ def _run_stage_b_inference_with_progress(
 
     # Prepare model once for all crops
     decode_model, use_fp16 = _prepare_model_for_inference(model, device, use_fp16=use_fp16, quantize=quantize)
+    # Determine model dtype so cached bfloat16 tensors are cast to match the model.
+    import torch as _torch
+    _model_dtype = next(decode_model.parameters()).dtype
     _token_to_idx = {token: idx for idx, token in enumerate(vocab.tokens)}
 
     output_predictions.parent.mkdir(parents=True, exist_ok=True)
@@ -348,6 +355,7 @@ def _run_stage_b_inference_with_progress(
                 cache_hash=_cache_hash,
                 device=device,
                 use_fp16=use_fp16,
+                model_dtype=_model_dtype,
             )
 
             tokens = _decode_stage_b_tokens(
