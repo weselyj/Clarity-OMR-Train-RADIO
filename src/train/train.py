@@ -1357,23 +1357,17 @@ def _run_validation(
                 batch_dict = next(val_iter)
             except StopIteration:
                 break
-            images = batch_dict["images"]
-            decoder_inputs = batch_dict["decoder_inputs"]
-            labels = batch_dict["labels"]
-            contour_targets = batch_dict["contour_targets"]
-            if channels_last:
-                images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
-            else:
-                images = images.to(device, non_blocking=True)
-            decoder_inputs = decoder_inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            contour_targets = contour_targets.to(device, non_blocking=True)
+            labels = batch_dict["labels"].to(device, non_blocking=True)
+            contour_targets = batch_dict["contour_targets"].to(device, non_blocking=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=bf16_enabled,
             ):
-                outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+                outputs = _forward_batch_for_train(
+                    model, batch_dict, device,
+                    bf16_enabled=bf16_enabled, channels_last=channels_last,
+                )
                 token_loss = F.cross_entropy(
                     outputs["logits"].reshape(-1, vocab_size),
                     labels.reshape(-1),
