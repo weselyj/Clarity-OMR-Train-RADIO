@@ -933,7 +933,12 @@ class _TierGroupedBatchSampler(torch.utils.data.Sampler):
     """
 
     def __init__(self, batches: List[List[int]]) -> None:
-        super().__init__(data_source=None)
+        # NOTE: torch.utils.data.Sampler.__init__ on PyTorch nightly accepts
+        # *args/**kwargs but forwards to object.__init__ which rejects them
+        # ("object.__init__ takes exactly one argument").  Older PyTorch
+        # versions accepted data_source=None.  Calling super() with no args
+        # is correct on both, so do not pass data_source.
+        super().__init__()
         self._batches = batches
         # Resume support (Task 8): on resume, set this to the consumed prefix length.
         self._start_idx: int = 0
