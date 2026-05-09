@@ -2986,7 +2986,11 @@ def run_execute_mode(
                             "grad_norm": grad_norm_value,
                             "grad_norm_groups": grad_norms,
                             "grad_alerts": grad_alert_messages,
-                            "batch_size": int(images.shape[0]),
+                            "batch_size": int(
+                                _batch_dict["images"].shape[0]
+                                if "images" in _batch_dict
+                                else _batch_dict["encoder_hidden"].shape[0]
+                            ),
                             "max_sequence_length": stage.max_sequence_length,
                             # window_was_corrupted is always False on the JSONL-write
                             # path (corrupted windows continue earlier at the opt-step
