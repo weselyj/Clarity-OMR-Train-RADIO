@@ -30,6 +30,13 @@ from src.train.model_factory import (
 )
 
 
+# Datasets whose encoder features are pre-computed and stored in the cache.
+# Tests and the tier-grouped sampler import this constant so the source of truth
+# lives in one place. Keep in sync with the build_encoder_cache.py dataset list.
+_CACHED_DATASETS: frozenset[str] = frozenset(
+    {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+)
+
 PITCH_CLASS_TO_SEMITONE = {
     "C": 0,
     "C#": 1,
@@ -557,6 +564,8 @@ class StageBDataset(torch.utils.data.Dataset):
         vocab=None,
         augment: bool = True,
         rng_seed: Optional[int] = None,
+        cache_root: "Optional[Path]" = None,
+        cache_hash16: "Optional[str]" = None,
     ) -> None:
         super().__init__()
         self.stage = stage
@@ -591,10 +600,14 @@ class StageBDataset(torch.utils.data.Dataset):
         self._rng_base_seed = rng_seed
         self._rng = random.Random(rng_seed)
 
+        # Stage 3 encoder-cache kwargs (both None => legacy Stage-2 behavior).
+        self.cache_root = Path(cache_root) if cache_root is not None else None
+        self.cache_hash16 = cache_hash16
+
     def __len__(self) -> int:
         return len(self.entries)
 
-    def __getitem__(self, idx: int) -> "Dict[str, torch.Tensor]":
+    def __getitem__(self, idx: int) -> "Dict[str, object]":
         import torch
 
         entry = self.entries[idx]
@@ -604,8 +617,65 @@ class StageBDataset(torch.utils.data.Dataset):
         eos_id = vocab.token_to_id["<eos>"]
         measure_end_id = vocab.token_to_id.get("<measure_end>")
 
-        # 1. Load + resize image
         sample_id = str(entry.get("sample_id", f"<idx:{idx}>"))
+        dataset_name = str(entry.get("dataset", ""))
+
+        # Determine tier
+        is_cached_tier = dataset_name in _CACHED_DATASETS
+
+        # --- Cached path: load pre-computed encoder features from disk ---
+        if is_cached_tier and self.cache_root is not None and self.cache_hash16 is not None:
+            from src.data.encoder_cache import _sanitize_sample_key, read_cache_entry
+            key = _sanitize_sample_key(sample_id)
+            encoder_hidden, h16, w16 = read_cache_entry(
+                self.cache_root, self.cache_hash16, dataset_name, key
+            )
+            # Token encode (same as live path)
+            sequence = entry.get("token_sequence", [])
+            if not isinstance(sequence, list) or not sequence:
+                sequence = ["<bos>", "<eos>"]
+            try:
+                token_ids = vocab.encode(sequence, strict=True)
+            except KeyError:
+                token_ids = [bos_id, eos_id]
+            if len(token_ids) < 2:
+                token_ids = [bos_id, eos_id]
+            if len(token_ids) > self.max_sequence_length:
+                truncated = token_ids[: self.max_sequence_length - 1]
+                if measure_end_id is not None:
+                    last_me = -1
+                    for _i in range(len(truncated) - 1, -1, -1):
+                        if truncated[_i] == measure_end_id:
+                            last_me = _i
+                            break
+                    if last_me > 0:
+                        token_ids = truncated[: last_me + 1] + [eos_id]
+                    else:
+                        token_ids = truncated + [eos_id]
+                else:
+                    token_ids = truncated + [eos_id]
+            contour_target = _derive_pitch_contour(sequence)
+            seq_len = self.max_sequence_length - 1
+            input_ids = token_ids[:-1]
+            label_ids = token_ids[1:]
+            if not input_ids:
+                input_ids = [bos_id]
+                label_ids = [eos_id]
+            input_pad = [pad_id] * max(0, seq_len - len(input_ids))
+            label_pad = [-100] * max(0, seq_len - len(label_ids))
+            decoder_inputs = (input_ids + input_pad)[:seq_len]
+            labels = (label_ids + label_pad)[:seq_len]
+            return {
+                "tier": "cached",
+                "encoder_hidden": encoder_hidden,  # (seq_tokens, 1280) bf16
+                "_h16": h16,
+                "_w16": w16,
+                "decoder_inputs": torch.tensor(decoder_inputs, dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+                "contour_targets": torch.tensor(contour_target, dtype=torch.long),
+            }
+
+        # --- Live path: full image load + augment pipeline ---
         try:
             image_tensor, content_width = _load_entry_image_tensor(
                 entry,
@@ -614,14 +684,11 @@ class StageBDataset(torch.utils.data.Dataset):
                 max_width=self.image_width,
             )
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
-            # Return a blank image + minimal token sequence so the batch stays
-            # consistent in shape even when a single file is missing.
             import torch as _torch
             print(f"[StageBDataset] skipping {sample_id}: {exc}", file=sys.stderr)
             image_tensor = _torch.zeros(1, self.image_height, self.image_width, dtype=_torch.float32)
             content_width = self.image_width
 
-        # 2. Token encode
         sequence = entry.get("token_sequence", [])
         if not isinstance(sequence, list) or not sequence:
             sequence = ["<bos>", "<eos>"]
@@ -635,9 +702,9 @@ class StageBDataset(torch.utils.data.Dataset):
             truncated = token_ids[: self.max_sequence_length - 1]
             if measure_end_id is not None:
                 last_me = -1
-                for i in range(len(truncated) - 1, -1, -1):
-                    if truncated[i] == measure_end_id:
-                        last_me = i
+                for _i in range(len(truncated) - 1, -1, -1):
+                    if truncated[_i] == measure_end_id:
+                        last_me = _i
                         break
                 if last_me > 0:
                     token_ids = truncated[: last_me + 1] + [eos_id]
@@ -646,14 +713,10 @@ class StageBDataset(torch.utils.data.Dataset):
             else:
                 token_ids = truncated + [eos_id]
 
-        # 3. Apply online augmentations (per-sample)
         if self.augment:
             image_tensor = _apply_online_augmentations(image_tensor.unsqueeze(0), self._rng).squeeze(0)
 
-        # 4. Derive contour target
         contour_target = _derive_pitch_contour(sequence)
-
-        # 5. Build decoder inputs / labels via teacher-forcing shift
         input_ids = token_ids[:-1]
         label_ids = token_ids[1:]
         if not input_ids:
@@ -666,6 +729,7 @@ class StageBDataset(torch.utils.data.Dataset):
         labels = (label_ids + label_pad)[:seq_len]
 
         return {
+            "tier": "live",
             "images": image_tensor,
             "decoder_inputs": torch.tensor(decoder_inputs, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
@@ -674,22 +738,59 @@ class StageBDataset(torch.utils.data.Dataset):
         }
 
     @staticmethod
-    def collate_fn(samples: "List[Dict[str, torch.Tensor]]") -> "Dict[str, torch.Tensor]":
-        """Stack a list of per-sample dicts into a batched dict of tensors."""
+    def collate_fn(samples: "List[Dict[str, object]]") -> "Dict[str, object]":
+        """Stack a list of per-sample dicts into a batched dict.
+
+        All samples must be from the same tier (cached or live). Mixed-tier
+        batches raise ValueError — the tier-grouped sampler prevents them.
+        Legacy callers without a 'tier' key fall through to the live path.
+        """
         import torch
 
-        images = torch.stack([s["images"] for s in samples], dim=0)
+        tiers = {s["tier"] for s in samples if "tier" in s}
+        if len(tiers) > 1:
+            raise ValueError(
+                f"collate_fn received mixed tiers: {tiers}. "
+                "The tier-grouped sampler must guarantee tier-pure batches."
+            )
+
         decoder_inputs = torch.stack([s["decoder_inputs"] for s in samples], dim=0)
         labels = torch.stack([s["labels"] for s in samples], dim=0)
         contour_targets = torch.stack([s["contour_targets"] for s in samples], dim=0)
-        content_widths = torch.stack([s["content_widths"] for s in samples], dim=0)
-        return {
-            "images": images,
-            "decoder_inputs": decoder_inputs,
-            "labels": labels,
-            "contour_targets": contour_targets,
-            "content_widths": content_widths,
-        }
+
+        tier = tiers.pop() if tiers else "live"
+
+        if tier == "cached":
+            encoder_hidden = torch.stack([s["encoder_hidden"] for s in samples], dim=0)
+            h16s_set = {int(s["_h16"]) for s in samples}
+            w16s_set = {int(s["_w16"]) for s in samples}
+            if len(h16s_set) > 1 or len(w16s_set) > 1:
+                raise ValueError(
+                    f"cached batch has mixed spatial shapes: h16={h16s_set} w16={w16s_set}; "
+                    f"all cached features in a batch must share spatial dims for the "
+                    f"positional bridge to be applied correctly"
+                )
+            h16, w16 = h16s_set.pop(), w16s_set.pop()
+            return {
+                "tier": "cached",
+                "encoder_hidden": encoder_hidden,  # (B, seq_tokens, 1280)
+                "_h16": h16,
+                "_w16": w16,
+                "decoder_inputs": decoder_inputs,
+                "labels": labels,
+                "contour_targets": contour_targets,
+            }
+        else:
+            images = torch.stack([s["images"] for s in samples], dim=0)
+            content_widths = torch.stack([s["content_widths"] for s in samples], dim=0)
+            return {
+                "tier": "live",
+                "images": images,
+                "decoder_inputs": decoder_inputs,
+                "labels": labels,
+                "contour_targets": contour_targets,
+                "content_widths": content_widths,
+            }
 
 
 def build_stage_b_sampler(

@@ -1,0 +1,15 @@
+# Preprocessing config for Stage 3 encoder cache.
+# Hash is computed from the parsed dict (sorted keys → JSON → SHA-256),
+# not from raw file bytes, so whitespace edits do not invalidate the cache.
+#
+# Fields must enumerate every parameter that affects pixel values entering
+# RadioEncoder.forward(). Cross-checked against StageBDataset.__init__
+# (train.py:554-555): image_height=250, image_width=2500, pad-to-white=1.0.
+# No explicit normalize is applied in the current pipeline (RADIO expects
+# pixels in [0,1]; clamping is done in RadioEncoder.forward at line 73).
+
+image_height: 250
+image_width: 2500
+normalize_mean: null
+normalize_std: null
+pad_color: 1.0
