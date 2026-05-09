@@ -2256,25 +2256,42 @@ def run_execute_mode(
     resume_stage_index = 0
     resume_stage_completed_steps = 0
     if resume_checkpoint is not None:
-        remaining_steps = global_step
-        resume_stage_index = len(stages)
-        resume_stage_completed_steps = 0
-        for stage_index, runtime in enumerate(stage_runtime):
-            stage_total_steps = int(runtime["stage_total_steps"])
-            if remaining_steps >= stage_total_steps:
-                remaining_steps -= stage_total_steps
-                continue
-            resume_stage_index = stage_index
-            resume_stage_completed_steps = remaining_steps
-            break
-        if resume_stage_index < len(stages):
-            resolved_stage_name = stages[resume_stage_index].stage_name
-            if resume_stage_name and resume_stage_name != resolved_stage_name:
-                print(
-                    "[train] warning: checkpoint stage name does not match computed stage boundary. "
-                    f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
-                    file=sys.stderr,
-                )
+        # Prefer stage_name matching when the checkpoint advertises one — this
+        # supports the spec's incremental extension protocol (raise YAML target
+        # 4500 → 6000 → 7500 and resume mid-stage). The legacy global_step walk
+        # would treat global_step >= stage_total_steps as "stage done" and skip
+        # the stage entirely on a target raise. Falls back to the walk for
+        # multi-stage configs or checkpoints lacking a stage_step / stage_name.
+        ckpt_stage_step = checkpoint_payload.get("stage_step") if isinstance(checkpoint_payload, dict) else None
+        matched_idx = None
+        if resume_stage_name:
+            for _idx, _s in enumerate(stages):
+                if _s.stage_name == resume_stage_name:
+                    matched_idx = _idx
+                    break
+        if matched_idx is not None and ckpt_stage_step is not None:
+            resume_stage_index = matched_idx
+            resume_stage_completed_steps = max(0, int(ckpt_stage_step))
+        else:
+            remaining_steps = global_step
+            resume_stage_index = len(stages)
+            resume_stage_completed_steps = 0
+            for stage_index, runtime in enumerate(stage_runtime):
+                stage_total_steps = int(runtime["stage_total_steps"])
+                if remaining_steps >= stage_total_steps:
+                    remaining_steps -= stage_total_steps
+                    continue
+                resume_stage_index = stage_index
+                resume_stage_completed_steps = remaining_steps
+                break
+            if resume_stage_index < len(stages):
+                resolved_stage_name = stages[resume_stage_index].stage_name
+                if resume_stage_name and resume_stage_name != resolved_stage_name:
+                    print(
+                        "[train] warning: checkpoint stage name does not match computed stage boundary. "
+                        f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
+                        file=sys.stderr,
+                    )
 
     if requested_stage_index is not None:
         baseline_step = sum(int(runtime["stage_total_steps"]) for runtime in stage_runtime[:requested_stage_index])
@@ -2533,7 +2550,24 @@ def run_execute_mode(
                     _batch_idx_consumed = 0
             else:
                 _batch_idx_consumed = 0
+            # Tier-grouped extension fix: the for-loop iterates micro-batches in
+            # tier-grouped mode (`_loop_bound = _plan.total_batches`), but
+            # stage_start_step was initially set in opt-step units from
+            # resume_stage_completed_steps. On resume the units disagree, so
+            # reset stage_start_step to the micro-batch index of the first
+            # un-consumed batch. The LR scheduler was already advanced based
+            # on the opt-step counter at scheduler init, so this override only
+            # affects the per-step loop range.
+            if stage.tier_grouped_sampling and resumed_stage:
+                stage_start_step = _batch_idx_consumed + 1
             _train_iter = iter(_train_loader)
+            # Opt-step counter for this stage. Tracks how many optimizer.step()
+            # calls have completed in this stage (across resume boundaries).
+            # Persisted as `stage_step` in checkpoints so the units are
+            # consistent regardless of tier_grouped_sampling mode (the for-loop
+            # variable is micro-batches in tier-grouped mode, which is wrong
+            # for resume routing — see resume routing block).
+            _stage_opt_step = resume_stage_completed_steps if resumed_stage else 0
             # vocab size is constant; grab from the dataset's vocab object.
             vocab_size = _stage_ds._vocab.size
 
@@ -2824,6 +2858,7 @@ def run_execute_mode(
                 _loss_scalar_cache = loss.detach().item() * accum_steps
                 losses.append(_loss_scalar_cache)
                 global_step += 1
+                _stage_opt_step += 1
 
                 lr_map = {group.get("group_name", f"group_{idx}"): group["lr"] for idx, group in enumerate(optimizer.param_groups)}
                 validation_result = None
@@ -2908,7 +2943,7 @@ def run_execute_mode(
                                         scheduler=scheduler,
                                         stage_name=stage.stage_name,
                                         global_step=global_step,
-                                        stage_step=stage_step,
+                                        stage_step=_stage_opt_step,
                                         stage_steps_total=stage_total_steps,
                                         stage_b_config=stage_b_config_dict,
                                         name_suffix="best",
@@ -2931,7 +2966,7 @@ def run_execute_mode(
                         scheduler=scheduler,
                         stage_name=stage.stage_name,
                         global_step=global_step,
-                        stage_step=stage_step,
+                        stage_step=_stage_opt_step,
                         stage_steps_total=stage_total_steps,
                         stage_b_config=stage_b_config_dict,
                         best_val_loss=best_val_loss,
@@ -2970,7 +3005,8 @@ def run_execute_mode(
                         record = {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                             "global_step": global_step,
-                            "stage_step": stage_step,
+                            "stage_step": _stage_opt_step,
+                            "stage_step_microbatches": stage_step,
                             "stage_steps_total": stage_total_steps,
                             "epoch_index": epoch_index,
                             "epoch_step": epoch_step,
@@ -3046,7 +3082,7 @@ def run_execute_mode(
                     scheduler=scheduler,
                     stage_name=stage.stage_name,
                     global_step=global_step,
-                    stage_step=stage_step,
+                    stage_step=_stage_opt_step,
                     stage_steps_total=stage_total_steps,
                     stage_b_config=stage_b_config_dict,
                     name_suffix="final",
