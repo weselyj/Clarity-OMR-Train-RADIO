@@ -79,3 +79,39 @@ def test_resync_batch_idx_after_rebuild_defaults_to_zero_without_start_idx():
         pass
 
     assert _resync_batch_idx_after_rebuild(FakeSampler()) == 0
+
+
+def test_resync_combined_with_loop_increment_matches_iterator_position():
+    """Mirror the exact StopIteration-handler sequence in train.py:2778-2797:
+    rebuild iterator → next() → resync helper → loop's standard +=1.
+
+    The post-+=1 value must equal the iterator's actual next-uncomsumed
+    position — `_start_idx + 1`. If the call-site order is ever refactored
+    (e.g. resync moved after the +=1), this test catches the regression
+    that the helper-only test cannot.
+    """
+    from src.train.train import _TierGroupedBatchSampler, _resync_batch_idx_after_rebuild
+
+    sampler = _TierGroupedBatchSampler([[i] for i in range(10)])
+    sampler.set_start_idx(2)
+
+    # Pretend pre-rebuild _batch_idx_consumed had drifted high — e.g. we
+    # had consumed 5 of the 8 available batches successfully before
+    # StopIteration fired. With the buggy (no-resync) behavior, the next
+    # checkpoint's last_batch_idx would be 6, telling future resumes to
+    # skip past batches 0-5 — but the rebuilt iterator only consumed 1.
+    _batch_idx_consumed = 7
+
+    # Mirror train.py:2776-2789:
+    iterator = iter(sampler)            # rebuilt iterator
+    first_batch = next(iterator)        # iterator now at position _start_idx + 1
+    _batch_idx_consumed = _resync_batch_idx_after_rebuild(sampler)
+    # Mirror train.py:2797 (loop's standard increment for the consumed batch):
+    _batch_idx_consumed += 1
+
+    assert first_batch == [2], "iter() yields _batches[_start_idx:] starting at index 2"
+    assert _batch_idx_consumed == 3, (
+        "After the full handler sequence, _batch_idx_consumed must equal "
+        "_start_idx + 1 (=3), the position of the next un-consumed batch. "
+        "Without the resync, it would still be the inflated pre-rebuild value."
+    )

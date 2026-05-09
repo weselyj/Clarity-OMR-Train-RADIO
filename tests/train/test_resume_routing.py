@@ -128,6 +128,38 @@ def test_compute_resume_position_no_stage_name_uses_walk():
     assert completed == 2500
 
 
+def test_compute_resume_position_missing_stage_steps_total_trusts_stage_step():
+    """A checkpoint with stage_step but no stage_steps_total cannot be unit-
+    checked (the legacy detection signal `stage_step > stage_steps_total`
+    requires the latter). The helper trusts stage_step as opt-step units in
+    this case — practical for any post-63f9c4e checkpoint, where the field
+    is always written. Pre-63f9c4e checkpoints predate Stage 3 entirely
+    and would not match a Stage 3 stage_name, so they fall through to the
+    legacy walk regardless.
+
+    This test pins down the documented behavior so a future refactor of
+    the unit-detection logic doesn't accidentally invert this branch.
+    """
+    from src.train.train import _compute_resume_position
+
+    stages, stage_runtime = _make_stages_and_runtime()
+    payload = {
+        "stage_name": "stage3-radio-systems-frozen-encoder",
+        "stage_step": 4500,
+        # stage_steps_total intentionally absent
+        "global_step": 5000 + 4500,
+    }
+    idx, completed = _compute_resume_position(
+        checkpoint_payload=payload,
+        stages=stages,
+        stage_runtime=stage_runtime,
+        resume_stage_name="stage3-radio-systems-frozen-encoder",
+        global_step=5000 + 4500,
+    )
+    assert idx == 2
+    assert completed == 4500
+
+
 def test_compute_resume_position_unknown_stage_name_uses_walk(capsys):
     """An unknown stage_name (not present in the YAML) falls back to walk."""
     from src.train.train import _compute_resume_position
