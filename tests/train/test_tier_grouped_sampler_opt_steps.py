@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import pytest
 
+from src.train.train import _CACHED_DATASETS
 
-CACHED_DATASETS = {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+
+CACHED_DATASETS = set(_CACHED_DATASETS)
 LIVE_DATASETS = {"cameraprimus_systems"}
 
 

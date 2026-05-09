@@ -133,8 +133,6 @@ def build_tier_grouped_sampler_by_opt_steps(
         A flat list of batches, total length
         ``n_cached_opt_steps * grad_accum_cached + n_live_opt_steps * grad_accum_live``.
     """
-    import random
-
     rng = random.Random(seed)
 
     cached_indices = [i for i, e in enumerate(entries) if e.get("dataset") in cached_datasets]
