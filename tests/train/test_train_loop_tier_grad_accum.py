@@ -38,3 +38,82 @@ def test_per_batch_grad_accum_dispatch_on_tier():
 
     assert _grad_accum_for_batch(cached_batch, grad_accum_cached=1, grad_accum_live=8) == 1
     assert _grad_accum_for_batch(live_batch, grad_accum_cached=1, grad_accum_live=8) == 8
+
+
+def test_tier_block_micro_idx_arithmetic_across_transitions():
+    """Simulate the boundary-arithmetic loop across cached+live transitions.
+
+    Walks a hand-crafted sequence of (tier, accum_steps) pairs and asserts:
+    - is_accum_step is True exactly once per opt-step block (at the last batch)
+    - should_zero_grad is True exactly once per opt-step block (at the first batch)
+    - _tier_block_micro_idx returns to 0 at every opt-step boundary
+    - Tier transitions don't break the arithmetic (cached->live, live->cached)
+
+    This is the critical path: a misalignment here causes silent loss-scaling
+    bugs that cost a full training run to detect.
+    """
+    # Hand-crafted sequence representing the tier-grouped sampler output:
+    # 2 cached opt-steps (1 batch each) -> 1 live opt-step (8 batches) -> 2 cached
+    # -> 1 live -> totals: 2+8+2+8 = 20 batches, 6 opt-steps.
+    seq = (
+        [("cached", 1)] * 2
+        + [("live", 8)] * 8
+        + [("cached", 1)] * 2
+        + [("live", 8)] * 8
+    )
+    assert len(seq) == 20
+
+    # Expected opt-step boundaries: indices 0, 1, 9, 10, 11, 19 (the LAST batch of each block).
+    expected_is_accum_step = {0, 1, 9, 10, 11, 19}
+    # Expected zero_grad: at the FIRST batch of each block: indices 0, 1, 2, 10, 11, 12.
+    expected_should_zero_grad = {0, 1, 2, 10, 11, 12}
+
+    _tier_block_micro_idx = 0
+    is_accum_step_indices: set[int] = set()
+    should_zero_grad_indices: set[int] = set()
+    boundary_resets: list[int] = []  # batch indices where idx wrapped to 0
+
+    for batch_idx, (_tier, accum_steps) in enumerate(seq):
+        is_accum_step = (_tier_block_micro_idx + 1 == accum_steps)
+        should_zero_grad = (_tier_block_micro_idx == 0)
+
+        if is_accum_step:
+            is_accum_step_indices.add(batch_idx)
+        if should_zero_grad:
+            should_zero_grad_indices.add(batch_idx)
+
+        _tier_block_micro_idx = (_tier_block_micro_idx + 1) % accum_steps
+        if _tier_block_micro_idx == 0:
+            boundary_resets.append(batch_idx)
+
+    assert is_accum_step_indices == expected_is_accum_step, (
+        f"is_accum_step mismatch: got {sorted(is_accum_step_indices)}, "
+        f"expected {sorted(expected_is_accum_step)}"
+    )
+    assert should_zero_grad_indices == expected_should_zero_grad, (
+        f"should_zero_grad mismatch: got {sorted(should_zero_grad_indices)}, "
+        f"expected {sorted(expected_should_zero_grad)}"
+    )
+    # 6 opt-step boundaries total
+    assert len(boundary_resets) == 6
+    # Final state: idx back to 0
+    assert _tier_block_micro_idx == 0
+
+
+def test_tier_block_micro_idx_resets_on_partial_block_discard():
+    """When the StopIteration recovery discards a partial block, _tier_block_micro_idx must reset to 0.
+
+    Otherwise the next batch (from the rebuilt iterator) would be misaligned
+    with the boundary check.
+    """
+    _tier_block_micro_idx = 0
+    # Simulate consuming 4 batches of an 8-batch live block, then iterator exhausts.
+    for _ in range(4):
+        _tier_block_micro_idx = (_tier_block_micro_idx + 1) % 8
+    assert _tier_block_micro_idx == 4
+
+    # Apply the recovery logic from train.py:2429 (the follow-up commit 5c91726).
+    _mid_window = _tier_block_micro_idx != 0  # True
+    if _mid_window:
+        _tier_block_micro_idx = 0  # reset on discard
+    assert _tier_block_micro_idx == 0

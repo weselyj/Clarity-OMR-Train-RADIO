@@ -939,7 +939,12 @@ class _TierGroupedBatchSampler(torch.utils.data.Sampler):
         self._start_idx: int = 0
 
     def set_start_idx(self, idx: int) -> None:
-        """Skip the first ``idx`` batches when iterating (used on resume)."""
+        """Skip the first ``idx`` batches when iterating (used on resume).
+
+        Must be called before ``iter(loader)``; in-flight iterators are not
+        affected (the slice ``self._batches[self._start_idx:]`` is captured
+        when ``__iter__`` is first called).
+        """
         if idx < 0 or idx > len(self._batches):
             raise ValueError(f"start_idx={idx} out of range [0, {len(self._batches)}]")
         self._start_idx = idx
