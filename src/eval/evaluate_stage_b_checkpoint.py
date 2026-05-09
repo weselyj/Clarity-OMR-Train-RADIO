@@ -9,13 +9,19 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.eval.metrics import default_ablation_matrix
 from src.eval.run_eval import evaluate_rows
+
+# Datasets whose encoder features may be present in the encoder cache.
+# Mirrors _CACHED_DATASETS in src/train/train.py.
+_CACHED_DATASETS = frozenset(
+    {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+)
 
 
 def _resolve_path(project_root: Path, value: Path) -> Path:
@@ -153,6 +159,72 @@ def _build_eval_rows(prediction_rows: Sequence[Dict[str, object]]) -> List[Dict[
     return rows
 
 
+def _resolve_cache_memory(
+    *,
+    decode_model,
+    pixel_values,
+    dataset: str,
+    sample_id: str,
+    cache_root: Optional[Path],
+    cache_hash: Optional[str],
+    device,
+    use_fp16: bool,
+):
+    """Return encoder memory for one sample, using the cache when available.
+
+    Lookup order:
+      1. If ``cache_root`` is provided AND ``dataset`` is in ``_CACHED_DATASETS``:
+         a. Try the new reversible key scheme (_sanitize_sample_key).
+         b. On ``FileNotFoundError``, fall back to the legacy ``__`` scheme
+            (_sanitize_sample_key_legacy) for caches built before 2026-05-09.
+         c. On a second ``FileNotFoundError`` (both schemes miss), fall through
+            to the live encoder path so a partial cache never blocks eval.
+      2. Otherwise: run ``_encode_staff_image`` (live encoder forward pass).
+
+    Only ``FileNotFoundError`` is caught for the fallback chain.  Other errors
+    (e.g. ``OSError``, corrupted .pt file) propagate immediately so cache
+    corruption surfaces as a failure rather than a silent accuracy regression.
+
+    Returns:
+        memory tensor — same semantics as ``_encode_staff_image`` return value,
+        moved to ``device`` and cast to fp16 if ``use_fp16`` is True.
+    """
+    from src.cli import _encode_staff_image
+
+    if cache_root is not None and dataset in _CACHED_DATASETS:
+        from src.data.encoder_cache import (
+            _sanitize_sample_key,
+            _sanitize_sample_key_legacy,
+            read_cache_entry,
+        )
+        new_key = _sanitize_sample_key(sample_id)
+        try:
+            tensor, _h16, _w16 = read_cache_entry(
+                cache_root, cache_hash, dataset, new_key
+            )
+            memory = tensor.to(device=device)
+            if use_fp16:
+                memory = memory.half()
+            return memory
+        except FileNotFoundError:
+            pass  # try legacy key
+
+        legacy_key = _sanitize_sample_key_legacy(sample_id)
+        try:
+            tensor, _h16, _w16 = read_cache_entry(
+                cache_root, cache_hash, dataset, legacy_key
+            )
+            memory = tensor.to(device=device)
+            if use_fp16:
+                memory = memory.half()
+            return memory
+        except FileNotFoundError:
+            pass  # both schemes missed; fall through to live encoder
+
+    # Live path: full encoder forward pass
+    return _encode_staff_image(decode_model, pixel_values)
+
+
 def _run_stage_b_inference_with_progress(
     *,
     project_root: Path,
@@ -170,6 +242,8 @@ def _run_stage_b_inference_with_progress(
     use_kv_cache: bool = True,
     use_fp16: bool = False,
     quantize: bool = False,
+    encoder_cache_root: Optional[Path] = None,
+    encoder_cache_hash: Optional[str] = None,
 ) -> Dict[str, object]:
     import torch
 
@@ -186,6 +260,12 @@ def _run_stage_b_inference_with_progress(
         build_stage_b_components,
         model_factory_config_from_checkpoint_payload,
     )
+
+    # Resolve encoder cache root once (may be None if not provided via CLI)
+    _cache_root: Optional[Path] = (
+        Path(encoder_cache_root).resolve() if encoder_cache_root is not None else None
+    )
+    _cache_hash: Optional[str] = encoder_cache_hash or None
 
     crop_rows = _read_jsonl(crops_manifest)
     if not crop_rows:
@@ -259,7 +339,16 @@ def _run_stage_b_inference_with_progress(
             )
             if use_fp16:
                 pixel_values = pixel_values.half()
-            memory = _encode_staff_image(decode_model, pixel_values)
+            memory = _resolve_cache_memory(
+                decode_model=decode_model,
+                pixel_values=pixel_values,
+                dataset=str(row.get("dataset", "")).lower(),
+                sample_id=str(row.get("sample_id", "")),
+                cache_root=_cache_root,
+                cache_hash=_cache_hash,
+                device=device,
+                use_fp16=use_fp16,
+            )
 
             tokens = _decode_stage_b_tokens(
                 model=model,
@@ -388,6 +477,26 @@ def parse_args() -> argparse.Namespace:
         help="Disable progress logging during Stage-B inference.",
     )
     parser.add_argument(
+        "--encoder-cache-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root directory of the encoder feature cache "
+            "(e.g. data/cache/encoder/). When provided together with "
+            "--encoder-cache-hash, cached datasets skip the encoder forward pass "
+            "for a ~10-15x throughput improvement."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-cache-hash",
+        type=str,
+        default=None,
+        help=(
+            "16-character hex hash identifying the cache subdirectory "
+            "(e.g. ac8948ae4b5be3e9). Required when --encoder-cache-root is set."
+        ),
+    )
+    parser.add_argument(
         "--work-dir",
         type=Path,
         default=project_root / "src" / "eval" / "checkpoint_eval",
@@ -481,6 +590,8 @@ def main() -> None:
         length_penalty_alpha=float(args.length_penalty_alpha),
         use_kv_cache=bool(args.kv_cache),
         quantize=bool(getattr(args, "quantize", False)),
+        encoder_cache_root=getattr(args, "encoder_cache_root", None),
+        encoder_cache_hash=getattr(args, "encoder_cache_hash", None),
     )
 
     raw_prediction_rows = _read_jsonl(raw_predictions_path)
