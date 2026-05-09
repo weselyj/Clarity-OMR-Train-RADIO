@@ -68,6 +68,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--tolerance", type=float, default=1e-3)
+    parser.add_argument("--match-batch-size", type=int, default=8,
+                        help="Encode each validation image at this batch size by replicating it. "
+                             "Matches the build's batch size to neutralize flash-attention kernel "
+                             "variance. Set to 1 to skip replication (will produce false failures "
+                             "if the cache was built with batch_size > 1).")
     args = parser.parse_args()
 
     with args.preproc_cfg.open() as fh:
@@ -166,12 +171,18 @@ def main() -> int:
             failed.append({"sample_id": sid, "reason": "image_load_fail"})
             continue
 
+        # Encode at the SAME batch size the cache was built at (default 8).
+        # Flash attention's kernel selection varies with batch size, so a batch=1
+        # forward of the same image can differ from a batch=8 forward by a few
+        # bf16-noise multiples on a small subset of output elements. Replicating
+        # the test image to fill the build's batch matches the numerical regime.
         img_batch = img.unsqueeze(0).to(device)
         if img_batch.shape[1] == 1:
             img_batch = img_batch.repeat(1, 3, 1, 1)
+        img_batch = img_batch.repeat(args.match_batch_size, 1, 1, 1)
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            live_feat = model.encoder(img_batch)  # (1, 1280, h16, w16)
+            live_feat = model.encoder(img_batch)  # (B, 1280, h16, w16)
 
         live_flat = live_feat[0].cpu().to(torch.bfloat16).flatten(1).transpose(0, 1)  # (seq, 1280)
         cached_cpu = cached_tensor.cpu()
