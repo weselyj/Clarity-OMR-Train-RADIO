@@ -28,6 +28,7 @@ from src.train.model_factory import (
     build_stage_b_components,
     model_factory_config_from_checkpoint_payload,
 )
+from src.train.tier_sampler import build_tier_grouped_sampler_by_opt_steps
 
 
 # Datasets whose encoder features are pre-computed and stored in the cache.
@@ -90,6 +91,15 @@ class StageTrainingConfig:
     loraplus_lr_ratio: float
     dataset_mix: Tuple[DatasetMix, ...]
     stage_b_encoder: str = "davit"
+    # --- Stage 3 tier-aware fields (all None for legacy stages) ---
+    tier_grouped_sampling: bool = False
+    b_cached: Optional[int] = None
+    b_live: Optional[int] = None
+    grad_accumulation_steps_cached: Optional[int] = None
+    grad_accumulation_steps_live: Optional[int] = None
+    cached_data_ratio: Optional[float] = None
+    cache_root: Optional[str] = None
+    cache_hash16: Optional[str] = None
 
 
 def load_yaml(path: Path) -> Dict[str, object]:
@@ -125,6 +135,21 @@ def load_stage_config(path: Path) -> StageTrainingConfig:
     if not math.isclose(ratio_sum, 1.0, rel_tol=0.0, abs_tol=1e-6):
         raise ValueError(f"dataset_mix ratios must sum to 1.0 in {path}, got {ratio_sum}")
 
+    tier_grouped = bool(raw.get("tier_grouped_sampling", False))
+    tier_field_names = (
+        "b_cached", "b_live",
+        "grad_accumulation_steps_cached", "grad_accumulation_steps_live",
+        "cached_data_ratio", "cache_root", "cache_hash16",
+    )
+    tier_field_values = {name: raw.get(name) for name in tier_field_names}
+    if tier_grouped:
+        missing = [n for n, v in tier_field_values.items() if v is None]
+        if missing:
+            raise ValueError(
+                f"tier_grouped_sampling=true requires all tier fields to be set in {path}; "
+                f"missing: {missing}"
+            )
+
     return StageTrainingConfig(
         stage_name=str(raw["stage_name"]),
         epochs=int(raw["epochs"]),
@@ -144,6 +169,14 @@ def load_stage_config(path: Path) -> StageTrainingConfig:
         loraplus_lr_ratio=float(raw.get("loraplus_lr_ratio", 1.0)),
         dataset_mix=tuple(mix),
         stage_b_encoder=str(raw.get("stage_b_encoder", "davit")).lower().strip(),
+        tier_grouped_sampling=tier_grouped,
+        b_cached=int(tier_field_values["b_cached"]) if tier_field_values["b_cached"] is not None else None,
+        b_live=int(tier_field_values["b_live"]) if tier_field_values["b_live"] is not None else None,
+        grad_accumulation_steps_cached=int(tier_field_values["grad_accumulation_steps_cached"]) if tier_field_values["grad_accumulation_steps_cached"] is not None else None,
+        grad_accumulation_steps_live=int(tier_field_values["grad_accumulation_steps_live"]) if tier_field_values["grad_accumulation_steps_live"] is not None else None,
+        cached_data_ratio=float(tier_field_values["cached_data_ratio"]) if tier_field_values["cached_data_ratio"] is not None else None,
+        cache_root=str(tier_field_values["cache_root"]) if tier_field_values["cache_root"] is not None else None,
+        cache_hash16=str(tier_field_values["cache_hash16"]) if tier_field_values["cache_hash16"] is not None else None,
     )
 
 
@@ -625,11 +658,25 @@ class StageBDataset(torch.utils.data.Dataset):
 
         # --- Cached path: load pre-computed encoder features from disk ---
         if is_cached_tier and self.cache_root is not None and self.cache_hash16 is not None:
-            from src.data.encoder_cache import _sanitize_sample_key, read_cache_entry
-            key = _sanitize_sample_key(sample_id)
-            encoder_hidden, h16, w16 = read_cache_entry(
-                self.cache_root, self.cache_hash16, dataset_name, key
+            from src.data.encoder_cache import (
+                CacheMiss,
+                _sanitize_sample_key,
+                _sanitize_sample_key_legacy,
+                read_cache_entry,
             )
+            key = _sanitize_sample_key(sample_id)
+            try:
+                encoder_hidden, h16, w16 = read_cache_entry(
+                    self.cache_root, self.cache_hash16, dataset_name, key
+                )
+            except CacheMiss:
+                # Backwards-compat: caches built before 2026-05-09 used a lossy
+                # '__' escape. Fall back to that scheme so existing caches keep
+                # working without a 5h rebuild.
+                legacy_key = _sanitize_sample_key_legacy(sample_id)
+                encoder_hidden, h16, w16 = read_cache_entry(
+                    self.cache_root, self.cache_hash16, dataset_name, legacy_key
+                )
             # Token encode (same as live path)
             sequence = entry.get("token_sequence", [])
             if not isinstance(sequence, list) or not sequence:
@@ -889,6 +936,44 @@ def build_stage_b_sampler(
         replacement=True,
         generator=generator,
     )
+
+
+class _TierGroupedBatchSampler(torch.utils.data.Sampler):
+    """Wraps a pre-computed list of batched index lists for use with DataLoader.
+
+    Yields each inner list (one batch worth of indices). DataLoader's
+    batch_sampler arg expects exactly this shape: an iterable that yields
+    lists of indices.
+    """
+
+    def __init__(self, batches: List[List[int]]) -> None:
+        # NOTE: torch.utils.data.Sampler.__init__ on PyTorch nightly accepts
+        # *args/**kwargs but forwards to object.__init__ which rejects them
+        # ("object.__init__ takes exactly one argument").  Older PyTorch
+        # versions accepted data_source=None.  Calling super() with no args
+        # is correct on both, so do not pass data_source.
+        super().__init__()
+        self._batches = batches
+        # Resume support (Task 8): on resume, set this to the consumed prefix length.
+        self._start_idx: int = 0
+
+    def set_start_idx(self, idx: int) -> None:
+        """Skip the first ``idx`` batches when iterating (used on resume).
+
+        Must be called before ``iter(loader)``; in-flight iterators are not
+        affected (the slice ``self._batches[self._start_idx:]`` is captured
+        when ``__iter__`` is first called).
+        """
+        if idx < 0 or idx > len(self._batches):
+            raise ValueError(f"start_idx={idx} out of range [0, {len(self._batches)}]")
+        self._start_idx = idx
+
+    def __iter__(self):
+        for batch in self._batches[self._start_idx:]:
+            yield batch
+
+    def __len__(self) -> int:
+        return len(self._batches) - self._start_idx
 
 
 def stage_b_worker_init_fn(worker_id: int) -> None:
@@ -1291,23 +1376,17 @@ def _run_validation(
                 batch_dict = next(val_iter)
             except StopIteration:
                 break
-            images = batch_dict["images"]
-            decoder_inputs = batch_dict["decoder_inputs"]
-            labels = batch_dict["labels"]
-            contour_targets = batch_dict["contour_targets"]
-            if channels_last:
-                images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
-            else:
-                images = images.to(device, non_blocking=True)
-            decoder_inputs = decoder_inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            contour_targets = contour_targets.to(device, non_blocking=True)
+            labels = batch_dict["labels"].to(device, non_blocking=True)
+            contour_targets = batch_dict["contour_targets"].to(device, non_blocking=True)
             with torch.autocast(
                 device_type=device.type,
                 dtype=torch.bfloat16,
                 enabled=bf16_enabled,
             ):
-                outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+                outputs = _forward_batch_for_train(
+                    model, batch_dict, device,
+                    bf16_enabled=bf16_enabled, channels_last=channels_last,
+                )
                 token_loss = F.cross_entropy(
                     outputs["logits"].reshape(-1, vocab_size),
                     labels.reshape(-1),
@@ -1327,6 +1406,234 @@ def _run_validation(
     }
 
 
+def _run_validation_per_dataset(
+    model,
+    stage: "StageTrainingConfig",
+    per_dataset_loaders: "Dict[str, object]",
+    device,
+    *,
+    bf16_enabled: bool,
+    validation_batches: int,
+    vocab_size: int,
+    channels_last: bool = False,
+) -> "Optional[Dict[str, object]]":
+    """Run validation as N disjoint passes (one per dataset).
+
+    Calls :func:`_run_validation` once per dataset's loader and combines the
+    results.  In tier-grouped mode (with ``cached_data_ratio`` set), the
+    aggregate ``val_loss`` is re-projected from per-tier ``dataset_mix`` shares
+    into the spec's global cached/live weighting (Decision #4): cached datasets
+    share ``cached_data_ratio`` proportional to their ``dm.ratio``; live
+    datasets share ``1 - cached_data_ratio``. In legacy (non-tier-grouped)
+    mode, falls back to ``dm.ratio`` directly.
+
+    Args:
+        model: The model to evaluate.
+        stage: StageTrainingConfig (only ``dataset_mix``,
+            ``label_smoothing`` and ``contour_loss_weight`` are read).
+        per_dataset_loaders: Mapping of dataset name → DataLoader (or any
+            iterable) of val batches for that dataset.  One disjoint
+            validation pass is run per entry.
+        device: torch.device to move tensors onto.
+        bf16_enabled: Whether to enable bfloat16 autocast.
+        validation_batches: Maximum number of batches to evaluate per dataset.
+        vocab_size: Vocabulary size for cross-entropy logits reshape.
+        channels_last: When True, move images with channels_last memory format.
+
+    Returns:
+        Dict with::
+
+            {
+                "val_loss": float,                 # sample-weighted aggregate
+                "val_contour_loss": float,         # sample-weighted aggregate
+                "val_loss_per_dataset": Dict[str, float],
+                "val_contour_loss_per_dataset": Dict[str, float],
+            }
+
+        Returns ``None`` if every per-dataset loader is empty (or all weights
+        are zero).
+    """
+    per_loss: Dict[str, float] = {}
+    per_contour: Dict[str, float] = {}
+    for dataset_name, loader in per_dataset_loaders.items():
+        result = _run_validation(
+            model, stage, loader, device,
+            bf16_enabled=bf16_enabled,
+            validation_batches=validation_batches,
+            vocab_size=vocab_size,
+            channels_last=channels_last,
+        )
+        if result is None:
+            continue
+        per_loss[dataset_name] = result["val_loss"]
+        per_contour[dataset_name] = result["val_contour_loss"]
+
+    # Spec Decision #4: aggregate val_loss is cached_data_ratio-weighted across
+    # cached/live tiers, with each tier's share split among its datasets by their
+    # dataset_mix ratios. In tier-grouped mode, dm.ratio describes the
+    # cached-tier WeightedRandomSampler weighting only — cameraprimus_systems is
+    # set to 0.0 in production YAML because it lives in the LIVE tier. Using
+    # dm.ratio directly would silently drop cameraprimus from best_val_loss
+    # tracking and sanity halt inputs — exactly the wrong behavior since
+    # cameraprimus is the dataset most likely to regress.
+    if stage.tier_grouped_sampling and stage.cached_data_ratio is not None:
+        cached_share = stage.cached_data_ratio
+        live_share = 1.0 - cached_share
+        cached_total = sum(
+            dm.ratio for dm in stage.dataset_mix if dm.dataset in _CACHED_DATASETS
+        )
+        live_total = sum(
+            dm.ratio for dm in stage.dataset_mix if dm.dataset not in _CACHED_DATASETS
+        )
+        # Hoisted out of the per-dataset loop: tier sizes are stage-wide
+        # constants, not dependent on the iterating dm.
+        n_cached = sum(
+            1 for dm in stage.dataset_mix if dm.dataset in _CACHED_DATASETS
+        )
+        n_live = sum(
+            1 for dm in stage.dataset_mix if dm.dataset not in _CACHED_DATASETS
+        )
+        weights: Dict[str, float] = {}
+        for dm in stage.dataset_mix:
+            if dm.dataset in _CACHED_DATASETS:
+                if cached_total > 0:
+                    weights[dm.dataset] = cached_share * (dm.ratio / cached_total)
+                else:
+                    # Symmetric to the live-tier fallback below: if every
+                    # cached dataset has ratio 0 in the YAML (degenerate but
+                    # representable), distribute cached_share evenly so the
+                    # cached tier still contributes to the aggregate.
+                    weights[dm.dataset] = cached_share / n_cached if n_cached > 0 else 0.0
+            else:
+                if live_total > 0:
+                    weights[dm.dataset] = live_share * (dm.ratio / live_total)
+                else:
+                    # All live datasets have ratio 0 in YAML (production case:
+                    # cameraprimus_systems ratio=0.0). Distribute live_share
+                    # evenly among live datasets so cameraprimus still gets
+                    # weighted into the aggregate.
+                    weights[dm.dataset] = live_share / n_live if n_live > 0 else 0.0
+    else:
+        weights = {dm.dataset: dm.ratio for dm in stage.dataset_mix}
+
+    weight_sum = sum(weights.get(k, 0.0) for k in per_loss.keys())
+    if weight_sum <= 0:
+        return None
+    val_loss_agg = sum(weights.get(k, 0.0) * v for k, v in per_loss.items()) / weight_sum
+    val_contour_agg = sum(
+        weights.get(k, 0.0) * v for k, v in per_contour.items()
+    ) / weight_sum
+    return {
+        "val_loss": float(val_loss_agg),
+        "val_contour_loss": float(val_contour_agg),
+        "val_loss_per_dataset": per_loss,
+        "val_contour_loss_per_dataset": per_contour,
+    }
+
+
+def _forward_batch_for_train(
+    model,
+    batch_dict: "Dict[str, object]",
+    device: "torch.device",
+    *,
+    bf16_enabled: bool,
+    channels_last: bool,
+) -> "Dict[str, object]":
+    """Dispatch a batch through the model based on its tier.
+
+    Returns the model output dict (logits + contour_logits + ...). The caller
+    is responsible for h2d of labels/contour_targets AND for the surrounding
+    ``torch.autocast`` scope (kept on the caller side for consistency with
+    ``_run_validation``).
+
+    For cached batches: passes ``cached_features=encoder_hidden``, ``_h16``, ``_w16``.
+    For live batches: passes ``pixel_values=images``.
+    """
+    import torch
+
+    tier = batch_dict.get("tier", "live")
+    decoder_inputs = batch_dict["decoder_inputs"].to(device, non_blocking=True)
+    if tier == "cached":
+        cached_features = batch_dict["encoder_hidden"].to(device, non_blocking=True)
+        outputs = model(
+            cached_features=cached_features,
+            input_ids=decoder_inputs,
+            _h16=int(batch_dict["_h16"]),
+            _w16=int(batch_dict["_w16"]),
+            return_aux=True,
+        )
+    else:
+        if channels_last:
+            images = batch_dict["images"].to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = batch_dict["images"].to(device, non_blocking=True)
+        outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+    return outputs
+
+
+@dataclass(frozen=True)
+class _TierGroupedBatchPlan:
+    """Result of converting opt-step targets into batch counts."""
+    n_cached_opt_steps: int
+    n_live_opt_steps: int
+    n_cached_batches: int
+    n_live_batches: int
+    total_batches: int
+
+
+def _compute_tier_grouped_batch_plan(
+    *,
+    target_opt_steps: int,
+    cached_data_ratio: float,
+    b_cached: int,
+    b_live: int,
+    grad_accum_cached: int,
+    grad_accum_live: int,
+) -> "_TierGroupedBatchPlan":
+    """Convert (target_opt_steps, cached_data_ratio) into tier batch counts.
+
+    cached_data_ratio is the OPT-STEP gradient share (locked decision #1).
+    Cached opt-steps = round(target_opt_steps * cached_data_ratio); live
+    opt-steps = target_opt_steps - cached_opt_steps.
+    """
+    n_cached_opt = int(round(target_opt_steps * cached_data_ratio))
+    n_live_opt = max(0, target_opt_steps - n_cached_opt)
+    n_cached_batches = n_cached_opt * grad_accum_cached
+    n_live_batches = n_live_opt * grad_accum_live
+    return _TierGroupedBatchPlan(
+        n_cached_opt_steps=n_cached_opt,
+        n_live_opt_steps=n_live_opt,
+        n_cached_batches=n_cached_batches,
+        n_live_batches=n_live_batches,
+        total_batches=n_cached_batches + n_live_batches,
+    )
+
+
+def _grad_accum_for_batch(
+    batch_dict: "Dict[str, object]",
+    *,
+    grad_accum_cached: int,
+    grad_accum_live: int,
+) -> int:
+    """Return the per-tier grad_accum for the batch's tier."""
+    tier = batch_dict.get("tier", "live")
+    return grad_accum_cached if tier == "cached" else grad_accum_live
+
+
+def _should_sanity_halt(*, val_loss: float, global_step: int) -> Tuple[str, bool]:
+    """Spec sanity halt: val_loss > 5.0 in first 200 steps OR NaN at any step.
+
+    Returns (message, should_halt). message is the human-readable reason; only
+    meaningful when should_halt=True. The val_loss>5 message string is
+    intentionally stable so post-mortem tooling can grep for it.
+    """
+    if math.isnan(val_loss):
+        return ("val_loss is NaN", True)
+    if global_step < 200 and val_loss > 5.0:
+        return ("val_loss>5 in first 200 steps", True)
+    return ("", False)
+
+
 def _save_checkpoint(
     checkpoint_dir: Path,
     model,
@@ -1340,6 +1647,7 @@ def _save_checkpoint(
     stage_b_config: Optional[Dict[str, object]] = None,
     name_suffix: Optional[str] = None,
     best_val_loss: Optional[float] = None,
+    last_batch_idx: Optional[int] = None,
 ) -> Path:
     import torch
 
@@ -1358,11 +1666,119 @@ def _save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "stage_b_config": stage_b_config,
         "best_val_loss": best_val_loss,
+        # Tier-grouped sampler resume (Stage 3+, Decision #6): records the
+        # number of micro-batches consumed so a resumed run rebuilds the same
+        # sampler list (same seed) and skips the consumed prefix via
+        # _TierGroupedBatchSampler.set_start_idx.  None for non-tier-grouped
+        # stages (Stage 1 / Stage 2 v2) where weighted random sampling makes
+        # batch-prefix skipping meaningless.
+        "last_batch_idx": last_batch_idx,
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
     torch.save(payload, checkpoint_path)
     return checkpoint_path
+
+
+def _compute_resume_position(
+    *,
+    checkpoint_payload: Optional[Dict[str, object]],
+    stages: Sequence["StageTrainingConfig"],
+    stage_runtime: Sequence[Dict[str, object]],
+    resume_stage_name: str,
+    global_step: int,
+) -> Tuple[int, int]:
+    """Determine (resume_stage_index, resume_stage_completed_steps) from a checkpoint.
+
+    Prefers stage_name matching when the checkpoint advertises one — this supports
+    the spec's incremental extension protocol (raise YAML target 4500 → 6000 → 7500
+    and resume mid-stage). Falls back to a global_step walk for older multi-stage
+    checkpoints that lack a stage_name.
+
+    Detects pre-715a89b checkpoints where ``stage_step`` was stored in micro-batch
+    units instead of opt-step units. The signal is ``stage_step > stage_steps_total``
+    in the saved payload — impossible under the new opt-step convention but typical
+    of an end-of-run legacy save (e.g. 7650 micro-batches vs 4500 opt-steps for a
+    Stage 3 v1 run with 90/10 cached/live mix and grad_accum_live=8). When detected,
+    routing falls back to the walk so ``stage_start_step > stage_total_steps``
+    doesn't fire and silently skip the stage at train.py:2370.
+
+    Note: legacy *intermediate* checkpoints where micro-batch count happens to be
+    less than stage_steps_total cannot be detected from the payload alone. The
+    documented workaround is ``--start-stage <name>`` to restart the stage from
+    micro-batch 1 (resume_stage_completed_steps is reset to 0 unconditionally).
+    """
+    if checkpoint_payload is None:
+        return 0, 0
+
+    ckpt_stage_step = checkpoint_payload.get("stage_step") if isinstance(checkpoint_payload, dict) else None
+    ckpt_stage_steps_total = (
+        checkpoint_payload.get("stage_steps_total") if isinstance(checkpoint_payload, dict) else None
+    )
+
+    matched_idx: Optional[int] = None
+    if resume_stage_name:
+        for _idx, _s in enumerate(stages):
+            if _s.stage_name == resume_stage_name:
+                matched_idx = _idx
+                break
+
+    if matched_idx is not None and ckpt_stage_step is not None:
+        is_legacy_micro_batch_units = (
+            ckpt_stage_steps_total is not None
+            and int(ckpt_stage_step) > int(ckpt_stage_steps_total)
+        )
+        if is_legacy_micro_batch_units:
+            print(
+                "[train] checkpoint detected as pre-715a89b (legacy micro-batch units): "
+                f"stage_step={int(ckpt_stage_step)} > stage_steps_total={int(ckpt_stage_steps_total)}. "
+                "Falling back to global_step walk; for clean extension of v1/v2 use "
+                "--start-stage <name>.",
+                file=sys.stderr,
+            )
+        else:
+            return matched_idx, max(0, int(ckpt_stage_step))
+
+    remaining_steps = global_step
+    resume_stage_index = len(stages)
+    resume_stage_completed_steps = 0
+    for stage_index, runtime in enumerate(stage_runtime):
+        stage_total_steps = int(runtime["stage_total_steps"])
+        if remaining_steps >= stage_total_steps:
+            remaining_steps -= stage_total_steps
+            continue
+        resume_stage_index = stage_index
+        resume_stage_completed_steps = remaining_steps
+        break
+    if resume_stage_index < len(stages):
+        resolved_stage_name = stages[resume_stage_index].stage_name
+        if resume_stage_name and resume_stage_name != resolved_stage_name:
+            print(
+                "[train] warning: checkpoint stage name does not match computed stage boundary. "
+                f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
+                file=sys.stderr,
+            )
+    return resume_stage_index, resume_stage_completed_steps
+
+
+def _resync_batch_idx_after_rebuild(batch_sampler) -> int:
+    """Return the value ``_batch_idx_consumed`` must be reset to after a
+    StopIteration-driven DataLoader rebuild, so the loop's standard
+    ``_batch_idx_consumed += 1`` ends up matching the rebuilt iterator's
+    actual next position.
+
+    The rebuilt iterator's first batch is at ``batch_sampler._start_idx``
+    (set at resume time and not advanced during the in-flight iterator).
+    Without this resync, ``_batch_idx_consumed`` would continue counting
+    from its pre-rebuild value, inflating the next checkpoint's
+    ``last_batch_idx`` and causing future resumes to skip too many batches
+    via ``_TierGroupedBatchSampler.set_start_idx``.
+
+    Returns 0 for samplers without a ``_start_idx`` attribute (non-tier-
+    grouped legacy path; ``_batch_idx_consumed`` is irrelevant there because
+    ``last_batch_idx`` is saved as None).
+    """
+    return int(getattr(batch_sampler, "_start_idx", 0))
 
 
 class _CpuPhase:
@@ -1947,28 +2363,13 @@ def run_execute_mode(
             if requested_stage_index is not None:
                 requested_stage_label = stages[requested_stage_index].stage_name
 
-    resume_stage_index = 0
-    resume_stage_completed_steps = 0
-    if resume_checkpoint is not None:
-        remaining_steps = global_step
-        resume_stage_index = len(stages)
-        resume_stage_completed_steps = 0
-        for stage_index, runtime in enumerate(stage_runtime):
-            stage_total_steps = int(runtime["stage_total_steps"])
-            if remaining_steps >= stage_total_steps:
-                remaining_steps -= stage_total_steps
-                continue
-            resume_stage_index = stage_index
-            resume_stage_completed_steps = remaining_steps
-            break
-        if resume_stage_index < len(stages):
-            resolved_stage_name = stages[resume_stage_index].stage_name
-            if resume_stage_name and resume_stage_name != resolved_stage_name:
-                print(
-                    "[train] warning: checkpoint stage name does not match computed stage boundary. "
-                    f"checkpoint='{resume_stage_name}', computed='{resolved_stage_name}'",
-                    file=sys.stderr,
-                )
+    resume_stage_index, resume_stage_completed_steps = _compute_resume_position(
+        checkpoint_payload=checkpoint_payload if resume_checkpoint is not None else None,
+        stages=stages,
+        stage_runtime=stage_runtime,
+        resume_stage_name=resume_stage_name,
+        global_step=global_step,
+    )
 
     if requested_stage_index is not None:
         baseline_step = sum(int(runtime["stage_total_steps"]) for runtime in stage_runtime[:requested_stage_index])
@@ -2070,6 +2471,22 @@ def run_execute_mode(
                         continue
 
             optimizer = _build_optimizer(model, stage)
+            # In tier-grouped mode, opt-step count == stage_total_steps directly
+            # (the per-tier grad-accumulation is tracked via grad_accumulation_steps_cached
+            # / grad_accumulation_steps_live, NOT the legacy grad_accumulation_steps field).
+            # The legacy field is kept at 1 in tier-grouped YAMLs so this division is a no-op.
+            # Asserting that here would be wrong (legacy YAMLs use grad_accumulation_steps>1
+            # with tier_grouped_sampling=False), but flag the assumption in case a future
+            # YAML mixes the two and the LR cosine span ends up wrong.
+            if stage.tier_grouped_sampling and stage.grad_accumulation_steps != 1:
+                print(
+                    f"[train] warning: tier_grouped_sampling=True with "
+                    f"grad_accumulation_steps={stage.grad_accumulation_steps}; the LR scheduler "
+                    "horizon is computed as stage_total_steps // grad_accumulation_steps, "
+                    "but tier-grouped opt-steps count via stage_total_steps directly. "
+                    "Set grad_accumulation_steps=1 in the YAML for tier-grouped stages.",
+                    file=sys.stderr,
+                )
             optimizer_steps = max(1, stage_total_steps // stage.grad_accumulation_steps)
             scheduler = _build_scheduler(optimizer, stage, total_steps=optimizer_steps)
             if resumed_stage:
@@ -2078,7 +2495,8 @@ def run_execute_mode(
                         optimizer.load_state_dict(resume_optimizer_state)
                     except Exception as exc:
                         print(
-                            f"[train] warning: failed to restore optimizer state; continuing with fresh optimizer ({exc})",
+                            f"[train] warning: failed to restore optimizer state ({type(exc).__name__}: {exc}); "
+                            "continuing with fresh optimizer",
                             file=sys.stderr,
                         )
                 if resume_scheduler_state is not None:
@@ -2086,7 +2504,8 @@ def run_execute_mode(
                         scheduler.load_state_dict(resume_scheduler_state)
                     except Exception as exc:
                         print(
-                            f"[train] warning: failed to restore scheduler state; using step-aligned scheduler ({exc})",
+                            f"[train] warning: failed to restore scheduler state ({type(exc).__name__}: {exc}); "
+                            "using step-aligned scheduler",
                             file=sys.stderr,
                         )
                         scheduler.step(max(0, stage_start_step // stage.grad_accumulation_steps - 1))
@@ -2106,89 +2525,261 @@ def run_execute_mode(
             # via the WeightedRandomSampler (which preserves dataset_mix ratios).
             # persistent_workers=True avoids per-epoch worker respawn overhead.
             # pin_memory=True enables async H2D transfers via non_blocking=True.
-            _stage_ds = StageBDataset(
-                stage,
-                grouped_entries,
-                project_root=project_root,
-                image_height=image_height,
-                image_width=image_width,
-                max_sequence_length=stage.max_sequence_length,
-                augment=True,
-                rng_seed=seed,
-            )
-            # Compute total micro-batch draws needed for the full stage.
-            # stage_total_steps is OPT-steps; each OPT-step consumes
-            # grad_accumulation_steps micro-batches.  Sizing the sampler to
-            # cover the full count guarantees the iterator never exhausts
-            # mid-accumulation-window (the StopIteration handler below is
-            # purely defensive against bugs / checkpoint restarts).
-            _stage_total_train_samples = (
-                stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
-            )
-            _train_sampler = build_stage_b_sampler(
-                stage, _stage_ds,
-                total_samples=_stage_total_train_samples,
-                seed=seed,
-            )
             _pin_memory = device.type == "cuda"
             _effective_prefetch = prefetch_factor if num_workers > 0 else None
-            _train_loader = torch.utils.data.DataLoader(
-                _stage_ds,
-                batch_size=stage.batch_size,
-                sampler=_train_sampler,
-                num_workers=num_workers,
-                pin_memory=_pin_memory,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=_effective_prefetch,
-                collate_fn=StageBDataset.collate_fn,
-                worker_init_fn=stage_b_worker_init_fn,
-            )
+            if stage.tier_grouped_sampling:
+                # Stage 3: tier-grouped sampler path.
+                # Pass cache pointers to the dataset so cached entries route through
+                # read_cache_entry.
+                cache_root_path = (
+                    (project_root / stage.cache_root).resolve() if stage.cache_root else None
+                )
+                _stage_ds = StageBDataset(
+                    stage,
+                    grouped_entries,
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                    max_sequence_length=stage.max_sequence_length,
+                    augment=True,
+                    rng_seed=seed,
+                    cache_root=cache_root_path,
+                    cache_hash16=stage.cache_hash16,
+                )
+                # Compute opt-step → batch plan. stage_total_steps comes from
+                # the existing scheduler arithmetic and counts opt-steps.
+                _plan = _compute_tier_grouped_batch_plan(
+                    target_opt_steps=stage_total_steps,
+                    cached_data_ratio=stage.cached_data_ratio,
+                    b_cached=stage.b_cached,
+                    b_live=stage.b_live,
+                    grad_accum_cached=stage.grad_accumulation_steps_cached,
+                    grad_accum_live=stage.grad_accumulation_steps_live,
+                )
+                # The for-loop below counts MICRO-BATCH iterations, while
+                # stage_total_steps counts OPT-STEPS (the planner's input).  In
+                # tier-grouped mode one opt-step costs 1 cached batch OR
+                # grad_accumulation_steps_live live batches, so total_batches >
+                # stage_total_steps.  Using stage_total_steps as the loop bound
+                # would silently truncate training to ~58% of the opt-step
+                # target.  Use _plan.total_batches instead.
+                _loop_bound = _plan.total_batches
+                _batch_list = build_tier_grouped_sampler_by_opt_steps(
+                    entries=_stage_ds.entries,
+                    cached_datasets=_CACHED_DATASETS,
+                    live_datasets={"cameraprimus_systems"},
+                    n_cached_opt_steps=_plan.n_cached_opt_steps,
+                    n_live_opt_steps=_plan.n_live_opt_steps,
+                    b_cached=stage.b_cached,
+                    b_live=stage.b_live,
+                    grad_accum_cached=stage.grad_accumulation_steps_cached,
+                    grad_accum_live=stage.grad_accumulation_steps_live,
+                    seed=seed,
+                )
+                _train_loader = torch.utils.data.DataLoader(
+                    _stage_ds,
+                    batch_sampler=_TierGroupedBatchSampler(_batch_list),
+                    num_workers=num_workers,
+                    pin_memory=_pin_memory,
+                    persistent_workers=(num_workers > 0),
+                    prefetch_factor=_effective_prefetch,
+                    collate_fn=StageBDataset.collate_fn,
+                    worker_init_fn=stage_b_worker_init_fn,
+                )
+            else:
+                # Legacy path (Stage 1, Stage 2 v2): unchanged.
+                _stage_ds = StageBDataset(
+                    stage,
+                    grouped_entries,
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                    max_sequence_length=stage.max_sequence_length,
+                    augment=True,
+                    rng_seed=seed,
+                )
+                # Compute total micro-batch draws needed for the full stage.
+                # stage_total_steps is OPT-steps; each OPT-step consumes
+                # grad_accumulation_steps micro-batches.  Sizing the sampler to
+                # cover the full count guarantees the iterator never exhausts
+                # mid-accumulation-window (the StopIteration handler below is
+                # purely defensive against bugs / checkpoint restarts).
+                _stage_total_train_samples = (
+                    stage_total_steps * stage.batch_size * stage.grad_accumulation_steps
+                )
+                # Legacy path: stage_total_steps IS the micro-batch loop count
+                # (Stage 1/2 historical semantics — every for-loop iteration
+                # pulls one micro-batch and is_accum_step fires every
+                # grad_accumulation_steps iterations).  Preserved unchanged.
+                _loop_bound = stage_total_steps
+                _train_sampler = build_stage_b_sampler(
+                    stage, _stage_ds,
+                    total_samples=_stage_total_train_samples,
+                    seed=seed,
+                )
+                _train_loader = torch.utils.data.DataLoader(
+                    _stage_ds,
+                    batch_size=stage.batch_size,
+                    sampler=_train_sampler,
+                    num_workers=num_workers,
+                    pin_memory=_pin_memory,
+                    persistent_workers=(num_workers > 0),
+                    prefetch_factor=_effective_prefetch,
+                    collate_fn=StageBDataset.collate_fn,
+                    worker_init_fn=stage_b_worker_init_fn,
+                )
+            # Resume support (Decision #6): for tier-grouped stages, skip the
+            # first N micro-batches in the freshly-rebuilt sampler so a resumed
+            # run does not re-train the prefix already consumed.  The legacy
+            # WeightedRandomSampler path uses replacement=True with a stage-seed
+            # generator and does not need (or support) prefix skipping.
+            #
+            # CRITICAL: set_start_idx must be called BEFORE iter(_train_loader);
+            # the sampler captures self._batches[self._start_idx:] inside
+            # __iter__, so any later mutation has no effect on the live iterator.
+            if stage.tier_grouped_sampling and resumed_stage:
+                _resume_last_batch_idx = (
+                    int(checkpoint_payload.get("last_batch_idx") or 0)
+                    if isinstance(checkpoint_payload, dict)
+                    else 0
+                )
+                if _resume_last_batch_idx > 0:
+                    _train_loader.batch_sampler.set_start_idx(_resume_last_batch_idx)
+                    _batch_idx_consumed = _resume_last_batch_idx
+                else:
+                    _batch_idx_consumed = 0
+            else:
+                _batch_idx_consumed = 0
+            # Tier-grouped extension fix: the for-loop iterates micro-batches in
+            # tier-grouped mode (`_loop_bound = _plan.total_batches`), but
+            # stage_start_step was initially set in opt-step units from
+            # resume_stage_completed_steps. On resume the units disagree, so
+            # reset stage_start_step to the micro-batch index of the first
+            # un-consumed batch. The LR scheduler was already advanced based
+            # on the opt-step counter at scheduler init, so this override only
+            # affects the per-step loop range.
+            if stage.tier_grouped_sampling and resumed_stage:
+                stage_start_step = _batch_idx_consumed + 1
             _train_iter = iter(_train_loader)
+            # Opt-step counter for this stage. Tracks how many optimizer.step()
+            # calls have completed in this stage (across resume boundaries).
+            # Persisted as `stage_step` in checkpoints so the units are
+            # consistent regardless of tier_grouped_sampling mode (the for-loop
+            # variable is micro-batches in tier-grouped mode, which is wrong
+            # for resume routing — see resume routing block).
+            _stage_opt_step = resume_stage_completed_steps if resumed_stage else 0
             # vocab size is constant; grab from the dataset's vocab object.
             vocab_size = _stage_ds._vocab.size
 
-            # Build a val-side DataLoader for _run_validation.
-            # Uses the same dataset_mix ratios as training but fetches from
-            # split="val" entries.  augment=False: no augmentation during eval.
-            # The sampler is sized to cover validation_batches * batch_size draws
-            # (with replacement) so the iterator never exhausts during a single
-            # validation cycle.  A fresh iter() is called inside _run_validation.
-            _val_dataset = StageBDataset(
-                stage,
-                grouped_entries,
-                split="val",
-                project_root=project_root,
-                image_height=image_height,
-                image_width=image_width,
-                max_sequence_length=stage.max_sequence_length,
-                augment=False,
-                rng_seed=seed,
-            )
-            _val_total_samples = validation_batches * stage.batch_size
-            _val_sampler = build_stage_b_sampler(
-                stage,
-                _val_dataset,
-                total_samples=_val_total_samples,
-                seed=seed,
-                split_override="val",
-            )
-            _val_loader = torch.utils.data.DataLoader(
-                _val_dataset,
-                batch_size=stage.batch_size,
-                sampler=_val_sampler,
-                num_workers=num_workers,
-                pin_memory=_pin_memory,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=_effective_prefetch,
-                collate_fn=StageBDataset.collate_fn,
-                worker_init_fn=stage_b_worker_init_fn,
-            )
+            # Build val-side DataLoader(s) for validation.
+            #
+            # Tier-grouped (Stage 3+): build ONE loader per dataset so we can
+            # report stratified per-dataset val_loss (Decision #4 of the Stage 3
+            # plan: 4 disjoint validation passes).  Each per-dataset loader uses
+            # the tier-appropriate batch size (b_cached / b_live) since cached
+            # tensors are tiny relative to live images.
+            #
+            # Legacy (Stage 1 / Stage 2 v2): a single mixed loader sampled from
+            # all datasets at once via the WeightedRandomSampler.  Behavior
+            # unchanged from previous releases.
+            if stage.tier_grouped_sampling:
+                cache_root_path = (
+                    (project_root / stage.cache_root).resolve() if stage.cache_root else None
+                )
+                _per_dataset_val_loaders: "Optional[Dict[str, object]]" = {}
+                for mix_item in stage.dataset_mix:
+                    _ds_entries = grouped_entries.get((mix_item.dataset, "val"), [])
+                    if not _ds_entries:
+                        continue
+                    _val_ds_for_dataset = StageBDataset(
+                        stage,
+                        # Restrict to a single (dataset, "val") key so the
+                        # dataset's `entries` only contains this dataset's rows.
+                        {(mix_item.dataset, "val"): _ds_entries},
+                        split="val",
+                        project_root=project_root,
+                        image_height=image_height,
+                        image_width=image_width,
+                        max_sequence_length=stage.max_sequence_length,
+                        augment=False,
+                        rng_seed=seed,
+                        cache_root=cache_root_path,
+                        cache_hash16=stage.cache_hash16,
+                    )
+                    if len(_val_ds_for_dataset) == 0:
+                        continue
+                    _bs_for_ds = (
+                        stage.b_cached if mix_item.dataset in _CACHED_DATASETS else stage.b_live
+                    )
+                    _val_total_for_ds = validation_batches * _bs_for_ds
+                    _ds_sampler = torch.utils.data.RandomSampler(
+                        _val_ds_for_dataset,
+                        replacement=True,
+                        num_samples=_val_total_for_ds,
+                        generator=torch.Generator().manual_seed(seed),
+                    )
+                    _per_dataset_val_loaders[mix_item.dataset] = torch.utils.data.DataLoader(
+                        _val_ds_for_dataset,
+                        batch_size=_bs_for_ds,
+                        sampler=_ds_sampler,
+                        num_workers=num_workers,
+                        pin_memory=_pin_memory,
+                        persistent_workers=(num_workers > 0),
+                        prefetch_factor=_effective_prefetch,
+                        collate_fn=StageBDataset.collate_fn,
+                        worker_init_fn=stage_b_worker_init_fn,
+                    )
+                _val_loader = None  # Sentinel: dispatch uses _per_dataset_val_loaders below.
+            else:
+                # Legacy single-pass val loader (Stage 1 / Stage 2 v2). Unchanged.
+                _val_dataset = StageBDataset(
+                    stage,
+                    grouped_entries,
+                    split="val",
+                    project_root=project_root,
+                    image_height=image_height,
+                    image_width=image_width,
+                    max_sequence_length=stage.max_sequence_length,
+                    augment=False,
+                    rng_seed=seed,
+                )
+                _val_total_samples = validation_batches * stage.batch_size
+                _val_sampler = build_stage_b_sampler(
+                    stage,
+                    _val_dataset,
+                    total_samples=_val_total_samples,
+                    seed=seed,
+                    split_override="val",
+                )
+                _val_loader = torch.utils.data.DataLoader(
+                    _val_dataset,
+                    batch_size=stage.batch_size,
+                    sampler=_val_sampler,
+                    num_workers=num_workers,
+                    pin_memory=_pin_memory,
+                    persistent_workers=(num_workers > 0),
+                    prefetch_factor=_effective_prefetch,
+                    collate_fn=StageBDataset.collate_fn,
+                    worker_init_fn=stage_b_worker_init_fn,
+                )
+                _per_dataset_val_loaders = None
 
             timer.reset_step()
+            # Tier-grouped accumulation: tracks position within the current tier
+            # block. Reset to 0 at each opt-step boundary. Only used when
+            # stage.tier_grouped_sampling=True; legacy path uses stage_step % accum.
+            _tier_block_micro_idx = 0
 
-            for stage_step in range(stage_start_step, stage_total_steps + 1):
-                if (stage_step - 1) % stage.grad_accumulation_steps == 0:
-                    timer.reset_step()
+            for stage_step in range(stage_start_step, _loop_bound + 1):
+                if stage.tier_grouped_sampling:
+                    # Reset step timer at every tier-block boundary (start of a
+                    # new opt-step block). _tier_block_micro_idx==0 means the
+                    # previous opt-step (if any) just completed cleanly.
+                    if _tier_block_micro_idx == 0:
+                        timer.reset_step()
+                else:
+                    if (stage_step - 1) % stage.grad_accumulation_steps == 0:
+                        timer.reset_step()
                 with timer.cpu("sample"):
                     try:
                         _batch_dict = next(_train_iter)
@@ -2196,7 +2787,10 @@ def run_execute_mode(
                         # Defensive rebuild: iterator exhausted (correct
                         # total_samples sizing should prevent this, but guard
                         # against checkpoint restarts / sampler edge cases).
-                        _mid_window = (stage_step - 1) % stage.grad_accumulation_steps != 0
+                        if stage.tier_grouped_sampling:
+                            _mid_window = _tier_block_micro_idx != 0
+                        else:
+                            _mid_window = (stage_step - 1) % stage.grad_accumulation_steps != 0
                         if _mid_window:
                             # Partial accumulation window: accumulated gradients
                             # represent fewer micro-batches than expected.
@@ -2207,33 +2801,76 @@ def run_execute_mode(
                                 " window — gradient discarded",
                                 flush=True,
                             )
+                            if stage.tier_grouped_sampling:
+                                # Abandon the partial block: reset block index so
+                                # the rebuilt iterator's first batch starts fresh.
+                                _tier_block_micro_idx = 0
                         _train_iter = iter(_train_loader)
                         _batch_dict = next(_train_iter)
-                if _batch_dict is None:
-                    break
+                        if stage.tier_grouped_sampling:
+                            # Resync _batch_idx_consumed to the rebuilt
+                            # iterator's actual position. The standard
+                            # `_batch_idx_consumed += 1` below then leaves it
+                            # at (_start_idx + 1), the position of the next
+                            # un-consumed batch — without this resync the
+                            # counter inflates and the next checkpoint's
+                            # last_batch_idx skips too far on resume.
+                            _batch_idx_consumed = _resync_batch_idx_after_rebuild(
+                                _train_loader.batch_sampler
+                            )
+                # Tier-grouped resume bookkeeping (Decision #6): count every
+                # micro-batch successfully consumed by the iterator, NOT every
+                # opt-step.  Persisted into the checkpoint so a resumed run can
+                # call _TierGroupedBatchSampler.set_start_idx and skip past the
+                # already-consumed prefix.
+                _batch_idx_consumed += 1
                 epoch_index = ((stage_step - 1) // stage_steps_per_epoch) + 1
                 epoch_step = ((stage_step - 1) % stage_steps_per_epoch) + 1
                 with timer.cpu("h2d"):
-                    if channels_last:
-                        images = _batch_dict["images"].to(device, non_blocking=True, memory_format=torch.channels_last)
-                    else:
-                        images = _batch_dict["images"].to(device, non_blocking=True)
-                    decoder_inputs = _batch_dict["decoder_inputs"].to(device, non_blocking=True)
                     labels = _batch_dict["labels"].to(device, non_blocking=True)
                     contour_targets = _batch_dict["contour_targets"].to(device, non_blocking=True)
 
-                accum_steps = stage.grad_accumulation_steps
-                is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
-                if (stage_step - 1) % accum_steps == 0:
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
+                # Per-batch accum_steps: tier-aware when tier_grouped_sampling is on.
+                # Tier-grouped sampler emits batches in contiguous tier blocks of
+                # size accum_steps; the opt-step boundary is the LAST batch of each
+                # block, tracked by per-tier-block micro-batch index.
+                if stage.tier_grouped_sampling:
+                    accum_steps = _grad_accum_for_batch(
+                        _batch_dict,
+                        grad_accum_cached=stage.grad_accumulation_steps_cached,
+                        grad_accum_live=stage.grad_accumulation_steps_live,
+                    )
+                    # The fallback `stage_step == _loop_bound` is technically
+                    # redundant — the tier-grouped sampler emits contiguous
+                    # tier blocks, so the LAST batch of the schedule is always
+                    # a tier-block boundary and the primary check fires.  Keep
+                    # the fallback as belt-and-suspenders, comparing against
+                    # _loop_bound (total_batches) rather than stage_total_steps
+                    # (opt-step target) so the comparison is dimensionally
+                    # correct.
+                    is_accum_step = (
+                        _tier_block_micro_idx + 1 == accum_steps
+                    ) or stage_step == _loop_bound
+                    if _tier_block_micro_idx == 0:
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
+                    _tier_block_micro_idx = (_tier_block_micro_idx + 1) % accum_steps
+                else:
+                    accum_steps = stage.grad_accumulation_steps
+                    is_accum_step = (stage_step % accum_steps) == 0 or stage_step == stage_total_steps
+                    if (stage_step - 1) % accum_steps == 0:
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_corruption = torch.zeros((), dtype=torch.bool, device=device)
                 with timer.gpu("forward"):
                     with torch.autocast(
                         device_type=device.type,
                         dtype=torch.bfloat16,
                         enabled=bf16_enabled,
                     ):
-                        outputs = model(pixel_values=images, input_ids=decoder_inputs, return_aux=True)
+                        outputs = _forward_batch_for_train(
+                            model, _batch_dict, device,
+                            bf16_enabled=bf16_enabled, channels_last=channels_last,
+                        )
                         token_loss = F.cross_entropy(
                             outputs["logits"].reshape(-1, vocab_size),
                             labels.reshape(-1),
@@ -2330,6 +2967,7 @@ def run_execute_mode(
                 _loss_scalar_cache = loss.detach().item() * accum_steps
                 losses.append(_loss_scalar_cache)
                 global_step += 1
+                _stage_opt_step += 1
 
                 lr_map = {group.get("group_name", f"group_{idx}"): group["lr"] for idx, group in enumerate(optimizer.param_groups)}
                 validation_result = None
@@ -2337,16 +2975,28 @@ def run_execute_mode(
                 if global_step % stage.validate_every_steps == 0:
                     import time as _time
                     _val_t0 = _time.perf_counter()
-                    validation_result = _run_validation(
-                        model=model,
-                        stage=stage,
-                        val_loader=_val_loader,
-                        device=device,
-                        bf16_enabled=bf16_enabled,
-                        validation_batches=validation_batches,
-                        vocab_size=vocab_size,
-                        channels_last=channels_last,
-                    )
+                    if stage.tier_grouped_sampling and _per_dataset_val_loaders is not None:
+                        # Stage 3+: 4 disjoint per-dataset passes with
+                        # sample-weighted aggregate val_loss (Decision #4).
+                        validation_result = _run_validation_per_dataset(
+                            model, stage, _per_dataset_val_loaders, device,
+                            bf16_enabled=bf16_enabled,
+                            validation_batches=validation_batches,
+                            vocab_size=vocab_size,
+                            channels_last=channels_last,
+                        )
+                    else:
+                        # Legacy Stage 1 / Stage 2 v2 path. Unchanged.
+                        validation_result = _run_validation(
+                            model=model,
+                            stage=stage,
+                            val_loader=_val_loader,
+                            device=device,
+                            bf16_enabled=bf16_enabled,
+                            validation_batches=validation_batches,
+                            vocab_size=vocab_size,
+                            channels_last=channels_last,
+                        )
                     _validation_ms = (_time.perf_counter() - _val_t0) * 1000.0
                     if validation_result is not None:
                         validation_events.append(
@@ -2356,6 +3006,37 @@ def run_execute_mode(
                                 **validation_result,
                             }
                         )
+                        # Sanity halt (Spec line 226): val_loss > 5.0 in first
+                        # 200 steps OR NaN at any step. Fires BEFORE best.pt
+                        # write so a corrupt validation never overwrites the
+                        # stable best checkpoint.
+                        halt_msg, should_halt = _should_sanity_halt(
+                            val_loss=validation_result["val_loss"],
+                            global_step=global_step,
+                        )
+                        if should_halt:
+                            print(
+                                f"[train] HALT (sanity): {halt_msg} at global_step={global_step}",
+                                flush=True,
+                            )
+                            # Use the already-open step_writer rather than
+                            # re-opening step_log_path (which would race with
+                            # the buffered writer on Windows). Drain any
+                            # pending buffered rows first so they precede the
+                            # halt event in the log.
+                            if step_writer is not None:
+                                if _step_log_buffer:
+                                    step_writer.writelines(_step_log_buffer)
+                                    _step_log_buffer.clear()
+                                step_writer.write(json.dumps({
+                                    "event": "sanity_halt",
+                                    "global_step": global_step,
+                                    "val_loss": validation_result["val_loss"],
+                                    "reason": halt_msg,
+                                }) + "\n")
+                                step_writer.flush()
+                                step_writer.close()
+                            sys.exit(1)
                         # Save a stable _best.pt whenever val_loss improves.
                         if checkpoint_dir is not None:
                             current_val = validation_result.get("val_loss")
@@ -2371,11 +3052,16 @@ def run_execute_mode(
                                         scheduler=scheduler,
                                         stage_name=stage.stage_name,
                                         global_step=global_step,
-                                        stage_step=stage_step,
+                                        stage_step=_stage_opt_step,
                                         stage_steps_total=stage_total_steps,
                                         stage_b_config=stage_b_config_dict,
                                         name_suffix="best",
                                         best_val_loss=best_val_loss,
+                                        last_batch_idx=(
+                                            _batch_idx_consumed
+                                            if stage.tier_grouped_sampling
+                                            else None
+                                        ),
                                     )
 
                 _checkpoint_ms: Optional[float] = None
@@ -2389,10 +3075,15 @@ def run_execute_mode(
                         scheduler=scheduler,
                         stage_name=stage.stage_name,
                         global_step=global_step,
-                        stage_step=stage_step,
+                        stage_step=_stage_opt_step,
                         stage_steps_total=stage_total_steps,
                         stage_b_config=stage_b_config_dict,
                         best_val_loss=best_val_loss,
+                        last_batch_idx=(
+                            _batch_idx_consumed
+                            if stage.tier_grouped_sampling
+                            else None
+                        ),
                     )
                     checkpoints_written.append(str(checkpoint_path))
                     _checkpoint_ms = (_time.perf_counter() - _ckpt_t0) * 1000.0
@@ -2423,7 +3114,8 @@ def run_execute_mode(
                         record = {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                             "global_step": global_step,
-                            "stage_step": stage_step,
+                            "stage_step": _stage_opt_step,
+                            "stage_step_microbatches": stage_step,
                             "stage_steps_total": stage_total_steps,
                             "epoch_index": epoch_index,
                             "epoch_step": epoch_step,
@@ -2439,7 +3131,11 @@ def run_execute_mode(
                             "grad_norm": grad_norm_value,
                             "grad_norm_groups": grad_norms,
                             "grad_alerts": grad_alert_messages,
-                            "batch_size": int(images.shape[0]),
+                            "batch_size": int(
+                                _batch_dict["images"].shape[0]
+                                if "images" in _batch_dict
+                                else _batch_dict["encoder_hidden"].shape[0]
+                            ),
                             "max_sequence_length": stage.max_sequence_length,
                             # window_was_corrupted is always False on the JSONL-write
                             # path (corrupted windows continue earlier at the opt-step
@@ -2449,6 +3145,19 @@ def run_execute_mode(
                             "bf16_enabled": bf16_enabled,
                             "validation": validation_result,
                         }
+                        # Stage 3 stratified val_loss: surface per-dataset
+                        # losses at the top level of the row so downstream
+                        # log consumers don't need to dig into "validation".
+                        # Legacy stages (no per-dataset key) write nothing.
+                        if validation_result is not None:
+                            if "val_loss_per_dataset" in validation_result:
+                                record["val_loss_per_dataset"] = validation_result[
+                                    "val_loss_per_dataset"
+                                ]
+                            if "val_contour_loss_per_dataset" in validation_result:
+                                record["val_contour_loss_per_dataset"] = validation_result[
+                                    "val_contour_loss_per_dataset"
+                                ]
                         _step_log_buffer.append(json.dumps(record) + "\n")
                         # Flush buffer to disk on: cadence step, validation event,
                         # checkpoint event, or when a validation result is present.
@@ -2482,11 +3191,16 @@ def run_execute_mode(
                     scheduler=scheduler,
                     stage_name=stage.stage_name,
                     global_step=global_step,
-                    stage_step=stage_step,
+                    stage_step=_stage_opt_step,
                     stage_steps_total=stage_total_steps,
                     stage_b_config=stage_b_config_dict,
                     name_suffix="final",
                     best_val_loss=best_val_loss,
+                    last_batch_idx=(
+                        _batch_idx_consumed
+                        if stage.tier_grouped_sampling
+                        else None
+                    ),
                 )
                 checkpoints_written.append(str(final_path))
 

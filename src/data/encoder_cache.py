@@ -64,6 +64,23 @@ def _sanitize_sample_key(sample_id: str) -> str:
     return sample_id
 
 
+def _sanitize_sample_key_legacy(sample_id: str) -> str:
+    """Lossy '__' escape used by caches built before 2026-05-09.
+
+    Backwards-compat ONLY: ``read_cache_entry`` falls back to this scheme when
+    the new-scheme path is missing on disk, so existing 1.4 TB caches built
+    pre-fix remain usable without rebuild. Do NOT use for new writes.
+    """
+    if ":" in sample_id:
+        sample_id = sample_id.split(":", 1)[1]
+    return (
+        sample_id
+        .replace("/", "__")
+        .replace(":", "__")
+        .replace("\\", "__")
+    )
+
+
 def compute_cache_hash(
     encoder_weights_path: Path,
     preproc_cfg: dict,

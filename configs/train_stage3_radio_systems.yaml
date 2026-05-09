@@ -1,0 +1,87 @@
+# Stage 3 Phase 1 — frozen-encoder training on systems-aware multi-staff data.
+#
+# Resumes from Stage 2 v2 best.pt (val_loss 0.148, step 4000) with the encoder
+# (and encoder-side DoRA adapters) frozen. Trainable surface: decoder +
+# cross-attention + LM head + positional_bridge.
+#
+# Two-tier dataloader: 90% opt-step share on cached features (215,985 samples,
+# read from data/cache/encoder/ac8948ae4b5be3e9/), 10% on live cameraprimus
+# with augmentation.
+#
+# Run command (executed on GPU box at 10.10.1.29):
+#   ssh 10.10.1.29 'cd "C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO" && \
+#     venv-cu132\Scripts\python -u src/train/train.py \
+#       --stage-configs configs/train_stage3_radio_systems.yaml \
+#       --mode execute \
+#       --resume-checkpoint checkpoints/full_radio_stage2_systems_v2/stage2-radio-systems-polyphonic_best.pt \
+#       --start-stage stage3-radio-systems-frozen-encoder \
+#       --checkpoint-dir checkpoints/full_radio_stage3_v2 \
+#       --token-manifest src/data/manifests/token_manifest_stage3.jsonl \
+#       --step-log logs/full_radio_stage3_v2_steps.jsonl'
+#
+# v2 extends target from 4500 → 6000 per spec step-extension protocol; v1
+# completed cleanly with val_loss=0.169 (camera=0.143 below Stage 2 v2 anchor)
+# and was still descending at the 4500 cap. v2 re-runs from Stage 2 v2 init
+# with the cosine schedule reshaped over 6000 steps; v1's best.pt is preserved
+# at checkpoints/v1_phase1_safe/.
+
+stage_name: stage3-radio-systems-frozen-encoder
+stage_b_encoder: radio_h
+
+# Step target: 6000 opt-steps (extended from 4500 per spec lines 201–210; manual
+# review at 4500 found val_loss still descending). Cap at 7500 if v2 also
+# descends at 6000.
+epochs: 1
+effective_samples_per_epoch: 6000    # OPT-STEP target; tier-grouped planner derives total_batches=10200 (5400 cached × 1 + 600 live × 8) so the for-loop iterates 10200 times.
+batch_size: 1                        # SENTINEL — unused when tier_grouped_sampling=True
+max_sequence_length: 512
+grad_accumulation_steps: 1           # SENTINEL — unused when tier_grouped_sampling=True
+
+# Tier-aware mode (Stage 3 only). When tier_grouped_sampling=true the trainer
+# uses b_cached/b_live + grad_accumulation_steps_cached/grad_accumulation_steps_live
+# in place of batch_size + grad_accumulation_steps.
+tier_grouped_sampling: true
+b_cached: 16
+b_live: 2
+grad_accumulation_steps_cached: 1
+grad_accumulation_steps_live: 8
+cached_data_ratio: 0.90              # 90% opt-step gradient signal on cached tier
+cache_root: data/cache/encoder
+cache_hash16: ac8948ae4b5be3e9
+
+# Optimizer (matches Stage 2 v2 LR pattern; encoder-side DoRA is frozen, so
+# lr_dora applies only to decoder-side adapters).
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 500
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.01
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 500
+validate_every_steps: 500
+
+# dataset_mix in tier-grouped mode applies WITHIN the cached tier; the live tier
+# (cameraprimus_systems) is drawn separately by build_tier_grouped_sampler at
+# the batch-list level. cameraprimus_systems entry-weight inside the cached pool
+# is 0 (it's the live tier's exclusive dataset).
+dataset_mix:
+  - dataset: synthetic_systems
+    ratio: 0.7778     # 70 / 90 within the cached tier
+    split: train
+    required: true
+  - dataset: grandstaff_systems
+    ratio: 0.1111     # 10 / 90
+    split: train
+    required: true
+  - dataset: primus_systems
+    ratio: 0.1111     # 10 / 90
+    split: train
+    required: true
+  - dataset: cameraprimus_systems
+    ratio: 0.0        # weight 0 within the cached weighting; live tier draws from this dataset directly
+    split: train
+    required: true
