@@ -122,12 +122,12 @@ def test_sanitize_sample_key_strips_dataset_prefix() -> None:
 
 def test_sanitize_sample_key_replaces_slash() -> None:
     from src.data.encoder_cache import _sanitize_sample_key
-    assert _sanitize_sample_key("primus:dir/sub/file") == "dir__sub__file"
+    assert _sanitize_sample_key("primus:dir/sub/file") == "dir_SLASH_sub_SLASH_file"
 
 
 def test_sanitize_sample_key_replaces_backslash() -> None:
     from src.data.encoder_cache import _sanitize_sample_key
-    assert _sanitize_sample_key("grandstaff_systems:dir\\sub\\file") == "dir__sub__file"
+    assert _sanitize_sample_key("grandstaff_systems:dir\\sub\\file") == "dir_BSLASH_sub_BSLASH_file"
 
 
 def test_sanitize_sample_key_no_op_on_clean_key() -> None:
@@ -139,7 +139,29 @@ def test_sanitize_sample_key_colon_in_body_replaced() -> None:
     """A colon that is NOT the dataset-prefix separator (e.g. after the first colon) is replaced."""
     from src.data.encoder_cache import _sanitize_sample_key
     # "ds:body:extra" → strip "ds:", then replace ":" in "body:extra"
-    assert _sanitize_sample_key("ds:body:extra") == "body__extra"
+    assert _sanitize_sample_key("ds:body:extra") == "body_COLON_extra"
+
+
+def test_sanitize_handles_double_underscore_in_body() -> None:
+    """An ID containing '__' must not collide with one containing '/' after sanitization.
+
+    Under the old lossy '__' escape:
+      'Abbott__p001__sys00'  →  'Abbott__p001__sys00'
+      'Abbott__p001/sys00'   →  'Abbott__p001__sys00'  (collision!)
+
+    Under the new reversible escape:
+      'Abbott__p001__sys00'  →  'Abbott__p001__sys00'
+      'Abbott__p001/sys00'   →  'Abbott__p001_SLASH_sys00'  (no collision)
+    """
+    from src.data.encoder_cache import _sanitize_sample_key
+
+    key_dunder = _sanitize_sample_key("synthetic_systems:Abbott__p001__sys00")
+    key_slash = _sanitize_sample_key("synthetic_systems:Abbott__p001/sys00")
+    assert key_dunder != key_slash, (
+        f"Collision: both '{key_dunder}' and '{key_slash}' map to the same sanitized key"
+    )
+    assert key_dunder == "Abbott__p001__sys00"
+    assert key_slash == "Abbott__p001_SLASH_sys00"
 
 
 # ---------------------------------------------------------------------------

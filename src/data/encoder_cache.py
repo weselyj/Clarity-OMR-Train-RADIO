@@ -42,11 +42,25 @@ def _sanitize_sample_key(sample_id: str) -> str:
     Rules:
       1. If sample_id contains ':', strip everything up to and including the
          first ':' (removes the '<dataset>:' prefix).
-      2. Replace any remaining '/', ':', '\\' with '__'.
+      2. Replace any remaining '/', ':', '\\' with token-safe escape sequences
+         (_SLASH_, _COLON_, _BSLASH_) so the mapping is reversible and two
+         distinct IDs can never collide after sanitization (unlike the previous
+         '__' escape, where e.g. 'Abbott__p001__sys00' and
+         'Abbott__p001/sys00' would both become 'Abbott__p001__sys00').
+
+    Note: Legacy caches built before 2026-05-09 used a lossy single-'__' escape;
+    rebuilds use this reversible escape. The old and new escapes produce different
+    filenames only for IDs that contain '/', ':', or '\\'; sample IDs consisting
+    purely of alphanumerics and '__' are unaffected.
     """
     if ":" in sample_id:
         sample_id = sample_id.split(":", 1)[1]
-    sample_id = sample_id.replace("/", "__").replace(":", "__").replace("\\", "__")
+    sample_id = (
+        sample_id
+        .replace("/", "_SLASH_")
+        .replace(":", "_COLON_")
+        .replace("\\", "_BSLASH_")
+    )
     return sample_id
 
 
