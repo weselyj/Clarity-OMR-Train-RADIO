@@ -15,17 +15,24 @@
 #       --mode execute \
 #       --resume-checkpoint checkpoints/full_radio_stage2_systems_v2/stage2-radio-systems-polyphonic_best.pt \
 #       --start-stage stage3-radio-systems-frozen-encoder \
-#       --checkpoint-dir checkpoints/full_radio_stage3_v1 \
+#       --checkpoint-dir checkpoints/full_radio_stage3_v2 \
 #       --token-manifest src/data/manifests/token_manifest_stage3.jsonl \
-#       --step-log logs/full_radio_stage3_v1_steps.jsonl'
+#       --step-log logs/full_radio_stage3_v2_steps.jsonl'
+#
+# v2 extends target from 4500 → 6000 per spec step-extension protocol; v1
+# completed cleanly with val_loss=0.169 (camera=0.143 below Stage 2 v2 anchor)
+# and was still descending at the 4500 cap. v2 re-runs from Stage 2 v2 init
+# with the cosine schedule reshaped over 6000 steps; v1's best.pt is preserved
+# at checkpoints/v1_phase1_safe/.
 
 stage_name: stage3-radio-systems-frozen-encoder
 stage_b_encoder: radio_h
 
-# Step target: 4500 opt-steps. Manual extension protocol at 4500 → 6000 → 7500
-# (see spec lines 201–210).
+# Step target: 6000 opt-steps (extended from 4500 per spec lines 201–210; manual
+# review at 4500 found val_loss still descending). Cap at 7500 if v2 also
+# descends at 6000.
 epochs: 1
-effective_samples_per_epoch: 4500    # OPT-STEP target consumed by the tier-grouped planner; the planner derives total_batches=7650 (4050 cached × 1 + 450 live × 8) so the for-loop iterates 7650 times to complete all 4500 opt-steps.
+effective_samples_per_epoch: 6000    # OPT-STEP target; tier-grouped planner derives total_batches=10200 (5400 cached × 1 + 600 live × 8) so the for-loop iterates 10200 times.
 batch_size: 1                        # SENTINEL — unused when tier_grouped_sampling=True
 max_sequence_length: 512
 grad_accumulation_steps: 1           # SENTINEL — unused when tier_grouped_sampling=True
