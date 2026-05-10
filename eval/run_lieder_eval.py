@@ -25,10 +25,9 @@ runs/detect/runs/yolo26m_systems/weights/best.pt; override via
 DoRA-wrapped (PEFT base_model.model.* with lora_*) checkpoint format
 automatically and applies _prepare_model_for_dora before load_state_dict.
 
-Defaults to greedy decode (beam_width=1, max_decode_steps=256) — fast enough
-for the MVP gate where the goal is just "any non-NaN F1 means inference works."
-For real eval against a Stage 3 checkpoint, override with --beam-width 5
---max-decode-steps 512.
+Defaults to greedy decode (beam_width=1, max_decode_steps=2048) — aligned
+with SystemInferencePipeline's per-system-crop default. Override --beam-width
+to 5 for higher-quality (slower) decoding.
 
 NOTE: --config is metadata-only. The config path is validated at startup (to
 catch typos early) and written to the per-piece status JSONL as run metadata,
@@ -294,7 +293,8 @@ def _run_piece(
     return record
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Construct the run_lieder_eval CLI parser. Module-level for testability."""
     p = argparse.ArgumentParser(
         description="Inference-only pass: run Stage B checkpoint on the Lieder eval split "
                     "and write predicted MusicXML + Stage-D diagnostics sidecars to disk. "
@@ -321,8 +321,9 @@ def main() -> None:
         help="Stage-B beam width (default 1 = greedy; ~5x slower per beam at 5)",
     )
     p.add_argument(
-        "--max-decode-steps", type=int, default=256,
-        help="Stage-B max decode steps per staff (default 256; full quality is 512)",
+        "--max-decode-steps", type=int, default=2048,
+        help="Stage-B max decode steps per system crop (default 2048; aligns with "
+             "SystemInferencePipeline default).",
     )
     p.add_argument(
         "--max-pieces", type=int, default=None,
@@ -372,6 +373,11 @@ def main() -> None:
             "Enables tree-edit-distance normalization in the scorer."
         ),
     )
+    return p
+
+
+def main() -> None:
+    p = build_argument_parser()
     args = p.parse_args()
 
     # --- Validate inputs ---------------------------------------------------
