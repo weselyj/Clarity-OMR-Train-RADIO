@@ -1,6 +1,6 @@
 # Pre-cu132 Baseline (2026-04-27)
 
-Captured before installing the PyTorch nightly built against CUDA 13.2 on the Windows training host (10.10.1.29).
+Captured before installing the PyTorch nightly built against CUDA 13.2 on the Windows training host (the GPU box).
 
 Plan: [`docs/superpowers/plans/2026-04-27-pytorch-nightly-cu132.md`](../../docs/superpowers/plans/2026-04-27-pytorch-nightly-cu132.md).
 
