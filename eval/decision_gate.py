@@ -28,14 +28,15 @@ STRONG_THRESHOLD = 0.30
 MIXED_THRESHOLD = 0.2410
 
 # Spec §"Phase 2 §2" line 254-262. Per-dataset Stage 3 quality floors (revised
-# 2026-05-09 — 7 entries via _systems analogs from token_manifest_stage3.jsonl
-# + single-staff originals from token_manifest_full.jsonl).
+# 2026-05-10 per Plan D Decision #4 revision — single-staff variants of
+# grandstaff and primus are confirming context, not gating, since Stage 3 was
+# trained on _systems only and the single-staff regression is by design;
+# cameraprimus single-staff retained because it doubles as a regression
+# tripwire for the cameraprimus baseline.).
 PER_DATASET_FLOORS = {
     "synthetic_systems": 90.0,
     "grandstaff_systems": 95.0,
-    "grandstaff": 90.0,
     "primus_systems": 80.0,
-    "primus": 80.0,
     # cameraprimus + cameraprimus_systems are dynamic — see _resolve_cameraprimus_floor().
 }
 CAMERAPRIMUS_FLOOR_BASE = 75.0
@@ -100,8 +101,10 @@ def evaluate(
         lieder_mean_onset_f1: from eval/results/lieder_<name>.csv
         musicxml_validity_rate: from same CSV (corroborating only)
         per_dataset: dict {dataset_name: composite quality_score, 0-100 scale};
-            7 keys expected (synthetic_systems, grandstaff_systems, grandstaff,
-            primus_systems, primus, cameraprimus_systems, cameraprimus)
+            5 gated keys (synthetic_systems, grandstaff_systems, primus_systems,
+            cameraprimus_systems, cameraprimus). Single-staff grandstaff/primus
+            may be present in the dict but are not gated (Plan D Decision #4
+            revision — confirming context only).
         cameraprimus_systems_baseline: Stage 2 v2 quality on token_manifest_stage3.jsonl
         cameraprimus_baseline: Stage 2 v2 quality on token_manifest_full.jsonl
         lc6548281_onset_f1: optional sanity-check value (None if not evaluated)
@@ -163,7 +166,7 @@ def render_report(result: GateResult, *, name: str = "stage3_v2") -> str:
     lines.append("")
     lines.append("| Dataset | Measured | Floor | Status |")
     lines.append("|---|---|---|---|")
-    for ds in ["synthetic_systems", "grandstaff_systems", "grandstaff", "primus_systems", "primus", "cameraprimus_systems", "cameraprimus"]:
+    for ds in ["synthetic_systems", "grandstaff_systems", "primus_systems", "cameraprimus_systems", "cameraprimus"]:
         r = result.per_dataset_results.get(ds)
         if r is None:
             lines.append(f"| {ds} | — | — | MISSING |")
