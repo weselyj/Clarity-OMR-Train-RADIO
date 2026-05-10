@@ -16,7 +16,6 @@ from src.models.davit_stage_b import (
     list_dora_target_modules,
     run_stage_b_shape_smoke_test,
 )
-from src.models.yolo_stage_a import YoloStageA, YoloStageAConfig
 
 
 @dataclass(frozen=True)
@@ -75,16 +74,6 @@ def list_radio_dora_target_modules() -> list[str]:
         "up_proj",
         "down_proj",
     ]
-
-
-def build_stage_a_model(config: Optional[ModelFactoryConfig] = None) -> YoloStageA:
-    cfg = config or ModelFactoryConfig()
-    stage_a_config = YoloStageAConfig(
-        weights_path=cfg.stage_a_weights_path,
-        confidence_threshold=cfg.stage_a_confidence_threshold,
-        iou_threshold=cfg.stage_a_iou_threshold,
-    )
-    return YoloStageA(stage_a_config)
 
 
 def build_stage_b_components(config: Optional[ModelFactoryConfig] = None) -> Dict[str, object]:
