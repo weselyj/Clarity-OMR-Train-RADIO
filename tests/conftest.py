@@ -3,8 +3,8 @@
 Skips tests under CUDA-required directories when torch is unavailable or
 torch.cuda.is_available() returns False, with an informative reason.
 
-Pure-Python tests (tests/data, tests/tokenizer, tests/decoding) continue
-to run without CUDA.
+Pure-Python tests outside the directories named in CUDA_REQUIRED_DIRS
+continue to run without CUDA.
 """
 
 from pathlib import Path

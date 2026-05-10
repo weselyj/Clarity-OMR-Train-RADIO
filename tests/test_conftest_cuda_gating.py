@@ -1,6 +1,5 @@
 """Tests for the CUDA-gating conftest helper."""
 
-from pathlib import Path
 from unittest import mock
 
 
