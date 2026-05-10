@@ -9,13 +9,19 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from src.eval.metrics import default_ablation_matrix
 from src.eval.run_eval import evaluate_rows
+
+# Datasets whose encoder features may be present in the encoder cache.
+# Mirrors _CACHED_DATASETS in src/train/train.py.
+_CACHED_DATASETS = frozenset(
+    {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+)
 
 
 def _resolve_path(project_root: Path, value: Path) -> Path:
@@ -153,6 +159,115 @@ def _build_eval_rows(prediction_rows: Sequence[Dict[str, object]]) -> List[Dict[
     return rows
 
 
+def _encode_from_cached_features(decode_model, cached_features, h16: int, w16: int):
+    """Run deformable_attention + positional_bridge on cached raw RADIO features.
+
+    The encoder cache stores raw RADIO spatial output (seq_tokens, 1280) before
+    the deformable attention and positional bridge (1280→768).  This function
+    re-runs those two trainable stages so the output ``memory`` tensor has the
+    correct 768-dim shape expected by cross_attn_k in each decoder block.
+
+    Args:
+        decode_model: The unwrapped RadioStageB instance (or a compatible model
+            with ``deformable_attention`` and ``positional_bridge`` attributes).
+        cached_features: Tensor of shape (seq_tokens, 1280) as loaded from cache
+            (typically bfloat16; will be cast to match the model parameter dtype).
+        h16: spatial height (H/16) before flattening.
+        w16: spatial width (W/16) before flattening.
+
+    Returns:
+        memory tensor of shape (1, seq_tokens, 768) ready for decode_tokens.
+    """
+    import torch
+
+    # Cast cached bfloat16 features to the model's working dtype so the
+    # deformable_attention and positional_bridge matmuls do not type-mismatch.
+    model_dtype = next(decode_model.deformable_attention.parameters()).dtype
+    cached_features = cached_features.to(dtype=model_dtype)
+
+    # cached_features: (seq_tokens, 1280) — add batch dim → (1, seq_tokens, 1280)
+    seq_tensor = cached_features.unsqueeze(0)  # (1, seq_tokens, 1280)
+    B, seq_tokens, C = seq_tensor.shape
+    # Reshape to (B, C, H/16, W/16) for deformable attention
+    feature_map = seq_tensor.transpose(1, 2).reshape(B, C, h16, w16)
+    # Deformable attention (same as live encode_staff path)
+    sequence = feature_map.flatten(2).transpose(1, 2)
+    with torch.inference_mode():
+        sequence = decode_model.deformable_attention(sequence, h16, w16)
+        sequence = sequence.transpose(1, 2).reshape(B, C, h16, w16)
+        memory, _ = decode_model.positional_bridge(sequence)
+    return memory  # (1, seq_tokens, 768)
+
+
+def _resolve_cache_memory(
+    *,
+    decode_model,
+    pixel_values,
+    dataset: str,
+    sample_id: str,
+    cache_root: Optional[Path],
+    cache_hash: Optional[str],
+    device,
+    use_fp16: bool,
+):
+    """Return encoder memory for one sample, using the cache when available.
+
+    The encoder cache stores raw RADIO spatial output (seq_tokens, 1280) before
+    the deformable attention and positional bridge.  When a cache hit occurs,
+    this function runs those two trainable stages (deformable_attention +
+    positional_bridge) to produce the 768-dim memory tensor expected by the
+    decoder cross-attention, skipping only the expensive RADIO encoder forward.
+
+    Lookup order:
+      1. If ``cache_root`` is provided AND ``dataset`` is in ``_CACHED_DATASETS``:
+         a. Try the new reversible key scheme (_sanitize_sample_key).
+         b. On ``FileNotFoundError``, fall back to the legacy ``__`` scheme
+            (_sanitize_sample_key_legacy) for caches built before 2026-05-09.
+         c. On a second ``FileNotFoundError`` (both schemes miss), fall through
+            to the live encoder path so a partial cache never blocks eval.
+      2. Otherwise: run ``_encode_staff_image`` (live encoder forward pass).
+
+    Only ``FileNotFoundError`` is caught for the fallback chain.  Other errors
+    (e.g. ``OSError``, corrupted .pt file) propagate immediately so cache
+    corruption surfaces as a failure rather than a silent accuracy regression.
+
+    Returns:
+        memory tensor of shape (1, seq_tokens, 768), dtype matching the model.
+    """
+    from src.inference.decoder_runtime import _encode_staff_image
+
+    if cache_root is not None and dataset in _CACHED_DATASETS:
+        from src.data.encoder_cache import (
+            _sanitize_sample_key,
+            _sanitize_sample_key_legacy,
+            read_cache_entry,
+        )
+        new_key = _sanitize_sample_key(sample_id)
+        try:
+            raw_tensor, h16, w16 = read_cache_entry(
+                cache_root, cache_hash, dataset, new_key
+            )
+            # Move to device (keep bfloat16 from cache; bridge will produce fp32/fp16
+            # as dictated by the model's parameter dtype).
+            raw_tensor = raw_tensor.to(device=device)
+            return _encode_from_cached_features(decode_model, raw_tensor, h16, w16)
+        except FileNotFoundError:
+            pass  # try legacy key
+
+        legacy_key = _sanitize_sample_key_legacy(sample_id)
+        try:
+            raw_tensor, h16, w16 = read_cache_entry(
+                cache_root, cache_hash, dataset, legacy_key
+            )
+            raw_tensor = raw_tensor.to(device=device)
+            return _encode_from_cached_features(decode_model, raw_tensor, h16, w16)
+        except FileNotFoundError:
+            pass  # both schemes missed; fall through to live encoder
+
+    # Live path: full encoder forward pass
+    return _encode_staff_image(decode_model, pixel_values)
+
+
 def _run_stage_b_inference_with_progress(
     *,
     project_root: Path,
@@ -170,10 +285,12 @@ def _run_stage_b_inference_with_progress(
     use_kv_cache: bool = True,
     use_fp16: bool = False,
     quantize: bool = False,
+    encoder_cache_root: Optional[Path] = None,
+    encoder_cache_hash: Optional[str] = None,
 ) -> Dict[str, object]:
     import torch
 
-    from src.cli import (
+    from src.inference.decoder_runtime import (
         _decode_stage_b_tokens,
         _encode_staff_image,
         _load_stage_b_crop_tensor,
@@ -186,6 +303,12 @@ def _run_stage_b_inference_with_progress(
         build_stage_b_components,
         model_factory_config_from_checkpoint_payload,
     )
+
+    # Resolve encoder cache root once (may be None if not provided via CLI)
+    _cache_root: Optional[Path] = (
+        Path(encoder_cache_root).resolve() if encoder_cache_root is not None else None
+    )
+    _cache_hash: Optional[str] = encoder_cache_hash or None
 
     crop_rows = _read_jsonl(crops_manifest)
     if not crop_rows:
@@ -259,7 +382,16 @@ def _run_stage_b_inference_with_progress(
             )
             if use_fp16:
                 pixel_values = pixel_values.half()
-            memory = _encode_staff_image(decode_model, pixel_values)
+            memory = _resolve_cache_memory(
+                decode_model=decode_model,
+                pixel_values=pixel_values,
+                dataset=str(row.get("dataset", "")).lower(),
+                sample_id=str(row.get("sample_id", "")),
+                cache_root=_cache_root,
+                cache_hash=_cache_hash,
+                device=device,
+                use_fp16=use_fp16,
+            )
 
             tokens = _decode_stage_b_tokens(
                 model=model,
@@ -372,6 +504,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="Inference device (e.g. cuda, cpu).")
     parser.add_argument("--quantize", action="store_true", help="INT8 dynamic quantization on decoder (CPU: 2-3x faster, GPU: needs torchao).")
     parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Run decoder forward in float16 (CUDA only). ~1.5-2x speedup on GPU; minor accuracy noise vs fp32.",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="Speed-oriented eval profile: beam=1, max_decode_steps<=192, image_max_width<=1024.",
@@ -386,6 +523,26 @@ def parse_args() -> argparse.Namespace:
         "--quiet",
         action="store_true",
         help="Disable progress logging during Stage-B inference.",
+    )
+    parser.add_argument(
+        "--encoder-cache-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root directory of the encoder feature cache "
+            "(e.g. data/cache/encoder/). When provided together with "
+            "--encoder-cache-hash, cached datasets skip the encoder forward pass "
+            "for a ~10-15x throughput improvement."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-cache-hash",
+        type=str,
+        default=None,
+        help=(
+            "16-character hex hash identifying the cache subdirectory "
+            "(e.g. ac8948ae4b5be3e9). Required when --encoder-cache-root is set."
+        ),
     )
     parser.add_argument(
         "--work-dir",
@@ -480,7 +637,10 @@ def main() -> None:
         quiet=bool(args.quiet),
         length_penalty_alpha=float(args.length_penalty_alpha),
         use_kv_cache=bool(args.kv_cache),
+        use_fp16=bool(getattr(args, "fp16", False)),
         quantize=bool(getattr(args, "quantize", False)),
+        encoder_cache_root=getattr(args, "encoder_cache_root", None),
+        encoder_cache_hash=getattr(args, "encoder_cache_hash", None),
     )
 
     raw_prediction_rows = _read_jsonl(raw_predictions_path)

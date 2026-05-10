@@ -201,6 +201,7 @@ eval/results/*
 !eval/results/.gitkeep
 !eval/results/baseline_davit_lieder.csv
 !eval/results/lieder_mvp.csv
+!eval/results/lieder_stage3_v2_smoke.csv
 !eval/results/baseline_pre_rebuild/
 eval/results/baseline_pre_rebuild/*
 !eval/results/baseline_pre_rebuild/measure_stage_a.py

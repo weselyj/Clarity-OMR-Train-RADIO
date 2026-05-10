@@ -1,0 +1,2 @@
+index,piece,onset_f1,tedn,linearized_ser,stage_d_skipped_notes,stage_d_skipped_chords,stage_d_missing_durations,stage_d_malformed_spans,stage_d_unknown_tokens,stage_d_fallback_rests,stage_d_raised_count,stage_d_first_error,score_failure_reason
+1,lc6623145,0.067842605156038,,0.6109016112444292,0,0,0,0,0,0,0,,tedn: subprocess timeout after 300s
