@@ -9,6 +9,8 @@ entire 50-piece run (Phase 1 inference only — scoring stays in subprocess).
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -28,6 +30,10 @@ from src.pipeline.assemble_score import (
     AssembledScore,
     StaffRecognitionResult,
     assemble_score_from_system_predictions,
+)
+from src.pipeline.export_musicxml import (
+    StageDExportDiagnostics,
+    assembled_score_to_music21_with_diagnostics,
 )
 
 
@@ -176,3 +182,32 @@ class SystemInferencePipeline:
             )
         finally:
             tmp_path.unlink(missing_ok=True)
+
+    def export_musicxml(
+        self,
+        score: AssembledScore,
+        out_path,
+        *,
+        diagnostics: Optional[StageDExportDiagnostics] = None,
+    ) -> None:
+        """Write the predicted MusicXML and the .diagnostics.json sidecar.
+
+        Mirrors archive/per_staff/src/pdf_to_musicxml.py:395-465 (the
+        production export pattern), but does not include the lenient
+        re-export fallback. If music21.write fails, the exception
+        propagates — the eval driver wraps individual pieces in try/except.
+        """
+        if diagnostics is None:
+            diagnostics = StageDExportDiagnostics()
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        music_score = assembled_score_to_music21_with_diagnostics(
+            score, diagnostics, strict=False,
+        )
+        music_score.write("musicxml", str(out_path))
+
+        diag_path = out_path.with_suffix(out_path.suffix + ".diagnostics.json")
+        diag_dict = dataclasses.asdict(diagnostics)
+        diag_path.write_text(json.dumps(diag_dict, indent=2), encoding="utf-8")

@@ -51,3 +51,45 @@ def test_run_pdf_produces_assembled_score_from_pdf():
 
     total_staves = sum(len(s.staves) for s in score.systems)
     assert total_staves == 2
+
+
+def test_export_musicxml_writes_xml_and_diagnostics_sidecar(tmp_path):
+    """export_musicxml writes both the .musicxml file and a
+    .musicxml.diagnostics.json sidecar (matching the contract eval/_scoring_utils.py expects)."""
+    fake_bundle = MagicMock(use_fp16=False, vocab=MagicMock(tokens=[]))
+
+    fake_music_score = MagicMock()
+    fake_music_score.write = MagicMock()
+
+    with patch("src.inference.system_pipeline.YoloStageASystems"), \
+         patch("src.inference.system_pipeline.load_stage_b_for_inference",
+               return_value=fake_bundle), \
+         patch("src.inference.system_pipeline.assembled_score_to_music21_with_diagnostics",
+               return_value=fake_music_score) as fake_export:
+
+        from src.inference.system_pipeline import SystemInferencePipeline
+        from src.pipeline.export_musicxml import StageDExportDiagnostics
+
+        pipeline = SystemInferencePipeline(
+            yolo_weights="yolo.pt", stage_b_ckpt="stage_b.pt", device="cpu",
+        )
+        out_path = tmp_path / "out.musicxml"
+        diags = StageDExportDiagnostics()
+        diags.skipped_notes = 7
+        fake_score = MagicMock()
+
+        def _write_stub(_format, path):
+            from pathlib import Path as _P
+            _P(path).write_text("<score-partwise/>")
+        fake_music_score.write.side_effect = _write_stub
+
+        pipeline.export_musicxml(fake_score, out_path, diagnostics=diags)
+
+    fake_export.assert_called_once_with(fake_score, diags, strict=False)
+    assert out_path.exists()
+    sidecar = out_path.with_suffix(out_path.suffix + ".diagnostics.json")
+    assert sidecar.exists()
+
+    import json
+    payload = json.loads(sidecar.read_text())
+    assert payload["skipped_notes"] == 7
