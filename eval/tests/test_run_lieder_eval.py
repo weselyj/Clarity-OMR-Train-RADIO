@@ -18,6 +18,8 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Module bootstrap — stub out heavy dependencies so import works without torch
 # ---------------------------------------------------------------------------
@@ -356,6 +358,46 @@ def test_run_scoring_spawns_subprocess_not_inline(monkeypatch, tmp_path):
     assert sys.executable in cmd[0:1] or "python" in str(cmd[0]).lower()
     assert "eval.score_lieder_eval" in cmd
     assert "--tedn" in cmd
+
+
+# ---------------------------------------------------------------------------
+# G. test_default_stage_a_weights + test_main_errors_when_stage_a_weights_missing
+# ---------------------------------------------------------------------------
+def test_default_stage_a_weights_points_to_system_yolo():
+    """Default --stage-a-weights is the in-repo system YOLO, not the sibling repo."""
+    from eval.run_lieder_eval import _DEFAULT_STAGE_A_YOLO
+    assert str(_DEFAULT_STAGE_A_YOLO) == "runs/detect/runs/yolo26m_systems/weights/best.pt"
+
+
+def test_main_errors_when_stage_a_weights_missing(tmp_path, capsys, monkeypatch):
+    """When --stage-a-weights points to a non-existent file, main exits with a clear error."""
+    import sys
+    from eval import run_lieder_eval
+
+    # Create dummy checkpoint and config files so they pass any other validation
+    # that might run; the test exercises only the stage-a-weights check.
+    ckpt = tmp_path / "ckpt.pt"
+    ckpt.write_bytes(b"")
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("")
+
+    missing = tmp_path / "does_not_exist.pt"
+    fake_argv = [
+        "run_lieder_eval",
+        "--checkpoint", str(ckpt),
+        "--config", str(cfg),
+        "--name", "test",
+        "--stage-a-weights", str(missing),
+    ]
+    monkeypatch.setattr(sys, "argv", fake_argv)
+
+    with pytest.raises(SystemExit):
+        run_lieder_eval.main()
+
+    captured = capsys.readouterr()
+    assert "Stage A weights not found" in captured.err
+    assert str(missing) in captured.err
+    assert "docs/TRAINING.md" in captured.err
 
 
 # ---------------------------------------------------------------------------

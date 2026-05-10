@@ -64,9 +64,10 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from eval.lieder_split import get_eval_pieces, split_hash
 
-# Default Stage A YOLO checkpoint (shipped by sibling Clarity-OMR).
-# Override via --stage-a-weights.
-_DEFAULT_STAGE_A_YOLO = Path.home() / "Clarity-OMR" / "info" / "yolo.pt"
+# Default Stage A YOLO checkpoint (in-repo, produced by Stage A training).
+# Override via --stage-a-weights. Path is repo-relative; resolved against
+# the current working directory (typically the repo root).
+_DEFAULT_STAGE_A_YOLO = Path("runs/detect/runs/yolo26m_systems/weights/best.pt")
 
 # Cache validation: minimum acceptable output file size (bytes).
 # Override via --min-output-bytes.
@@ -328,8 +329,8 @@ def main() -> None:
     p.add_argument(
         "--stage-a-weights", type=Path, default=_DEFAULT_STAGE_A_YOLO,
         help=(
-            "Path to Stage-A YOLO weights (default: ~/Clarity-OMR/info/yolo.pt). "
-            "Download by running sibling Clarity-OMR's omr.py once on any PDF."
+            f"Path to Stage A YOLO weights (default: {_DEFAULT_STAGE_A_YOLO}). "
+            "Train Stage A first via scripts/train_yolo.py — see docs/TRAINING.md."
         ),
     )
     p.add_argument(
@@ -372,6 +373,14 @@ def main() -> None:
     args = p.parse_args()
 
     # --- Validate inputs ---------------------------------------------------
+    # Stage A weights check first: an actionable error pointing at the training
+    # docs is more useful than the cryptic failure the YOLO loader produces
+    # later, and this is the most common misconfiguration.
+    if not args.stage_a_weights.is_file():
+        p.error(
+            f"Stage A weights not found at {args.stage_a_weights}. "
+            f"Train Stage A first (see docs/TRAINING.md) or pass --stage-a-weights."
+        )
     if not args.checkpoint.exists():
         raise SystemExit(f"FATAL: checkpoint not found: {args.checkpoint}")
     if not args.config.exists():
