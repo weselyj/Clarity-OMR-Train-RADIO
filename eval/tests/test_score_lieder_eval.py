@@ -1247,17 +1247,34 @@ def test_read_stage_d_diag_extracts_skipped_systems(tmp_path):
         "unknown_tokens": 5,
         "fallback_rests": 6,
         "raised_during_part_append": [],
-        "skipped_systems": [
-            {"system_index": 7, "reason": "decode_truncated"},
-            {"system_index": 11, "reason": "malformed"},
-        ],
+        "skipped_systems": 3,  # int counter — matches StageDExportDiagnostics
     }), encoding="utf-8")
 
     result = _read_stage_d_diag(pred)
 
     assert len(result) == 9, f"expected 9-tuple, got {len(result)}: {result}"
-    # The new field is the count, not the list — append at end of tuple.
-    assert result[-1] == 2
+    assert result[-1] == 3
+
+
+def test_read_stage_d_diag_skipped_systems_null(tmp_path):
+    """If sidecar explicitly sets skipped_systems to null, default to 0."""
+    import json
+    from eval._scoring_utils import _read_stage_d_diag
+
+    pred = tmp_path / "piece.musicxml"
+    pred.write_text("<score-partwise/>", encoding="utf-8")
+    diag = pred.with_suffix(pred.suffix + ".diagnostics.json")
+    diag.write_text(json.dumps({
+        "skipped_notes": 0, "skipped_chords": 0, "missing_durations": 0,
+        "malformed_spans": 0, "unknown_tokens": 0, "fallback_rests": 0,
+        "raised_during_part_append": [],
+        "skipped_systems": None,
+    }), encoding="utf-8")
+
+    result = _read_stage_d_diag(pred)
+
+    assert len(result) == 9
+    assert result[-1] == 0
 
 
 def test_read_stage_d_diag_missing_skipped_systems_field(tmp_path):

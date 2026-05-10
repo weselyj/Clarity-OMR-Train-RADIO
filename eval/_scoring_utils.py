@@ -71,7 +71,7 @@ def _read_stage_d_diag(pred_path: Path) -> tuple:
         raw = json.loads(diag_path.read_text(encoding="utf-8"))
         raised = raw.get("raised_during_part_append", [])
         first_error = raised[0].get("error_message", "") if raised else ""
-        skipped_systems_count = len(raw.get("skipped_systems", []))
+        skipped_systems_count = int(raw.get("skipped_systems") or 0)
         return (
             raw.get("skipped_notes"),
             raw.get("skipped_chords"),
