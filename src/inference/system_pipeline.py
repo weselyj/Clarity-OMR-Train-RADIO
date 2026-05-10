@@ -91,7 +91,9 @@ class SystemInferencePipeline:
         score = assemble_score_from_system_predictions(
             [tokens], [system_location],
         )
-        # Flatten staves from the single-system AssembledScore.
+        # Flatten staves from the single-system AssembledScore. Use the caller's
+        # system_index — assemble_score() re-numbers systems sequentially via
+        # enumerate(), losing the per-page identity we need to round-trip.
         result: List[StaffRecognitionResult] = []
         for system in score.systems:
             for staff in system.staves:
@@ -100,7 +102,7 @@ class SystemInferencePipeline:
                         sample_id=staff.sample_id,
                         tokens=staff.tokens,
                         location=staff.location,
-                        system_index_hint=system.system_index,
+                        system_index_hint=system_index,
                     )
                 )
         return result
