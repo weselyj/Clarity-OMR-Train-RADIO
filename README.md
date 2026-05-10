@@ -312,7 +312,7 @@ Applied online during training (not pre-generated). Stage A uses an additional s
 │   ├── data/
 │   │   ├── generate_synthetic.py                   # Synthetic data generation + v15 system-bbox derivation + per-staff manifest writer
 │   │   ├── yolo_aligned_systems.py                 # Multi-staff system-level helpers (Plan A consumer)
-│   │   ├── yolo_aligned_crops.py                   # Per-staff variant (helpers reused by systems module)
+│   │   ├── yolo_common.py                          # Shared YOLO geometry + ultralytics adapters (iou_xyxy, _yolo_predict_to_boxes)
 │   │   ├── derive_systems_from_staves.py           # Spatial heuristic for AudioLabs (real scans)
 │   │   ├── bracket_detector.py                     # Visual first-barline detection (real scans)
 │   │   ├── multi_dpi.py                            # Verovio rendering at multiple DPIs

@@ -162,7 +162,7 @@ from src.data.yolo_aligned_systems import process_page_systems
 
 
 class _FakeYoloResult:
-    """Minimal Ultralytics-result shape that yolo_aligned_crops._yolo_predict_to_boxes accepts."""
+    """Minimal Ultralytics-result shape that yolo_common._yolo_predict_to_boxes accepts."""
     def __init__(self, xyxy_list, conf_list):
         class _Boxes:
             pass

@@ -1,7 +1,9 @@
 """Multi-staff system-level helpers for Stage 3 data prep.
 
-Mirrors `src/data/yolo_aligned_crops.py` but operates on system bboxes
-(one label per system, multiple staves per system) rather than per-staff.
+Operates on system bboxes (one label per system, multiple staves per
+system). Shared geometry + ultralytics adapters live in
+`src/data/yolo_common.py`; the archived per-staff variant is at
+`archive/per_staff/src/data/yolo_aligned_crops.py`.
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ from typing import Iterable
 
 from PIL import Image
 
-from src.data.yolo_aligned_crops import iou_xyxy, _yolo_predict_to_boxes  # reuse
+from src.data.yolo_common import iou_xyxy, _yolo_predict_to_boxes
 from src.tokenizer.vocab import STAFF_INDEX_MARKER_TOKENS
 
 
@@ -159,7 +161,8 @@ def process_page_systems(
     conf: float = 0.25,
     dataset_name: str = "synthetic_systems",
 ) -> tuple[list[dict], dict]:
-    """Multi-staff variant of `yolo_aligned_crops.process_page`.
+    """Multi-staff variant of the per-staff `process_page`
+    (archived at `archive/per_staff/src/data/yolo_aligned_crops.py`).
 
     Workflow:
       1. Load page image dimensions, oracle system bboxes, staves-per-system list
