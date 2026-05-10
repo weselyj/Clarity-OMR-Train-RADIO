@@ -1,4 +1,4 @@
-"""Tests for eval.score_lieder_eval, eval.score_demo_eval, and shared eval._scoring_utils.
+"""Tests for eval.score_lieder_eval and shared eval._scoring_utils.
 
 Verifies module imports, CLI help, and the new behaviors introduced in the
 performance review (2026-04-28):
@@ -152,15 +152,6 @@ class TestImports:
         assert hasattr(mod, "main")
         assert hasattr(mod, "_discover_predictions")
 
-    def test_demo_imports(self):
-        """score_demo_eval and its dependencies import cleanly."""
-        if str(_REPO_ROOT) not in sys.path:
-            sys.path.insert(0, str(_REPO_ROOT))
-        import importlib
-        mod = importlib.import_module("eval.score_demo_eval")
-        assert hasattr(mod, "main")
-        assert hasattr(mod, "DEMO_STEMS")
-
     def test_scoring_utils_imports(self):
         """_scoring_utils exports expected symbols."""
         if str(_REPO_ROOT) not in sys.path:
@@ -200,23 +191,6 @@ class TestHelpRenders:
         assert "--output-dir" in result.stdout
         assert "--python" in result.stdout
         assert "--parallel-metric-groups" in result.stdout
-
-    def test_demo_help(self):
-        result = subprocess.run(
-            [sys.executable, "-m", "eval.score_demo_eval", "--help"],
-            capture_output=True, text=True, cwd=str(_REPO_ROOT), env=_SUBPROCESS_ENV,
-        )
-        assert result.returncode == 0, f"--help failed:\n{result.stderr}"
-        assert "predictions-dir" in result.stdout
-        assert "reference-dir" in result.stdout
-        assert "--jobs" in result.stdout
-        assert "--cheap-jobs" in result.stdout
-        assert "--tedn-jobs" in result.stdout
-        assert "--max-active-pieces" in result.stdout
-        assert "--write-order" in result.stdout
-        assert "--memory-limit-gb" in result.stdout
-        assert "--child-memory-limit-gb" in result.stdout
-        assert "--resume" in result.stdout
 
 
 # ---------------------------------------------------------------------------
