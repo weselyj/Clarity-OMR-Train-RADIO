@@ -1,17 +1,17 @@
-# Clarity OMR dependencies
-# Install: pip install -r requirements.txt
+# Clarity-OMR-Train-RADIO dependencies
 #
-# For GPU (CUDA) support, install PyTorch with CUDA first:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# Then install the rest:
-#   pip install -r requirements.txt
+# This project requires a CUDA-capable GPU (see docs/HARDWARE.md).
+# CPU-only torch is NOT a supported install path — ultralytics' YOLO
+# kernels and the RADIO encoder both require CUDA-built torchvision.
 #
-# For CPU only (PyTorch CPU is installed automatically):
-#   pip install -r requirements.txt
+# Install (production cu132 nightly path):
+#   Windows: scripts/setup_venv_cu132.ps1
+#   Linux:   scripts/setup_venv_cu132.sh
+#   Manual:  see docs/INSTALL.md
 
-# PyTorch (CPU wheels - override with CUDA install above if you have a GPU)
-torch
-torchvision
+# torch and torchvision are installed by scripts/setup_venv_cu132.{ps1,sh}
+# from the PyTorch nightly cu132 index — DO NOT add them to this file
+# (would override the cu132 selection with the latest stable wheel).
 
 # Model download
 huggingface_hub
