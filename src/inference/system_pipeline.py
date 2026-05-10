@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
+import fitz  # PyMuPDF
 import torch
 from PIL import Image
 
@@ -57,6 +58,43 @@ class SystemInferencePipeline:
         self._image_height = image_height
         self._image_max_width = image_max_width
         self._length_penalty_alpha = length_penalty_alpha
+
+    def run_pdf(
+        self,
+        pdf_path,
+        *,
+        diagnostics=None,
+    ) -> AssembledScore:
+        """Render PDF pages, run Stage A + Stage B per page, assemble.
+
+        `diagnostics` is currently a placeholder for future Stage-D skip
+        recording during decode (assemble currently doesn't take a
+        diagnostics arg). Pass-through is preserved so callers don't need
+        to know which stages consume it.
+        """
+        all_token_lists = []
+        all_locations = []
+        with fitz.open(str(pdf_path)) as doc:
+            for page_index, page in enumerate(doc):
+                pix = page.get_pixmap(dpi=self._page_dpi)
+                img = Image.frombytes(
+                    "RGB", (pix.width, pix.height), pix.samples,
+                )
+                systems = self._stage_a.detect_systems(img)
+                for sys in systems:
+                    x1, y1, x2, y2 = sys["bbox_extended"]
+                    crop = img.crop((int(x1), int(y1), int(x2), int(y2)))
+                    tokens = self._decode_one_crop(crop)
+                    all_token_lists.append(tokens)
+                    all_locations.append({
+                        "system_index": sys["system_index"],
+                        "bbox": sys["bbox_extended"],
+                        "page_index": page_index,
+                        "conf": sys["conf"],
+                    })
+        return assemble_score_from_system_predictions(
+            all_token_lists, all_locations,
+        )
 
     def run_page(
         self,
