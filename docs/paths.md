@@ -8,7 +8,7 @@ unless noted.
 
 | Path | Source |
 |---|---|
-| `runs/detect/runs/yolo26m_systems/weights/best.pt` | Produced by `scripts/train_yolo.py` (see [TRAINING_COMMANDS.md](TRAINING_COMMANDS.md)) |
+| `runs/detect/runs/yolo26m_systems/weights/best.pt` | Produced by `scripts/train_yolo.py` (see [TRAINING.md](TRAINING.md)) |
 | `runs/detect/runs/yolo26m_systems/weights/last.pt` | Sibling final-epoch weights |
 
 This is the default `--stage-a-weights` for `eval.run_lieder_eval`. The
