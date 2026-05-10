@@ -1,4 +1,14 @@
-# Stage 2 systems-aware retrain (RADIO + multi-staff markers).
+# Stage 2 polyphonic-aware retrain (RADIO + multi-staff markers).
+#
+# Renamed 2026-05-10 from train_stage2_radio_systems.yaml. The "systems" name was
+# misleading: dataset_mix below is 80% grandstaff_systems (per-system) plus 20%
+# primus + cameraprimus (single-staff). The checkpoint that this config produced
+# (`stage2-radio-systems-polyphonic_best.pt`) is therefore polyphonic-aware on a
+# mixed system/single-staff signal, NOT pure-per-system.
+#
+# This is the v2 anchor; Stage 3 v2 resumes from it. Per-staff archival in 2026-05
+# kept this config as the canonical Stage 2 starting point. A future pure-per-
+# system Stage 2 v3 would use a new config (datasets all `_systems` suffix).
 #
 # Resumes from Stage 1 monophonic foundation checkpoint and warmup-trains the model
 # to emit <staff_idx_N> markers on the corrected GrandStaff manifest (grandstaff_systems).
@@ -7,7 +17,7 @@
 # Run command:
 #   ssh 10.10.1.29 'cd "C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO" && \
 #     venv-cu132\Scripts\python -u src/train/train.py \
-#       --stage-configs configs/train_stage2_radio_systems.yaml \
+#       --stage-configs configs/train_stage2_radio_polyphonic.yaml \
 #       --mode execute \
 #       --resume-checkpoint checkpoints/full_radio_stage1_v2/stage1-radio-monophonic-foundation_best.pt \
 #       --start-stage stage2-radio-systems-polyphonic \

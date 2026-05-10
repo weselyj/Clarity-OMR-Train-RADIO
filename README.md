@@ -293,7 +293,7 @@ Applied online during training (not pre-generated). Stage A uses an additional s
 │   ├── train_stage1_radio.yaml                     # Stage 1 v2 RADIO config
 │   ├── train_stage2.yaml                           # Stage 2 polyphonic (legacy)
 │   ├── train_stage2_radio.yaml                     # Stage 2 RADIO config
-│   ├── train_stage2_radio_systems.yaml             # Stage 2 v2 system-level config (current)
+│   ├── train_stage2_radio_polyphonic.yaml          # Stage 2 v2 polyphonic-aware config (80% systems / 20% single-staff mix)
 │   ├── train_stage3.yaml                           # Stage 3 legacy config
 │   └── train_stage3_radio.yaml                     # Stage 3 RADIO config (Plan B will add a system-level variant)
 │
@@ -472,8 +472,10 @@ python scripts/train_yolo.py \
 # Stage 1 v2 — per-staff RADIO (completed; for re-runs only)
 python src/train/train.py --config configs/train_stage1_radio.yaml
 
-# Stage 2 v2 — system-level vocab-extension warmup (completed; init checkpoint for Stage 3)
-python src/train/train.py --config configs/train_stage2_radio_systems.yaml
+# Stage 2 v2 — polyphonic vocab-extension warmup (completed; init checkpoint for Stage 3).
+# Note: the dataset_mix is 80% systems / 20% single-staff — the file was previously
+# named train_stage2_radio_systems.yaml. See header in the config for the rationale.
+python src/train/train.py --config configs/train_stage2_radio_polyphonic.yaml
 
 # Stage 3 — full system-level retrain with encoder-cache hybrid (in development)
 # Requires Phase 0 encoder cache infrastructure on feat/stage3-encoder-cache.
