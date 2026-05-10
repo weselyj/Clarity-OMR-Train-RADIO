@@ -8,8 +8,8 @@ Last verified: 2026-05-10. Update when a path moves; this doc is the source of t
 
 | Box | Path | Notes |
 |---|---|---|
-| Local (laptop / workstation) | `/home/ari/work/Clarity-OMR-Train-RADIO` | Linux, Python 3.14 (no torch installed locally — torch-dep tests run on GPU box) |
-| GPU box (`seder` / `10.10.1.29`) | `C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO` | Windows, cmd.exe; ssh with `cd /d "<path>"` for spaces. WSL Ubuntu installed but stopped |
+| Local (laptop / workstation) | `/home/ari/work/Clarity-OMR-Train-RADIO` | Linux, Python 3.14. CPU torch + ultralytics + pymupdf + mir_eval installed user-level via `pip install --user --break-system-packages` so unit tests in `tests/inference`, `tests/pipeline`, `tests/cli`, `eval/tests` run end-to-end. GPU/CUDA workloads still run on GPU box only. |
+| GPU box (`seder` / `10.10.1.29`) | `C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO` | Windows, cmd.exe; ssh with `cd /d "<path>"` for spaces. Use `venv-cu132\Scripts\python.exe` (torch 2.13 dev cu132 + ultralytics + pymupdf) for inference and scoring; default system Python lacks torch. WSL Ubuntu installed but stopped. |
 | Origin | `https://github.com/weselyj/Clarity-OMR-Train-RADIO.git` | `main` is the integration branch |
 
 ## Stage A (system YOLO) weights
@@ -49,8 +49,24 @@ The 50-piece subset used for Phase 2 / Subproject 4 evals is a deterministic sub
 
 **Smoke piece**: `lc6623145`
 - PDF: `data/openscore_lieder/eval_pdfs/lc6623145.pdf`
-- Ground truth: `data/openscore_lieder/scores/<Composer>/<Opus>/<Song>/lc6623145.mxl` (path nested by composer)
-- Last-known predicted output (per-staff, wrong format): `eval/results/lieder_stage3_v2_smoke/lc6623145.musicxml` + `.musicxml.diagnostics.json`
+- Ground truth: `data/openscore_lieder/scores/Barnard,_Charlotte_Alington/_/Five_o'clock_in_the_morning/lc6623145.mxl`
+- Per-system smoke output (Subproject 4): `smoke_lc6623145.musicxml` + `.musicxml.diagnostics.json` at the GPU box repo root; staged copy at `smoke_predictions/lc6623145.musicxml` for the scorer. Smoke score CSV: `smoke_scores.csv`. Last result 2026-05-10: `onset_f1=0.0946`, `linearized_ser=0.5526` (well above the per-staff `0.067` baseline).
+- Predecessor (per-staff, wrong format) output: `eval/results/lieder_stage3_v2_smoke/lc6623145.musicxml` — superseded.
+
+## Subproject 4 (per-system inference) artifacts
+
+GPU box, `C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO\` relative:
+
+| Path | Notes |
+|---|---|
+| `eval/results/lieder_subproject4/<piece_id>.musicxml` (+ `.musicxml.diagnostics.json`) | 50-piece corpus predictions written by `python -m eval.run_lieder_eval --name subproject4` |
+| `eval/results/lieder_subproject4_inference_status.jsonl` | Phase 1 per-piece status (one JSON record per piece, flushed on each completion) |
+| `eval/results/lieder_subproject4_scores.csv` | Phase 2 per-piece scores (cheap metrics: onset_f1, linearized_ser; TEDN off by default) |
+| `subproject4_run.log` | Combined stdout/stderr from the corpus run; useful for post-mortem on per-piece failures |
+
+The per-system inference entrypoints in this repo (Subproject 4):
+- One-off: `python -m src.cli.run_system_inference --pdf … --out … --yolo-weights … --stage-b-ckpt …`
+- Corpus: `python -m eval.run_lieder_eval --checkpoint … --config … --name … --max-pieces 50 --run-scoring`
 
 ## Encoder cache (Stage 3 training)
 

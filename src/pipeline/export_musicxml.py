@@ -57,6 +57,11 @@ class StageDExportDiagnostics:
     fallback_rests:
         ``<chord_start>`` spans with a valid ``<chord_end>`` but zero pitch
         tokens inside — these are emitted as rests rather than chords.
+    skipped_systems:
+        Whole systems dropped before assembly because the decoder returned
+        a malformed token sequence (``<staff_start>`` without a matching
+        ``<staff_end>``, typically caused by hitting ``--max-decode-steps``
+        mid-staff).  Incremented by ``assemble_score_from_system_predictions``.
     raised_during_part_append:
         List of dicts recorded when an exception is caught during part
         append (strict=False path).  Each dict has keys:
@@ -69,6 +74,7 @@ class StageDExportDiagnostics:
     malformed_spans: int = 0
     unknown_tokens: int = 0
     fallback_rests: int = 0
+    skipped_systems: int = 0
     raised_during_part_append: List[Dict[str, object]] = field(default_factory=list)
 
 
