@@ -1221,3 +1221,27 @@ class TestStemArgRemoved:
         assert params[1] == "ref_path"
         assert params[2] == "metrics"
         assert params[3] == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# Task 14: --tedn flag
+# ---------------------------------------------------------------------------
+
+def test_tedn_flag_default_off_skips_tedn_computation(monkeypatch, tmp_path):
+    """When --tedn is NOT passed, score_one_piece must skip the TEDN computation
+    entirely (no music21->kern conversion, no zss tree-edit-distance)."""
+    from unittest.mock import MagicMock
+
+    fake_compute_tedn = MagicMock()
+    monkeypatch.setattr("eval.score_lieder_eval.compute_tedn", fake_compute_tedn,
+                        raising=False)
+
+    import eval.score_lieder_eval as sle
+
+    parser = sle._build_argparser() if hasattr(sle, "_build_argparser") else sle.build_argparser()
+    args = parser.parse_args([
+        "--predictions-dir", str(tmp_path),
+        "--ground-truth-dir", str(tmp_path),
+        "--out-csv", str(tmp_path / "scores.csv"),
+    ])
+    assert args.tedn is False

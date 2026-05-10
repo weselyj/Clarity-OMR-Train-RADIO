@@ -277,7 +277,11 @@ def _wait_for_memory_budget(limit_gb: float, poll_sec: float) -> None:
         time.sleep(poll_sec)
 
 
-def main() -> None:
+def _build_argparser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for score_lieder_eval.
+
+    Extracted so tests can call _build_argparser() directly without invoking main().
+    """
     p = argparse.ArgumentParser(
         description="Score predicted MusicXMLs from a Lieder eval inference run against "
                     "reference MXLs, subprocess-isolating per-piece metric computation."
@@ -288,20 +292,36 @@ def main() -> None:
              "All .musicxml files in this directory are scored.",
     )
     p.add_argument(
-        "--reference-dir", type=Path, required=True,
+        "--reference-dir", "--ground-truth-dir", type=Path, required=True,
+        dest="reference_dir",
         help="Directory containing reference .mxl files. Can be the full openscore_lieder/scores "
              "tree (recursive search used) or a flat mirror. "
-             "Example: data/openscore_lieder/scores",
+             "Example: data/openscore_lieder/scores. "
+             "(--ground-truth-dir is an alias used by invoke_scoring_phase.)",
     )
     p.add_argument(
-        "--name", required=True,
+        "--name", default=None,
         help="Run name (used for output CSV filename: eval/results/lieder_<name>.csv). "
-             "Should match the name used with run_lieder_eval.py.",
+             "Should match the name used with run_lieder_eval.py. "
+             "Required unless --out-csv is given.",
+    )
+    p.add_argument(
+        "--out-csv", type=Path, default=None, dest="out_csv",
+        help="Full path to the output CSV file. Overrides --name / --output-dir. "
+             "Alias used by invoke_scoring_phase in run_lieder_eval.py.",
     )
     p.add_argument(
         "--metrics",
-        default="tedn,linearized_ser,onset_f1",
-        help="Comma-separated list of metrics to compute (default: tedn,linearized_ser,onset_f1)",
+        default="linearized_ser,onset_f1",
+        help="Comma-separated list of metrics to compute (default: linearized_ser,onset_f1). "
+             "Use --tedn to also enable TEDN (slow, ~300s/piece worst case).",
+    )
+    p.add_argument(
+        "--tedn",
+        action="store_true",
+        default=False,
+        help="Compute TEDN (Tree-Edit Distance on kern) — slow, ~300s/piece worst case. "
+             "Default off. When set, 'tedn' is appended to the metrics list.",
     )
     p.add_argument(
         "--max-pieces", type=int, default=None,
@@ -378,7 +398,16 @@ def main() -> None:
              "Can reduce per-piece wall time but roughly doubles per-piece peak RAM. "
              "Default OFF. See score_piece_subprocess() docstring for details.",
     )
+    return p
+
+
+def main() -> None:
+    p = _build_argparser()
     args = p.parse_args()
+
+    # --tedn appends 'tedn' to the metrics list
+    if args.tedn and "tedn" not in args.metrics:
+        args.metrics = args.metrics + ",tedn"
 
     # --- Resolve two-lane concurrency settings ---
     if args.jobs is not None:
@@ -407,6 +436,10 @@ def main() -> None:
         raise SystemExit(f"FATAL: --tedn-jobs must be >= 1, got {tedn_jobs}")
     if max_active_pieces < 1:
         raise SystemExit(f"FATAL: --max-active-pieces must be >= 1, got {max_active_pieces}")
+
+    # Validate: need either --name or --out-csv (not both required, but at least one)
+    if args.out_csv is None and args.name is None:
+        raise SystemExit("FATAL: one of --name or --out-csv is required.")
 
     if not args.predictions_dir.exists():
         raise SystemExit(f"FATAL: predictions-dir not found: {args.predictions_dir}")
@@ -444,13 +477,23 @@ def main() -> None:
     need_tedn = bool(tedn_requested)
 
     # Determine output paths
-    output_dir = args.output_dir if args.output_dir else (_REPO_ROOT / "eval" / "results")
-    csv_path = (output_dir / f"lieder_{args.name}.csv").resolve()
-    partial_csv_path = (output_dir / f"lieder_{args.name}.partial.csv").resolve()
+    # --out-csv takes precedence; derive name/output_dir from it if provided.
+    if args.out_csv is not None:
+        csv_path = args.out_csv.resolve()
+        output_dir = csv_path.parent
+        # Derive run name from the CSV filename (strip leading "lieder_" if present, drop .csv)
+        _stem = csv_path.stem
+        run_name = _stem[len("lieder_"):] if _stem.startswith("lieder_") else _stem
+    else:
+        output_dir = args.output_dir if args.output_dir else (_REPO_ROOT / "eval" / "results")
+        run_name = args.name
+        csv_path = (output_dir / f"lieder_{run_name}.csv").resolve()
+
+    partial_csv_path = csv_path.with_suffix(".partial.csv")
 
     # Scoring logs directory (stderr + instrumentation)
     scoring_logs_dir = output_dir / "scoring_logs"
-    instrumentation_log = scoring_logs_dir / f"lieder_{args.name}_instrumentation.jsonl"
+    instrumentation_log = scoring_logs_dir / f"lieder_{run_name}_instrumentation.jsonl"
 
     # Resume: load already-scored stems and pre-populate rows_by_index
     rows_by_index: "dict[int, tuple]" = {}
@@ -477,7 +520,7 @@ def main() -> None:
                 if stem in resumed_rows:
                     rows_by_index[idx] = resumed_rows[stem]
 
-    print(f"Run name:          {args.name}")
+    print(f"Run name:          {run_name}")
     print(f"Predictions dir:   {args.predictions_dir}")
     print(f"Reference dir:     {args.reference_dir}")
     print(f"Metrics:           {metrics}")
@@ -785,7 +828,7 @@ def main() -> None:
     print(f"\nResults written to {csv_path}")
 
     _print_summary(
-        rows_by_index, metrics, n_total, missing_ref_count, args.name,
+        rows_by_index, metrics, n_total, missing_ref_count, run_name,
         has_index_col=use_index_col,
     )
 
