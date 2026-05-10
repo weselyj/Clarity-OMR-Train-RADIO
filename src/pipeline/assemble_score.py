@@ -402,7 +402,14 @@ def assemble_score_from_system_predictions(
 
     staves: List[StaffRecognitionResult] = []
     for sys_tokens, sys_loc in zip(system_token_lists, system_locations):
-        per_staff_lists = _split_staff_sequences_for_validation(sys_tokens)
+        try:
+            per_staff_lists = _split_staff_sequences_for_validation(sys_tokens)
+        except ValueError:
+            # Decoder produced malformed tokens for this system (e.g. truncated
+            # before <staff_end>). Skip this system rather than failing the
+            # whole piece — eval driver records the gap; downstream scoring
+            # tolerates missing systems.
+            continue
         if not per_staff_lists:
             continue
         n = len(per_staff_lists)

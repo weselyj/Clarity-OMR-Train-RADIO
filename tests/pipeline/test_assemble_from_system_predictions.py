@@ -79,3 +79,31 @@ def test_empty_system_token_list_yields_empty_score():
 
     score = assemble_score_from_system_predictions([], [])
     assert len(score.systems) == 0
+
+
+def test_malformed_system_tokens_are_skipped_not_fatal():
+    """A system whose decoder output is truncated before <staff_end> must not
+    kill the whole piece; the assembler skips it and continues with the rest."""
+    from src.pipeline.assemble_score import assemble_score_from_system_predictions
+
+    # Two <staff_start> markers but the second never reaches <staff_end> —
+    # this is the shape that trips the splitter's validation path
+    # (single-staff sequences bypass validation as a fast path).
+    malformed_sys = [
+        "<bos>",
+        "<staff_start>", "<staff_idx_0>", "<measure_start>", "note-C4-quarter",
+        "<measure_end>", "<staff_end>",
+        "<staff_start>", "<staff_idx_1>", "<measure_start>", "note-C3-quarter",
+        # No closing <staff_end> — decoder hit max_decode_steps mid-second-staff.
+    ]
+    good_sys = _make_grandstaff_system_tokens()
+    locs = [
+        {"system_index": 0, "bbox": (0.0, 0.0, 100.0, 100.0), "page_index": 0, "conf": 0.5},
+        {"system_index": 1, "bbox": (0.0, 100.0, 100.0, 200.0), "page_index": 0, "conf": 0.9},
+    ]
+
+    score = assemble_score_from_system_predictions([malformed_sys, good_sys], locs)
+
+    # Only the good system contributes staves; the malformed one is silently dropped.
+    assert len(score.systems) == 1
+    assert len(score.systems[0].staves) == 2
