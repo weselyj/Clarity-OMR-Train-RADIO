@@ -1,5 +1,8 @@
 # RADIO Stage 3 Phase 2 — Mid-Handoff (2026-05-10)
 
+> ⚠️ **SUPERSEDED 2026-05-10** by [`2026-05-10-per-system-cleanup-wrap.md`](2026-05-10-per-system-cleanup-wrap.md).
+> The Phase 2 evaluation plan described here did not complete: launching the lieder eval revealed a structural mismatch (the per-staff inference pipeline feeds split-from-system crops to a system-trained Stage 3 v2). The session pivoted to archiving the per-staff code and re-aligning the decision-gate to the per-system product rule. Read the wrap-up handoff for the actual outcomes; this snapshot remains as the original Phase 2 plan-of-record.
+
 > Per-dataset eval matrix landed (4 JSONs, 500 samples each); lieder eval and decision-gate execution still ahead. Next session picks up with the lieder eval.
 
 ## Status
