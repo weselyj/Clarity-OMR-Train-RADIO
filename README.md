@@ -42,6 +42,17 @@ OUTPUT: Valid MusicXML file
 
 The earlier per-staff design fed individual staff crops to Stage B, then re-stitched the per-staff outputs in Stage C. That recovered most onsets but lost cross-staff coordination signal — ties that span systems, anacrusis split across staves, voice-piano alignment in vocal-piano music. The 2026-05 retrain experiment confirmed this empirically: a clean per-staff-trained checkpoint produced syntactically better outputs but didn't move the headline `onset_f1` metric. System-level inputs preserve cross-staff context that single-staff windows structurally cannot recover.
 
+**Single-staff scores are still supported** — they're treated as 1-staff systems at inference time. The product rule:
+
+- **Inference**: a system bbox (1+ staves stacked) goes in, tokens come out. Naturally single-staff scores (violin solos, monophonic primus) are 1-staff systems.
+- **Training**: single-staff training data must come from naturally single-staff *sources*. Don't take a 2-staff piano grand-staff and feed each staff separately — that's polluting single-staff exposure with split-from-system data.
+
+Per this rule, the `grandstaff` (single-staff) variant — split from the 2-staff GrandStaff source — is NOT a valid training/eval input. `grandstaff_systems` (the 2-staff system format) is. The `primus` and `cameraprimus` single-staff variants ARE valid because their sources are naturally 1-staff.
+
+### Per-staff archival (2026-05-10)
+
+The legacy per-staff inference pipeline (Stage A YOLO emitting per-staff crops + per-staff Stage B + per-staff assembly) was archived to [archive/per_staff/](archive/per_staff/) in commits `e05ca05` → `8b8da66` → Phase A/B/C of the per-system cleanup. The lieder smoke evaluation against Stage 3 v2 produced `onset_f1=0.067` because of this format mismatch (per-staff crops fed to a system-trained model), not real model weakness — see [docs/superpowers/handoffs/2026-05-10-radio-stage3-phase2-mid-handoff.md](docs/superpowers/handoffs/2026-05-10-radio-stage3-phase2-mid-handoff.md) for the original Phase 2 evaluation that surfaced this. Subproject 4 (TBD) builds the replacement system-aware inference pipeline.
+
 ## Project status
 
 | Subproject | Component | Status |
