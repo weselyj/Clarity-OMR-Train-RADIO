@@ -13,29 +13,15 @@ from typing import List
 import numpy as np
 from PIL import Image
 
+from ultralytics import YOLO
+
 from src.data.yolo_common import _yolo_predict_to_boxes
 from src.models.system_postprocess import extend_left_for_brace
-
-# YOLO is imported lazily in __init__ to avoid a torchvision/torch NMS
-# registration crash that occurs on module import in CPU-only environments.
-# The module-level name exists so that tests can patch it via
-#   patch("src.models.yolo_stage_a_systems.YOLO", ...).
-YOLO = None
-
-
-def _get_yolo():
-    """Return the YOLO class, importing ultralytics on first call."""
-    global YOLO  # noqa: PLW0603
-    if YOLO is None:
-        from ultralytics import YOLO as _YOLO
-        YOLO = _YOLO
-    return YOLO
 
 
 class YoloStageASystems:
     def __init__(self, weights_path: Path, *, conf: float = 0.25, imgsz: int = 1920):
-        yolo_cls = YOLO if YOLO is not None else _get_yolo()
-        self._model = yolo_cls(str(weights_path))
+        self._model = YOLO(str(weights_path))
         self._conf = conf
         self._imgsz = imgsz
 

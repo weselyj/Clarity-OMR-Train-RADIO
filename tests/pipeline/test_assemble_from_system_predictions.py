@@ -107,3 +107,49 @@ def test_malformed_system_tokens_are_skipped_not_fatal():
     # Only the good system contributes staves; the malformed one is silently dropped.
     assert len(score.systems) == 1
     assert len(score.systems[0].staves) == 2
+
+
+def test_diagnostics_skipped_systems_counter_tracks_each_drop():
+    """When a StageDExportDiagnostics is passed, each malformed system increments
+    skipped_systems so the post-mortem can correlate low onset_f1 with truncation."""
+    from src.pipeline.assemble_score import assemble_score_from_system_predictions
+    from src.pipeline.export_musicxml import StageDExportDiagnostics
+
+    malformed_sys = [
+        "<bos>",
+        "<staff_start>", "<staff_idx_0>", "<measure_start>", "note-C4-quarter",
+        "<measure_end>", "<staff_end>",
+        "<staff_start>", "<staff_idx_1>", "<measure_start>", "note-C3-quarter",
+        # missing <staff_end>
+    ]
+    good_sys = _make_grandstaff_system_tokens()
+    locs = [
+        {"system_index": 0, "bbox": (0.0, 0.0, 100.0, 100.0), "page_index": 0, "conf": 0.5},
+        {"system_index": 1, "bbox": (0.0, 100.0, 100.0, 200.0), "page_index": 0, "conf": 0.9},
+        {"system_index": 2, "bbox": (0.0, 200.0, 100.0, 300.0), "page_index": 0, "conf": 0.4},
+    ]
+
+    diags = StageDExportDiagnostics()
+    assemble_score_from_system_predictions(
+        [malformed_sys, good_sys, malformed_sys], locs, diagnostics=diags,
+    )
+
+    assert diags.skipped_systems == 2
+    # Other counters are not touched by the assembler — Stage D fills those in.
+    assert diags.skipped_notes == 0
+    assert diags.unknown_tokens == 0
+
+
+def test_diagnostics_default_none_does_not_crash():
+    """Passing no diagnostics is allowed; no AttributeError on the malformed path."""
+    from src.pipeline.assemble_score import assemble_score_from_system_predictions
+
+    malformed_sys = [
+        "<bos>",
+        "<staff_start>", "<staff_idx_0>", "<staff_end>",
+        "<staff_start>", "<staff_idx_1>",  # missing <staff_end>
+    ]
+    locs = [{"system_index": 0, "bbox": (0.0, 0.0, 100.0, 100.0), "page_index": 0, "conf": 0.5}]
+    # No diagnostics arg — must not raise.
+    score = assemble_score_from_system_predictions([malformed_sys], locs)
+    assert len(score.systems) == 0

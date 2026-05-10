@@ -73,10 +73,11 @@ class SystemInferencePipeline:
     ) -> AssembledScore:
         """Render PDF pages, run Stage A + Stage B per page, assemble.
 
-        `diagnostics` is currently a placeholder for future Stage-D skip
-        recording during decode (assemble currently doesn't take a
-        diagnostics arg). Pass-through is preserved so callers don't need
-        to know which stages consume it.
+        When `diagnostics` is supplied, it is forwarded to
+        `assemble_score_from_system_predictions`, which increments
+        `skipped_systems` for each system whose decoder output failed
+        token validation (decoder truncation). It is also forwarded to
+        `export_musicxml` for Stage-D skip recording.
         """
         all_token_lists = []
         all_locations = []
@@ -99,7 +100,7 @@ class SystemInferencePipeline:
                         "conf": sys["conf"],
                     })
         return assemble_score_from_system_predictions(
-            all_token_lists, all_locations,
+            all_token_lists, all_locations, diagnostics=diagnostics,
         )
 
     def run_page(

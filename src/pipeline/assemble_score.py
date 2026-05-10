@@ -387,6 +387,7 @@ def assemble_score_from_system_predictions(
     system_locations: Sequence[Dict],
     *,
     sample_id_prefix: str = "",
+    diagnostics=None,
 ) -> AssembledScore:
     """Compose StaffRecognitionResult list from per-system token sequences.
 
@@ -397,6 +398,10 @@ def assemble_score_from_system_predictions(
 
     Each `system_locations` entry must contain: system_index, bbox (4-tuple
     x1,y1,x2,y2), page_index, conf.
+
+    If ``diagnostics`` is a ``StageDExportDiagnostics`` instance, it is
+    mutated in place: ``skipped_systems`` is incremented for each system
+    whose tokens fail validation (decoder truncation).
     """
     from src.data.convert_tokens import _split_staff_sequences_for_validation
 
@@ -409,6 +414,8 @@ def assemble_score_from_system_predictions(
             # before <staff_end>). Skip this system rather than failing the
             # whole piece — eval driver records the gap; downstream scoring
             # tolerates missing systems.
+            if diagnostics is not None:
+                diagnostics.skipped_systems += 1
             continue
         if not per_staff_lists:
             continue
