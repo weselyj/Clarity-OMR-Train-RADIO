@@ -234,7 +234,7 @@ def _resolve_cache_memory(
     Returns:
         memory tensor of shape (1, seq_tokens, 768), dtype matching the model.
     """
-    from src.cli import _encode_staff_image
+    from src.inference.decoder_runtime import _encode_staff_image
 
     if cache_root is not None and dataset in _CACHED_DATASETS:
         from src.data.encoder_cache import (
@@ -290,7 +290,7 @@ def _run_stage_b_inference_with_progress(
 ) -> Dict[str, object]:
     import torch
 
-    from src.cli import (
+    from src.inference.decoder_runtime import (
         _decode_stage_b_tokens,
         _encode_staff_image,
         _load_stage_b_crop_tensor,

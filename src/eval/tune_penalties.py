@@ -130,7 +130,7 @@ def _run_inference_with_config(
     project_root: Path,
 ) -> List[Dict[str, object]]:
     """Run inference on all crops with a specific penalty config."""
-    from src.cli import _decode_stage_b_tokens, _load_stage_b_crop_tensor
+    from src.inference.decoder_runtime import _decode_stage_b_tokens, _load_stage_b_crop_tensor
 
     results: List[Dict[str, object]] = []
     for row in crop_rows:
@@ -226,7 +226,7 @@ def _decode_with_custom_penalty(
 
     from src.decoding.beam_search import BeamSearchConfig, constrained_beam_search_with_state
 
-    from src.cli import _LazyLogitDict, _encode_staff_image, _resolve_stage_b_decode_model
+    from src.inference.decoder_runtime import _LazyLogitDict, _encode_staff_image, _resolve_stage_b_decode_model
 
     decode_model = _resolve_stage_b_decode_model(model)
     memory = _encode_staff_image(decode_model, pixel_values)

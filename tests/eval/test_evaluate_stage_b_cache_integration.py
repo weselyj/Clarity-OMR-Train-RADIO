@@ -72,9 +72,10 @@ if "torch" not in sys.modules:
 
 _CACHE_MOD = "src.data.encoder_cache"
 _MOD = "src.eval.evaluate_stage_b_checkpoint"
-# _encode_staff_image is imported from src.cli inside _resolve_cache_memory's body,
-# so we patch it at src.cli (where the name is bound at call time).
-_CLI_MOD = "src.cli"
+# _encode_staff_image is imported from src.inference.decoder_runtime inside
+# _resolve_cache_memory's body (post Phase A archival cleanup), so we patch it
+# there — that's where the name is bound at call time.
+_DECODER_MOD = "src.inference.decoder_runtime"
 
 
 def _fake_memory():
@@ -108,7 +109,7 @@ class TestCachedDatasetUsesCacheWhenRootProvided:
         sentinel_memory = MagicMock(name="post_bridge_memory")
 
         with patch(f"{_CACHE_MOD}.read_cache_entry", return_value=_fake_cached_entry()) as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image") as mock_encode, \
+             patch(f"{_DECODER_MOD}._encode_staff_image") as mock_encode, \
              patch(f"{_MOD}._encode_from_cached_features", return_value=sentinel_memory) as mock_bridge:
 
             result = _resolve_cache_memory(
@@ -142,7 +143,7 @@ class TestUncachedDatasetRunsEncoderForward:
         device = _fake_device("cpu")
 
         with patch(f"{_CACHE_MOD}.read_cache_entry") as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image", return_value=fake_memory) as mock_encode:
+             patch(f"{_DECODER_MOD}._encode_staff_image", return_value=fake_memory) as mock_encode:
 
             result = _resolve_cache_memory(
                 decode_model=MagicMock(),
@@ -174,7 +175,7 @@ class TestNoCacheRootMeansEncoderForwardForAll:
         device = _fake_device("cpu")
 
         with patch(f"{_CACHE_MOD}.read_cache_entry") as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image", return_value=fake_memory) as mock_encode:
+             patch(f"{_DECODER_MOD}._encode_staff_image", return_value=fake_memory) as mock_encode:
 
             result = _resolve_cache_memory(
                 decode_model=MagicMock(),
@@ -207,7 +208,7 @@ class TestCacheMissFallsBackToEncoderForward:
 
         # Both new-scheme and legacy-scheme raise FileNotFoundError
         with patch(f"{_CACHE_MOD}.read_cache_entry", side_effect=FileNotFoundError("miss")) as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image", return_value=fake_memory) as mock_encode:
+             patch(f"{_DECODER_MOD}._encode_staff_image", return_value=fake_memory) as mock_encode:
 
             result = _resolve_cache_memory(
                 decode_model=MagicMock(),
@@ -261,7 +262,7 @@ class TestLegacyKeyFallbackOnFileNotFound:
 
         sentinel_memory = MagicMock(name="post_bridge_memory")
         with patch(f"{_CACHE_MOD}.read_cache_entry", side_effect=side_effect) as mock_read, \
-             patch(f"{_CLI_MOD}._encode_staff_image") as mock_encode, \
+             patch(f"{_DECODER_MOD}._encode_staff_image") as mock_encode, \
              patch(f"{_MOD}._encode_from_cached_features", return_value=sentinel_memory) as mock_bridge:
 
             result = _resolve_cache_memory(
