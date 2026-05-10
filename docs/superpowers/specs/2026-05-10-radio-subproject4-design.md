@@ -358,7 +358,7 @@ These were considered during design but are explicitly out of scope for this sub
 ## References
 
 - Handoff that scoped this work: [`docs/superpowers/handoffs/2026-05-10-per-system-cleanup-wrap.md`](../handoffs/2026-05-10-per-system-cleanup-wrap.md)
-- Path reference: [`docs/locations.md`](../../locations.md)
+- Path reference: [`docs/paths.md`](../../paths.md)
 - External design review: `/home/ari/docs/clarity_omr_radio_subproject4_review.md` (drove the two-pass eval, explicit checkpoint loader, no-vocab-flag, and diagnostics-sidecar fixes)
 - TorchAO follow-up evaluation: `/home/ari/docs/clarity_omr_radio_torchao_evaluation.md`
 - Per-staff archive: [`archive/per_staff/`](../../../archive/per_staff/) (sources to lift `run_lieder_eval.py`, `score_lieder_eval.py`)
