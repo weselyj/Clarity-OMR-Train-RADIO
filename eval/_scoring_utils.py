@@ -3,7 +3,7 @@
 Imported by eval.score_demo_eval and eval.score_lieder_eval.  Contains:
 
   - CSV_HEADER              — canonical column list (piece + metrics + stage_d + failure)
-  - _read_stage_d_diag()   — reads <pred>.diagnostics.json sidecar, returns 8-tuple
+  - _read_stage_d_diag()   — reads <pred>.diagnostics.json sidecar, returns 9-tuple
   - _run_subprocess()      — invokes eval._score_one_piece, returns parsed JSON dict
   - score_metric_group_subprocess() — run ONE metric group in a fresh subprocess
   - score_piece_subprocess() — thin sequential wrapper over score_metric_group_subprocess
@@ -49,23 +49,29 @@ CSV_HEADER = [
     "stage_d_missing_durations", "stage_d_malformed_spans",
     "stage_d_unknown_tokens", "stage_d_fallback_rests",
     "stage_d_raised_count", "stage_d_first_error",
+    "stage_d_skipped_systems",
     "score_failure_reason",
 ]
 
 
 def _read_stage_d_diag(pred_path: Path) -> tuple:
-    """Return the 8 Stage-D diagnostic CSV values for *pred_path*.
+    """Return the 9 Stage-D diagnostic CSV values for *pred_path*.
 
     Looks for <pred_path>.diagnostics.json alongside the MusicXML output.
-    Returns a tuple of 8 values (all None if the sidecar is absent or unreadable).
+    Returns a tuple of 9 values (all None if the sidecar is absent or unreadable).
     Logs a warning to stderr when parsing fails (but still returns all-None so
     the row pipeline is not interrupted).
+
+    The 9 values, in CSV column order:
+        skipped_notes, skipped_chords, missing_durations, malformed_spans,
+        unknown_tokens, fallback_rests, raised_count, first_error, skipped_systems_count
     """
     diag_path = pred_path.with_suffix(pred_path.suffix + ".diagnostics.json")
     try:
         raw = json.loads(diag_path.read_text(encoding="utf-8"))
         raised = raw.get("raised_during_part_append", [])
         first_error = raised[0].get("error_message", "") if raised else ""
+        skipped_systems_count = len(raw.get("skipped_systems", []))
         return (
             raw.get("skipped_notes"),
             raw.get("skipped_chords"),
@@ -75,10 +81,11 @@ def _read_stage_d_diag(pred_path: Path) -> tuple:
             raw.get("fallback_rests"),
             len(raised),
             first_error,
+            skipped_systems_count,
         )
     except Exception as exc:
         print(f"[warn] Stage D sidecar parse failed for {pred_path}: {exc}", file=sys.stderr)
-        return (None, None, None, None, None, None, None, None)
+        return (None, None, None, None, None, None, None, None, None)
 
 
 def _build_reference_index(reference_dir: Path) -> "dict[str, Path]":

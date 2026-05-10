@@ -575,7 +575,7 @@ def main() -> None:
 
     def _write_missing_row(i: int, stem: str, reason: str) -> None:
         """Write a missing-reference row immediately."""
-        stage_d = (None,) * 8
+        stage_d = (None,) * 9
         if use_index_col:
             row = (i, stem, None, None, None) + stage_d + (reason,)
         else:
