@@ -68,3 +68,44 @@ def test_run_system_crop_decodes_via_bundle_and_returns_staves():
     fake_load_crop.assert_called_once()
     fake_encode.assert_called_once()
     fake_decode.assert_called_once()
+
+
+def test_run_page_iterates_systems_and_collects_staves():
+    """run_page calls the Stage A wrapper, crops each system, decodes each."""
+    from PIL import Image as _Image
+
+    fake_bundle = MagicMock(use_fp16=False, vocab=MagicMock(tokens=[]))
+    fake_yolo_instance = MagicMock()
+    fake_yolo_instance.detect_systems.return_value = [
+        {"system_index": 0, "bbox_extended": (0.0, 0.0, 100.0, 50.0), "conf": 0.9},
+        {"system_index": 1, "bbox_extended": (0.0, 50.0, 100.0, 100.0), "conf": 0.85},
+    ]
+    fake_token_seq = [
+        "<bos>",
+        "<staff_start>", "<staff_idx_0>",
+        "<measure_start>", "note-C4-quarter", "<measure_end>", "<staff_end>",
+        "<eos>",
+    ]
+
+    with patch("src.inference.system_pipeline.YoloStageASystems",
+               return_value=fake_yolo_instance), \
+         patch("src.inference.system_pipeline.load_stage_b_for_inference",
+               return_value=fake_bundle), \
+         patch("src.inference.system_pipeline._load_stage_b_crop_tensor",
+               return_value=MagicMock()), \
+         patch("src.inference.system_pipeline._encode_staff_image",
+               return_value=MagicMock()), \
+         patch("src.inference.system_pipeline._decode_stage_b_tokens",
+               return_value=fake_token_seq):
+
+        from src.inference.system_pipeline import SystemInferencePipeline
+
+        pipeline = SystemInferencePipeline(
+            yolo_weights="yolo.pt", stage_b_ckpt="stage_b.pt", device="cpu",
+        )
+        page = _Image.new("RGB", (1000, 800), color="white")
+        staves = pipeline.run_page(page, page_index=4)
+
+    assert len(staves) == 2
+    assert {s.system_index_hint for s in staves} == {0, 1}
+    assert all(s.location.page_index == 4 for s in staves)

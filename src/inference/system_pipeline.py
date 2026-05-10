@@ -58,6 +58,27 @@ class SystemInferencePipeline:
         self._image_max_width = image_max_width
         self._length_penalty_alpha = length_penalty_alpha
 
+    def run_page(
+        self,
+        page_image: Image.Image,
+        page_index: int = 0,
+    ) -> List[StaffRecognitionResult]:
+        """Detect systems on the page, decode each, return flat staves list."""
+        systems = self._stage_a.detect_systems(page_image)
+        all_staves: List[StaffRecognitionResult] = []
+        for sys in systems:
+            x1, y1, x2, y2 = sys["bbox_extended"]
+            crop = page_image.crop((int(x1), int(y1), int(x2), int(y2)))
+            sys_loc = {
+                "system_index": sys["system_index"],
+                "bbox": sys["bbox_extended"],
+                "page_index": page_index,
+                "conf": sys["conf"],
+            }
+            staves = self.run_system_crop(crop, sys["system_index"], sys_loc)
+            all_staves.extend(staves)
+        return all_staves
+
     def run_system_crop(
         self,
         crop: Image.Image,
