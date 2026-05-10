@@ -44,10 +44,10 @@ See [paths.md](paths.md) for the full output layout.
 ### Data preparation
 
 The `data/processed/mixed_systems_v1/data.yaml` input is produced by the
-data-preparation pipeline in the project root README (look for the
-"Building the Stage A dataset" section), which renders synthetic systems,
-derives system labels for the real corpora, and mixes them into the
-final YOLO-ready split.
+data-preparation pipeline documented in [QUICKSTART.md](QUICKSTART.md),
+which renders synthetic systems, derives system labels for the real
+corpora, and mixes them into the final YOLO-ready split. See also the
+"Training data preparation" section below.
 
 ## Stage B — System-level RADIO
 
@@ -137,9 +137,9 @@ from the cache directory if you suspect I/O is the bottleneck.
 
 The data-preparation pipeline (downloading PrIMuS / Camera-PrIMuS /
 GrandStaff / OpenScore Lieder, rendering synthetic systems, deriving
-system labels, building the mixed Stage A dataset) is documented in the
-project root README under "Data preparation". See also [paths.md](paths.md)
-for canonical output locations.
+system labels, building the mixed Stage A dataset) is documented in
+[QUICKSTART.md](QUICKSTART.md). See also [paths.md](paths.md) for
+canonical output locations.
 
 ## Platform notes
 

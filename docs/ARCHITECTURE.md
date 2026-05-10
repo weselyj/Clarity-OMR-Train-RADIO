@@ -40,7 +40,7 @@ Per this rule, the `grandstaff` (single-staff) variant — split from the 2-staf
 
 ## Per-staff archival (2026-05-10)
 
-The legacy per-staff inference pipeline (Stage A YOLO emitting per-staff crops + per-staff Stage B + per-staff assembly) was archived to [archive/per_staff/](../archive/per_staff/) in commits `e05ca05` → `8b8da66` → Phase A/B/C of the per-system cleanup. The lieder smoke evaluation against Stage 3 v2 produced `onset_f1=0.067` because of this format mismatch (per-staff crops fed to a system-trained model), not real model weakness — see [archive/handoffs/2026-05-10-radio-stage3-phase2-mid-handoff.md](../archive/handoffs/2026-05-10-radio-stage3-phase2-mid-handoff.md) for the original Phase 2 evaluation that surfaced this. Subproject 4 (TBD) builds the replacement system-aware inference pipeline.
+The legacy per-staff inference pipeline (Stage A YOLO emitting per-staff crops + per-staff Stage B + per-staff assembly) was archived to [archive/per_staff/](../archive/per_staff/) in commits `e05ca05` → `8b8da66` → Phase A/B/C of the per-system cleanup. The lieder smoke evaluation against Stage 3 v2 produced `onset_f1=0.067` because of this format mismatch (per-staff crops fed to a system-trained model), not real model weakness — see [archive/handoffs/2026-05-10-radio-stage3-phase2-mid-handoff.md](../archive/handoffs/2026-05-10-radio-stage3-phase2-mid-handoff.md) for the original Phase 2 evaluation that surfaced this. Subproject 4 (shipped 2026-05-10) is the replacement system-aware inference pipeline — see [EVALUATION.md](EVALUATION.md).
 
 ## Stage A — System detection
 
