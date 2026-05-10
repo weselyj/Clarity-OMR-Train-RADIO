@@ -382,6 +382,60 @@ def assemble_score(staves: Sequence[StaffRecognitionResult]) -> AssembledScore:
     return AssembledScore(systems=assembled_systems, part_order=part_order_set)
 
 
+def assemble_score_from_system_predictions(
+    system_token_lists: Sequence[List[str]],
+    system_locations: Sequence[Dict],
+    *,
+    sample_id_prefix: str = "",
+) -> AssembledScore:
+    """Compose StaffRecognitionResult list from per-system token sequences.
+
+    Splits each system's tokens at <staff_end> boundaries via
+    `_split_staff_sequences_for_validation`, even-splits the system bbox
+    vertically by N (number of emitted staves), and delegates to the
+    existing assemble_score().
+
+    Each `system_locations` entry must contain: system_index, bbox (4-tuple
+    x1,y1,x2,y2), page_index, conf.
+    """
+    from src.data.convert_tokens import _split_staff_sequences_for_validation
+
+    staves: List[StaffRecognitionResult] = []
+    for sys_tokens, sys_loc in zip(system_token_lists, system_locations):
+        per_staff_lists = _split_staff_sequences_for_validation(sys_tokens)
+        if not per_staff_lists:
+            continue
+        n = len(per_staff_lists)
+        sys_idx = int(sys_loc["system_index"])
+        page_idx = int(sys_loc.get("page_index", 0))
+        x1, y1, x2, y2 = sys_loc["bbox"]
+        sys_h = float(y2) - float(y1)
+        for i, staff_tokens in enumerate(per_staff_lists):
+            y_top = float(y1) + i * sys_h / n
+            y_bottom = float(y1) + (i + 1) * sys_h / n
+            location = StaffLocation(
+                page_index=page_idx,
+                y_top=y_top,
+                y_bottom=y_bottom,
+                x_left=float(x1),
+                x_right=float(x2),
+            )
+            sample_id = (
+                f"{sample_id_prefix}page{page_idx:04d}"
+                f"_sys{sys_idx:02d}_staff{i:02d}"
+            )
+            staves.append(
+                StaffRecognitionResult(
+                    sample_id=sample_id,
+                    tokens=list(staff_tokens),
+                    location=location,
+                    system_index_hint=sys_idx,
+                )
+            )
+
+    return assemble_score(staves)
+
+
 DURATION_QUARTER_LENGTH = {
     "_whole": 4.0,
     "_half": 2.0,
