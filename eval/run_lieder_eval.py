@@ -18,9 +18,11 @@ and reused across all pieces. This avoids per-piece model reload overhead and is
 safe because music21/zss state stays out of inference (scoring subprocess-
 isolated in score_lieder_eval.py).
 
-Uses sibling Clarity-OMR's shipped YOLO weights for Stage A; loads our trained
-Stage B checkpoint via --stage-b-checkpoint. Our src.eval.evaluate_stage_b_checkpoint
-detects the DoRA-wrapped (PEFT base_model.model.* with lora_*) checkpoint format
+Uses the in-repo system-level YOLO weights (default
+runs/detect/runs/yolo26m_systems/weights/best.pt; override via
+--stage-a-weights). Loads the trained Stage B checkpoint via
+--checkpoint. src.eval.evaluate_stage_b_checkpoint detects the
+DoRA-wrapped (PEFT base_model.model.* with lora_*) checkpoint format
 automatically and applies _prepare_model_for_dora before load_state_dict.
 
 Defaults to greedy decode (beam_width=1, max_decode_steps=256) — fast enough

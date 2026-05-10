@@ -371,9 +371,6 @@ def test_default_stage_a_weights_points_to_system_yolo():
 
 def test_main_errors_when_stage_a_weights_missing(tmp_path, capsys, monkeypatch):
     """When --stage-a-weights points to a non-existent file, main exits with a clear error."""
-    import sys
-    from eval import run_lieder_eval
-
     # Create dummy checkpoint and config files so they pass any other validation
     # that might run; the test exercises only the stage-a-weights check.
     ckpt = tmp_path / "ckpt.pt"
@@ -392,7 +389,7 @@ def test_main_errors_when_stage_a_weights_missing(tmp_path, capsys, monkeypatch)
     monkeypatch.setattr(sys, "argv", fake_argv)
 
     with pytest.raises(SystemExit):
-        run_lieder_eval.main()
+        rle.main()
 
     captured = capsys.readouterr()
     assert "Stage A weights not found" in captured.err
