@@ -217,3 +217,17 @@ scratch/
 
 # Model weight files at repo root (use checkpoints/ instead)
 /*.pt
+
+# Eval outputs (canonical published results live at docs/RESULTS.md link)
+eval/results/*
+!eval/results/.gitkeep
+!eval/results/README.md
+
+# YOLO training output trees (Stage A weights live on the GPU box)
+runs/
+
+# RADIO checkpoints (live on the GPU box; do not commit)
+checkpoints/
+
+# Personal training-run telemetry
+src/train/training_steps*.jsonl
