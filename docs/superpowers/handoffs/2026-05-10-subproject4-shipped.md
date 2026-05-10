@@ -1,16 +1,18 @@
 # Subproject 4 — Shipped (2026-05-10)
 
-> Per-system end-to-end inference pipeline (PDF → MusicXML) plus the 50-piece lieder corpus eval. All 16 plan tasks complete; ship-gate **PASS**.
+> Per-system end-to-end inference pipeline (PDF → MusicXML) plus the 50-piece lieder corpus eval. All 16 plan tasks complete; ship-gate **PASS**. Merged to `main` as PR #44.
 
 ## State at end of session
 
-| Box | Branch | HEAD | Pushed? |
-|---|---|---|---|
-| Local (`/home/ari/work/Clarity-OMR-Train-RADIO`) | `feat/subproject4-system-inference` | `7793351` (+ run-artifacts commit) | yes |
-| GPU box (`seder` / `10.10.1.29`) | `feat/subproject4-system-inference` | `7793351` (artifacts produced) | n/a |
-| Origin | `feat/subproject4-system-inference` | `7793351` | yes |
+| Box | Branch | HEAD |
+|---|---|---|
+| Local (`/home/ari/work/Clarity-OMR-Train-RADIO`) | `main` | `3b6ab4e` (merge of PR #44) |
+| GPU box (`seder` / `10.10.1.29`) | `main` | `3b6ab4e` (fast-forward synced) |
+| Origin | `main` | `3b6ab4e` |
 
-Working tree will be clean once the run-artifacts commit lands.
+Working trees clean on both boxes. Feature branch `feat/subproject4-system-inference` deleted both locally and on origin.
+
+PR: https://github.com/weselyj/Clarity-OMR-Train-RADIO/pull/44
 
 ## Smoke result (`lc6623145`)
 
@@ -63,15 +65,26 @@ Commits on top of the prior tasks-1-11-shipped handoff (`27e17b9`):
 | `5ce3fbb` | fix: skip malformed system tokens (decoder truncation) in `assemble_score_from_system_predictions` instead of failing the piece |
 | `d70fc73` | lift `eval/_score_one_piece.py` from archive — Task 11 missed it; required by the scorer subprocess |
 | `7793351` | docs: locations.md updated with Subproject 4 artifact paths and the GPU-box `venv-cu132` requirement |
-| (next) | Phase 1 status JSONL + Phase 2 scores CSV from the 50-piece run |
+| `d99d795` | data: subproject4 50-piece corpus run results (status JSONL + scores CSV) + this shipping handoff |
+| `674d0a2` | review fixes: revert lazy YOLO import to spec form; add `skipped_systems` counter to `StageDExportDiagnostics` (see "Pre-merge review fixes" below) |
+| `3b6ab4e` | merge of PR #44 to `main` |
 
-REVIEW CHECKPOINT 2 verified: 113 of 113 new-functionality tests green locally; 2 pre-existing failures unrelated to this work (`tests/data/test_multi_dpi.py` ImageMagick path, `tests/data/test_encoder_cache.py` torch perf paths) confirmed in the prior handoff.
+REVIEW CHECKPOINT 2 verified: 113 of 113 new-functionality tests green locally; post-`674d0a2` the 5 `tests/inference/test_system_pipeline*.py` cases no longer collect on the local CPU-only torch install (expected — those run on the GPU box's `venv-cu132`, where 108/108 pass). 2 pre-existing failures unrelated to this work (`tests/data/test_multi_dpi.py` ImageMagick path, `tests/data/test_encoder_cache.py` torch perf paths) confirmed in the prior handoff.
+
+## Pre-merge review fixes (commit `674d0a2`)
+
+The user reviewed the PR and flagged two of the items called out under "Spec deviations worth knowing." Both addressed before merge:
+
+1. **Reverted the lazy YOLO import.** The previous `yolo_stage_a_systems.py` carried a `YOLO = None` placeholder + `_get_yolo()` helper to dodge a `RuntimeError: operator torchvision::nms does not exist` on local CPU-only torch installs. The right answer was to stop installing CPU torch locally and run torch-dep tests on `seder`'s `venv-cu132` (CUDA 13 nightly) instead. Module-top `from ultralytics import YOLO` is now back, matching the spec. Saved as user feedback memory `feedback_use_gpu_box_for_torch_tests.md` so future sessions don't recreate the workaround.
+2. **Added `skipped_systems` field to `StageDExportDiagnostics`.** `assemble_score_from_system_predictions` now accepts an optional `diagnostics` argument and increments the counter every time the splitter raises on a malformed (decoder-truncated) system. `SystemInferencePipeline.run_pdf` forwards the caller's diagnostics through, so the per-piece `.musicxml.diagnostics.json` sidecar now exposes `skipped_systems`. This unlocks correlating low `onset_f1` with decoder-truncation rate during post-mortems on the 17 below-baseline pieces. Two new tests (`test_diagnostics_skipped_systems_counter_tracks_each_drop`, `test_diagnostics_default_none_does_not_crash`) cover the counter and the `None` default.
+
+After these fixes, on the GPU box: 108 passed / 1 skipped across `tests/pipeline tests/inference tests/cli eval/tests` (excluding the unrelated `eval/tests/test_playback.py` collection).
 
 ## Spec deviations worth knowing
 
-1. **Lazy YOLO import** in `src/models/yolo_stage_a_systems.py` (carried over from Tasks 1-11; necessary on CPU-only torch installs).
+1. ~~**Lazy YOLO import** in `src/models/yolo_stage_a_systems.py`~~ — **resolved in `674d0a2`**: reverted to spec-form module-top import. Local CPU-only torch installs are no longer a target; torch-dep tests run on the GPU box.
 2. **`AssembledStaff` does not carry `system_index_hint`** to the output type; the input `StaffRecognitionResult` does. The Task-4 test was rewritten to match this rather than mutate `AssembledStaff`. Carried over from Tasks 1-11.
-3. **Malformed system tokens are skipped silently** rather than recovered or counted. The eval driver's per-piece status row records "ok" as long as inference completed; the diagnostics sidecar does not currently surface skipped-system counts. Future improvement: thread skipped systems into `StageDExportDiagnostics` so the scorer can correlate "low onset_f1" with "many skipped systems."
+3. ~~**Malformed system tokens are skipped silently**~~ — **partially resolved in `674d0a2`**: `StageDExportDiagnostics.skipped_systems` is now incremented on each drop and surfaced in the `.musicxml.diagnostics.json` sidecar. The eval driver's per-piece status row still reports "ok" regardless (status JSONL contract unchanged); the count is in the sidecar, not the JSONL.
 4. **Score driver flag aliases** (Task 14): `--ground-truth-dir` aliases `--reference-dir`, `--out-csv` is a new override Path. The original `--name`-based dir convention still works; the new flags exist so `invoke_scoring_phase` (Task 13) can call the scorer with the canonical Subproject 4 contract.
 
 ## Operational notes
@@ -91,8 +104,8 @@ Per the spec's "Deferred follow-ups" section:
 
 New (post-shipping) follow-ups:
 
-- Investigate the 17 below-baseline pieces; cross-reference with `cameraprimus`-style scans on the eval split.
-- Consider exposing skipped-system counts in `StageDExportDiagnostics` so future runs can correlate decoder-truncation with score regressions.
+- Investigate the 17 below-baseline pieces; cross-reference with `cameraprimus`-style scans on the eval split. The new `skipped_systems` field in each piece's `.musicxml.diagnostics.json` sidecar (added in `674d0a2`) tells you which low scores are driven by decoder truncation vs genuine model weakness — re-run the corpus eval on `main` once and aggregate the sidecar counts to triage.
+- Consider also exposing `skipped_systems` in the per-piece status JSONL so a Phase-1 post-mortem doesn't have to re-open every sidecar.
 
 ## References
 
