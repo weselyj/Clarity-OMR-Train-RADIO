@@ -27,20 +27,24 @@ from typing import Dict, Optional
 STRONG_THRESHOLD = 0.30
 MIXED_THRESHOLD = 0.2410
 
-# Spec §"Phase 2 §2" line 254-262. Per-dataset Stage 3 quality floors (revised
-# 2026-05-10 per Plan D Decision #4 revision — single-staff variants of
-# grandstaff and primus are confirming context, not gating, since Stage 3 was
-# trained on _systems only and the single-staff regression is by design;
-# cameraprimus single-staff retained because it doubles as a regression
-# tripwire for the cameraprimus baseline.).
+# Per-dataset Stage 3 quality floors (revised 2026-05-10 per product rule:
+# the model handles systems by default and naturally-single-staff scores as
+# 1-staff systems. Single-staff datasets gate IFF their source is naturally
+# single-staff — primus and cameraprimus qualify; grandstaff (single-staff)
+# does NOT, because that data is artificially split from a 2-staff source).
+#
+# Static floors (absolute thresholds — system-level surfaces):
 PER_DATASET_FLOORS = {
     "synthetic_systems": 90.0,
     "grandstaff_systems": 95.0,
     "primus_systems": 80.0,
-    # cameraprimus + cameraprimus_systems are dynamic — see _resolve_cameraprimus_floor().
 }
-CAMERAPRIMUS_FLOOR_BASE = 75.0
-CAMERAPRIMUS_REGRESSION_TOLERANCE = 5.0
+#
+# Dynamic floors (regression tripwires — naturally-single-staff surfaces and
+# the cameraprimus_systems baseline). Each uses max(75, baseline - 5) so a
+# small slip is tolerated, a catastrophic loss fires DIAGNOSE.
+DYNAMIC_FLOOR_BASE = 75.0
+DYNAMIC_FLOOR_REGRESSION_TOLERANCE = 5.0
 
 
 class Verdict(str, enum.Enum):
@@ -67,15 +71,17 @@ class GateResult:
     per_dataset_results: Dict[str, FloorResult]
     cameraprimus_systems_baseline: float
     cameraprimus_baseline: float
+    primus_baseline: float
     lc6548281_onset_f1: Optional[float]
 
 
-def _resolve_cameraprimus_floor(baseline_re_eval: float) -> float:
-    """Spec line 261: floor = 75 if re-eval confirms 75.2; raise to
-    re_eval - 5 if re-eval is higher. Used for both cameraprimus
-    (single-staff) and cameraprimus_systems variants — each gets its
-    own baseline + dynamic floor."""
-    return max(CAMERAPRIMUS_FLOOR_BASE, baseline_re_eval - CAMERAPRIMUS_REGRESSION_TOLERANCE)
+def _resolve_dynamic_floor(baseline_re_eval: float) -> float:
+    """Regression-tripwire floor: floor = max(75, baseline - 5).
+
+    Used for naturally-single-staff datasets (primus, cameraprimus) and the
+    cameraprimus_systems variant. Tolerates small slip, fires DIAGNOSE on
+    catastrophic loss."""
+    return max(DYNAMIC_FLOOR_BASE, baseline_re_eval - DYNAMIC_FLOOR_REGRESSION_TOLERANCE)
 
 
 def _classify_lieder(mean_onset_f1: float) -> str:
@@ -93,6 +99,7 @@ def evaluate(
     per_dataset: Dict[str, float],
     cameraprimus_systems_baseline: float,
     cameraprimus_baseline: float,
+    primus_baseline: float,
     lc6548281_onset_f1: Optional[float] = None,
 ) -> GateResult:
     """Aggregate the inputs into a verdict.
@@ -101,17 +108,20 @@ def evaluate(
         lieder_mean_onset_f1: from eval/results/lieder_<name>.csv
         musicxml_validity_rate: from same CSV (corroborating only)
         per_dataset: dict {dataset_name: composite quality_score, 0-100 scale};
-            5 gated keys (synthetic_systems, grandstaff_systems, primus_systems,
-            cameraprimus_systems, cameraprimus). Single-staff grandstaff/primus
-            may be present in the dict but are not gated (Plan D Decision #4
-            revision — confirming context only).
+            6 gated keys (synthetic_systems, grandstaff_systems, primus_systems,
+            cameraprimus_systems, primus, cameraprimus). The single-staff
+            `grandstaff` key may be present but is NOT gated — that data is
+            artificially split from a 2-staff source and is not a valid
+            product input per the per-system inference design.
         cameraprimus_systems_baseline: Stage 2 v2 quality on token_manifest_stage3.jsonl
-        cameraprimus_baseline: Stage 2 v2 quality on token_manifest_full.jsonl
+        cameraprimus_baseline: Stage 2 v2 quality on token_manifest_full.jsonl, cameraprimus rows
+        primus_baseline: Stage 2 v2 quality on token_manifest_full.jsonl, primus rows
         lc6548281_onset_f1: optional sanity-check value (None if not evaluated)
     """
     floors = dict(PER_DATASET_FLOORS)
-    floors["cameraprimus_systems"] = _resolve_cameraprimus_floor(cameraprimus_systems_baseline)
-    floors["cameraprimus"] = _resolve_cameraprimus_floor(cameraprimus_baseline)
+    floors["cameraprimus_systems"] = _resolve_dynamic_floor(cameraprimus_systems_baseline)
+    floors["cameraprimus"] = _resolve_dynamic_floor(cameraprimus_baseline)
+    floors["primus"] = _resolve_dynamic_floor(primus_baseline)
 
     per_dataset_results = {}
     any_floor_fail = False
@@ -147,6 +157,7 @@ def evaluate(
         per_dataset_results=per_dataset_results,
         cameraprimus_systems_baseline=cameraprimus_systems_baseline,
         cameraprimus_baseline=cameraprimus_baseline,
+        primus_baseline=primus_baseline,
         lc6548281_onset_f1=lc6548281_onset_f1,
     )
 
@@ -166,7 +177,7 @@ def render_report(result: GateResult, *, name: str = "stage3_v2") -> str:
     lines.append("")
     lines.append("| Dataset | Measured | Floor | Status |")
     lines.append("|---|---|---|---|")
-    for ds in ["synthetic_systems", "grandstaff_systems", "primus_systems", "cameraprimus_systems", "cameraprimus"]:
+    for ds in ["synthetic_systems", "grandstaff_systems", "primus_systems", "cameraprimus_systems", "primus", "cameraprimus"]:
         r = result.per_dataset_results.get(ds)
         if r is None:
             lines.append(f"| {ds} | — | — | MISSING |")
@@ -176,7 +187,13 @@ def render_report(result: GateResult, *, name: str = "stage3_v2") -> str:
     lines.append("")
     cps_floor = result.per_dataset_results["cameraprimus_systems"].floor
     cp_floor = result.per_dataset_results["cameraprimus"].floor
-    lines.append(f"_cameraprimus_systems floor = max(75, {result.cameraprimus_systems_baseline:.2f} - 5) = {cps_floor:.2f}; cameraprimus floor = max(75, {result.cameraprimus_baseline:.2f} - 5) = {cp_floor:.2f}_")
+    p_floor = result.per_dataset_results["primus"].floor
+    lines.append(
+        f"_Dynamic floors (max(75, baseline-5)): "
+        f"cameraprimus_systems = max(75, {result.cameraprimus_systems_baseline:.2f} - 5) = {cps_floor:.2f}; "
+        f"cameraprimus = max(75, {result.cameraprimus_baseline:.2f} - 5) = {cp_floor:.2f}; "
+        f"primus = max(75, {result.primus_baseline:.2f} - 5) = {p_floor:.2f}_"
+    )
     lines.append("")
     lines.append("## Decision flow (spec §Phase 2)")
     lines.append("")
@@ -199,6 +216,7 @@ def main() -> int:
     p.add_argument("--per-dataset-json", type=str, required=True, help='JSON: {"dataset": composite_quality, ...} for 7 datasets')
     p.add_argument("--cameraprimus-systems-baseline", type=float, required=True, help="Stage 2 v2 cameraprimus_systems quality from token_manifest_stage3.jsonl eval")
     p.add_argument("--cameraprimus-baseline", type=float, required=True, help="Stage 2 v2 cameraprimus quality from token_manifest_full.jsonl eval")
+    p.add_argument("--primus-baseline", type=float, required=True, help="Stage 2 v2 primus quality from token_manifest_full.jsonl eval")
     p.add_argument("--lc6548281-onset-f1", type=float, default=None, help="Optional sanity-check value")
     p.add_argument("--name", type=str, default="stage3_v2", help="Report identifier")
     p.add_argument("--output", type=Path, default=None, help="Optional path to write the markdown report")
@@ -211,6 +229,7 @@ def main() -> int:
         per_dataset=per_dataset,
         cameraprimus_systems_baseline=args.cameraprimus_systems_baseline,
         cameraprimus_baseline=args.cameraprimus_baseline,
+        primus_baseline=args.primus_baseline,
         lc6548281_onset_f1=args.lc6548281_onset_f1,
     )
     report = render_report(result, name=args.name)

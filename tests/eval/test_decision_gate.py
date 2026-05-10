@@ -22,6 +22,7 @@ def _mk_inputs(**overrides):
         },
         "cameraprimus_systems_baseline": 75.2,
         "cameraprimus_baseline": 75.2,
+        "primus_baseline": 74.3,
         "lc6548281_onset_f1": 0.15,
     }
     base.update(overrides)
@@ -185,3 +186,51 @@ def test_render_report_contains_verdict_and_evidence():
     assert "0.32" in report or "0.3200" in report
     assert "synthetic_systems" in report
     assert "grandstaff_systems" in report
+
+
+def test_primus_single_staff_is_dynamic_regression_tripwire():
+    """Per the product rule (model handles systems by default and naturally-
+    single-staff scores as 1-staff systems), `primus` (single-staff, naturally
+    1-staff source) gates as a regression tripwire with floor max(75, baseline-5).
+    `grandstaff` (single-staff, artificially split from a 2-staff source) does
+    NOT gate."""
+    from eval.decision_gate import evaluate, Verdict
+
+    # Primus baseline of 80 → floor max(75, 80-5) = 75. Stage 3 v2 measured 76.8.
+    result = evaluate(**_mk_inputs(
+        primus_baseline=80.0,
+        per_dataset={
+            "synthetic_systems": 92.0,
+            "grandstaff_systems": 96.0,
+            "grandstaff": 50.0,           # catastrophic but ungated
+            "primus_systems": 82.0,
+            "primus": 76.8,                # above dynamic floor 75
+            "cameraprimus_systems": 76.0,
+            "cameraprimus": 76.0,
+        },
+    ))
+    assert result.per_dataset_results["primus"].floor == 75.0
+    assert result.per_dataset_results["primus"].passed is True
+    assert "grandstaff" not in result.per_dataset_results, "single-staff grandstaff must not gate"
+    assert result.verdict == Verdict.SHIP   # not affected by ungated grandstaff
+
+
+def test_primus_single_staff_failure_fires_diagnose():
+    """A primus single-staff result below max(75, baseline-5) is a real
+    regression and must fire DIAGNOSE."""
+    from eval.decision_gate import evaluate, Verdict
+
+    result = evaluate(**_mk_inputs(
+        primus_baseline=85.0,                       # → floor 80
+        per_dataset={
+            "synthetic_systems": 92.0,
+            "grandstaff_systems": 96.0,
+            "primus_systems": 82.0,
+            "primus": 70.0,                          # below floor 80
+            "cameraprimus_systems": 76.0,
+            "cameraprimus": 76.0,
+        },
+    ))
+    assert result.per_dataset_results["primus"].floor == 80.0
+    assert result.per_dataset_results["primus"].passed is False
+    assert result.verdict == Verdict.DIAGNOSE
