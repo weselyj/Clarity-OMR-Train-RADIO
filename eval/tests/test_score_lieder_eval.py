@@ -368,7 +368,7 @@ class TestMissingReference:
 
         # Verify the sentinel value matches what the scripts write
         sentinel = "reference_mxl_missing"
-        row = ("piece-without-ref", None, None, None) + (None,) * 8 + (sentinel,)
+        row = ("piece-without-ref", None, None, None) + (None,) * 9 + (sentinel,)
         assert row[-1] == "reference_mxl_missing"
         # This row should NOT be considered a scoring failure
         assert row[-1] != "subprocess exit"
@@ -388,14 +388,14 @@ class TestMetricAwareSummary:
         rows = {}
         for i in range(1, n_total + 1):
             if i <= n_scored:
-                row = ["piece-" + str(i), None, None, None] + [None] * 8 + [None]
+                row = ["piece-" + str(i), None, None, None] + [None] * 9 + [None]
                 for m in metrics:
                     col = metric_col.get(m)
                     if col is not None:
                         row[col] = 0.8 + i * 0.01
                 rows[i] = tuple(row)
             else:
-                rows[i] = ("piece-" + str(i), None, None, None) + (None,) * 8 + ("tedn: subprocess timeout after 300s",)
+                rows[i] = ("piece-" + str(i), None, None, None) + (None,) * 9 + ("tedn: subprocess timeout after 300s",)
         return rows
 
     def test_tedn_only_summary(self, capsys):
@@ -444,9 +444,9 @@ class TestMetricAwareSummary:
         from eval.score_lieder_eval import _print_summary
 
         rows = {
-            1: ("piece-1", 0.85, 0.72, 0.91) + (None,) * 8 + (None,),
-            2: ("piece-2", None, None, None) + (None,) * 8 + ("reference_mxl_missing",),
-            3: ("piece-3", None, None, None) + (None,) * 8 + ("subprocess exit 1: error",),
+            1: ("piece-1", 0.85, 0.72, 0.91) + (None,) * 9 + (None,),
+            2: ("piece-2", None, None, None) + (None,) * 9 + ("reference_mxl_missing",),
+            3: ("piece-3", None, None, None) + (None,) * 9 + ("subprocess exit 1: error",),
         }
         _print_summary(rows, ["onset_f1", "tedn", "linearized_ser"], n_total=3, missing_ref_count=1, name="test")
 
@@ -1016,8 +1016,8 @@ class TestResume:
         with csv_path.open("w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(CSV_HEADER)
-            w.writerow(["piece-a", 0.85, 0.72, 0.91] + [None] * 8 + [None])
-            w.writerow(["piece-b", 0.80, 0.68, 0.88] + [None] * 8 + [None])
+            w.writerow(["piece-a", 0.85, 0.72, 0.91] + [None] * 9 + [None])
+            w.writerow(["piece-b", 0.80, 0.68, 0.88] + [None] * 9 + [None])
 
         stems = _load_resume_set(csv_path)
         assert "piece-a" in stems
@@ -1050,7 +1050,7 @@ class TestResume:
         with partial_path.open("w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(CSV_HEADER)
-            w.writerow(["piece-00", 0.85, 0.72, 0.91] + [None] * 8 + [None])
+            w.writerow(["piece-00", 0.85, 0.72, 0.91] + [None] * 9 + [None])
 
         scored_calls = []
 
@@ -1138,7 +1138,7 @@ class TestStageDWarning:
 
         result = _read_stage_d_diag(pred_path)
         # Should return all-None tuple (row pipeline kept alive)
-        assert result == (None, None, None, None, None, None, None, None)
+        assert result == (None, None, None, None, None, None, None, None, None)
         # Should have warned to stderr
         captured = capsys.readouterr()
         assert "[warn]" in captured.err
@@ -1155,7 +1155,7 @@ class TestStageDWarning:
         # No sidecar file created
 
         result = _read_stage_d_diag(pred_path)
-        assert result == (None, None, None, None, None, None, None, None)
+        assert result == (None, None, None, None, None, None, None, None, None)
         captured = capsys.readouterr()
         assert "[warn]" in captured.err
 
@@ -1219,3 +1219,91 @@ def test_tedn_flag_default_off_skips_tedn_computation(monkeypatch, tmp_path):
         "--out-csv", str(tmp_path / "scores.csv"),
     ])
     assert args.tedn is False
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (codex finding #6): stage_d_skipped_systems column
+# ---------------------------------------------------------------------------
+
+def test_csv_header_includes_stage_d_skipped_systems():
+    """CSV_HEADER includes the new stage_d_skipped_systems column."""
+    from eval._scoring_utils import CSV_HEADER
+    assert "stage_d_skipped_systems" in CSV_HEADER
+
+
+def test_read_stage_d_diag_extracts_skipped_systems(tmp_path):
+    """_read_stage_d_diag returns the skipped_systems count from the sidecar."""
+    import json
+    from eval._scoring_utils import _read_stage_d_diag
+
+    pred = tmp_path / "piece.musicxml"
+    pred.write_text("<score-partwise/>", encoding="utf-8")
+    diag = pred.with_suffix(pred.suffix + ".diagnostics.json")
+    diag.write_text(json.dumps({
+        "skipped_notes": 1,
+        "skipped_chords": 2,
+        "missing_durations": 3,
+        "malformed_spans": 4,
+        "unknown_tokens": 5,
+        "fallback_rests": 6,
+        "raised_during_part_append": [],
+        "skipped_systems": 3,  # int counter — matches StageDExportDiagnostics
+    }), encoding="utf-8")
+
+    result = _read_stage_d_diag(pred)
+
+    assert len(result) == 9, f"expected 9-tuple, got {len(result)}: {result}"
+    assert result[-1] == 3
+
+
+def test_read_stage_d_diag_skipped_systems_null(tmp_path):
+    """If sidecar explicitly sets skipped_systems to null, default to 0."""
+    import json
+    from eval._scoring_utils import _read_stage_d_diag
+
+    pred = tmp_path / "piece.musicxml"
+    pred.write_text("<score-partwise/>", encoding="utf-8")
+    diag = pred.with_suffix(pred.suffix + ".diagnostics.json")
+    diag.write_text(json.dumps({
+        "skipped_notes": 0, "skipped_chords": 0, "missing_durations": 0,
+        "malformed_spans": 0, "unknown_tokens": 0, "fallback_rests": 0,
+        "raised_during_part_append": [],
+        "skipped_systems": None,
+    }), encoding="utf-8")
+
+    result = _read_stage_d_diag(pred)
+
+    assert len(result) == 9
+    assert result[-1] == 0
+
+
+def test_read_stage_d_diag_missing_skipped_systems_field(tmp_path):
+    """If the sidecar lacks skipped_systems (older outputs), value defaults to 0."""
+    import json
+    from eval._scoring_utils import _read_stage_d_diag
+
+    pred = tmp_path / "piece.musicxml"
+    pred.write_text("<score-partwise/>", encoding="utf-8")
+    diag = pred.with_suffix(pred.suffix + ".diagnostics.json")
+    diag.write_text(json.dumps({
+        "skipped_notes": 0, "skipped_chords": 0, "missing_durations": 0,
+        "malformed_spans": 0, "unknown_tokens": 0, "fallback_rests": 0,
+        "raised_during_part_append": [],
+    }), encoding="utf-8")
+
+    result = _read_stage_d_diag(pred)
+
+    assert len(result) == 9
+    assert result[-1] == 0
+
+
+def test_read_stage_d_diag_returns_none_tuple_on_missing_sidecar(tmp_path):
+    """When the sidecar is absent, return all-None 9-tuple (existing contract extended)."""
+    from eval._scoring_utils import _read_stage_d_diag
+
+    pred = tmp_path / "no_sidecar.musicxml"
+    pred.write_text("<score-partwise/>", encoding="utf-8")
+
+    result = _read_stage_d_diag(pred)
+
+    assert result == (None, None, None, None, None, None, None, None, None)

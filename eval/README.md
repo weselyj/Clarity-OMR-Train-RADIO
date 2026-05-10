@@ -47,47 +47,8 @@ was the same root cause — see PR #26).
 
 ## Running the evals
 
-### Lieder eval (146-piece corpus, two-pass)
+For running the lieder corpus evaluation (and the demo / baseline evals),
+see [`docs/EVALUATION.md`](../docs/EVALUATION.md).
 
-```bash
-# Pass 1: inference (writes predicted MusicXML to eval/results/lieder_<name>/)
-venv\Scripts\python -m eval.run_lieder_eval \
-    --checkpoint checkpoints/stage3/best.pt \
-    --config configs/train_stage3.yaml \
-    --name stage3 \
-    --max-pieces 20    # optional: smoke-cap before full run
-
-# Pass 2: scoring (subprocess-isolated per piece)
-venv\Scripts\python -m eval.score_lieder_eval \
-    --predictions-dir eval/results/lieder_stage3 \
-    --reference-dir data/openscore_lieder/scores \
-    --name stage3
-```
-
-Output CSV: `eval/results/lieder_stage3.csv`
-
-### Demo eval (4-piece public comparison table, two-pass)
-
-```bash
-# Pass 1: inference
-venv-cu132\Scripts\python -m eval.run_clarity_demo_eval \
-    --checkpoint checkpoints/stage3/best.pt \
-    --config configs/train_stage3.yaml \
-    --name stage3
-
-# Pass 2: scoring
-venv-cu132\Scripts\python -m eval.score_demo_eval \
-    --predictions-dir eval/results/clarity_demo_stage3 \
-    --reference-dir data/clarity_demo/mxl \
-    --name stage3
-```
-
-Output CSV: `eval/results/clarity_demo_stage3.csv`
-
-### Baseline reproduction
-
-```bash
-python -m eval.run_baseline_reproduction
-```
-
-Results land in `eval/results/`.
+For repo-relative paths to checkpoints and corpus data, see
+[`docs/paths.md`](../docs/paths.md).

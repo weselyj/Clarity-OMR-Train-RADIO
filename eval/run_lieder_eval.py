@@ -18,15 +18,16 @@ and reused across all pieces. This avoids per-piece model reload overhead and is
 safe because music21/zss state stays out of inference (scoring subprocess-
 isolated in score_lieder_eval.py).
 
-Uses sibling Clarity-OMR's shipped YOLO weights for Stage A; loads our trained
-Stage B checkpoint via --stage-b-checkpoint. Our src.eval.evaluate_stage_b_checkpoint
-detects the DoRA-wrapped (PEFT base_model.model.* with lora_*) checkpoint format
+Uses the in-repo system-level YOLO weights (default
+runs/detect/runs/yolo26m_systems/weights/best.pt; override via
+--stage-a-weights). Loads the trained Stage B checkpoint via
+--checkpoint. src.eval.evaluate_stage_b_checkpoint detects the
+DoRA-wrapped (PEFT base_model.model.* with lora_*) checkpoint format
 automatically and applies _prepare_model_for_dora before load_state_dict.
 
-Defaults to greedy decode (beam_width=1, max_decode_steps=256) — fast enough
-for the MVP gate where the goal is just "any non-NaN F1 means inference works."
-For real eval against a Stage 3 checkpoint, override with --beam-width 5
---max-decode-steps 512.
+Defaults to greedy decode (beam_width=1, max_decode_steps=2048) — aligned
+with SystemInferencePipeline's per-system-crop default. Override --beam-width
+to 5 for higher-quality (slower) decoding.
 
 NOTE: --config is metadata-only. The config path is validated at startup (to
 catch typos early) and written to the per-piece status JSONL as run metadata,
@@ -64,9 +65,15 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from eval.lieder_split import get_eval_pieces, split_hash
 
-# Default Stage A YOLO checkpoint (shipped by sibling Clarity-OMR).
-# Override via --stage-a-weights.
-_DEFAULT_STAGE_A_YOLO = Path.home() / "Clarity-OMR" / "info" / "yolo.pt"
+# Mirrors SystemInferencePipeline's max_decode_steps default
+# (src/inference/system_pipeline.py). Keep in sync — the help text and
+# docstring claim alignment.
+_PIPELINE_MAX_DECODE_STEPS_DEFAULT = 2048
+
+# Default Stage A YOLO checkpoint (in-repo, produced by Stage A training).
+# Override via --stage-a-weights. Path is repo-relative; resolved against
+# the current working directory (typically the repo root).
+_DEFAULT_STAGE_A_YOLO = Path("runs/detect/runs/yolo26m_systems/weights/best.pt")
 
 # Cache validation: minimum acceptable output file size (bytes).
 # Override via --min-output-bytes.
@@ -291,7 +298,8 @@ def _run_piece(
     return record
 
 
-def main() -> None:
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Construct the run_lieder_eval CLI parser. Module-level for testability."""
     p = argparse.ArgumentParser(
         description="Inference-only pass: run Stage B checkpoint on the Lieder eval split "
                     "and write predicted MusicXML + Stage-D diagnostics sidecars to disk. "
@@ -318,8 +326,10 @@ def main() -> None:
         help="Stage-B beam width (default 1 = greedy; ~5x slower per beam at 5)",
     )
     p.add_argument(
-        "--max-decode-steps", type=int, default=256,
-        help="Stage-B max decode steps per staff (default 256; full quality is 512)",
+        "--max-decode-steps", type=int, default=_PIPELINE_MAX_DECODE_STEPS_DEFAULT,
+        help=f"Stage-B max decode steps per system crop (default "
+             f"{_PIPELINE_MAX_DECODE_STEPS_DEFAULT}; aligns with "
+             "SystemInferencePipeline default)",
     )
     p.add_argument(
         "--max-pieces", type=int, default=None,
@@ -328,8 +338,8 @@ def main() -> None:
     p.add_argument(
         "--stage-a-weights", type=Path, default=_DEFAULT_STAGE_A_YOLO,
         help=(
-            "Path to Stage-A YOLO weights (default: ~/Clarity-OMR/info/yolo.pt). "
-            "Download by running sibling Clarity-OMR's omr.py once on any PDF."
+            f"Path to Stage A YOLO weights (default: {_DEFAULT_STAGE_A_YOLO}). "
+            "Train Stage A first via scripts/train_yolo.py — see docs/TRAINING.md."
         ),
     )
     p.add_argument(
@@ -369,9 +379,22 @@ def main() -> None:
             "Enables tree-edit-distance normalization in the scorer."
         ),
     )
+    return p
+
+
+def main() -> None:
+    p = build_argument_parser()
     args = p.parse_args()
 
     # --- Validate inputs ---------------------------------------------------
+    # Stage A weights check first: an actionable error pointing at the training
+    # docs is more useful than the cryptic failure the YOLO loader produces
+    # later, and this is the most common misconfiguration.
+    if not args.stage_a_weights.is_file():
+        p.error(
+            f"Stage A weights not found at {args.stage_a_weights}. "
+            f"Train Stage A first (see docs/TRAINING.md) or pass --stage-a-weights."
+        )
     if not args.checkpoint.exists():
         raise SystemExit(f"FATAL: checkpoint not found: {args.checkpoint}")
     if not args.config.exists():

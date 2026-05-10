@@ -4,6 +4,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Repo root resolved relative to this test file (tests/data/<file>.py -> repo root).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # ---------------------------------------------------------------------------
 # Canonical field set guaranteed by the normalization step in
 # build_stage3_combined_manifest.py.  All entries in the combined manifest
@@ -157,7 +160,7 @@ def test_build_combined_manifest_concatenates_four_sources(tmp_path: Path):
         "--output-manifest", str(out),
         "--audit-output", str(audit),
     ]
-    result = subprocess.run(cmd, cwd="/home/ari/work/Clarity-OMR-Train-RADIO",
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
@@ -198,7 +201,7 @@ def _run_combined_manifest(tmp_path: Path, syn_entries, gs_entries, pr_entries, 
         "--output-manifest", str(out),
         "--audit-output", str(audit),
     ]
-    result = subprocess.run(cmd, cwd="/home/ari/work/Clarity-OMR-Train-RADIO",
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     return [json.loads(L) for L in out.read_text().splitlines()]

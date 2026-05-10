@@ -183,10 +183,10 @@ Evidence summary:
 
 ## Artifacts
 
-- **Sample annotation JSON:** `C:\Users\Jonathan Wesely\scratch\omr-layout-analysis\al2_extracted\Schubert_D911-01\json\Schubert_D911-01_001.json`
+- **Sample annotation JSON:** `<source-clone>/al2_extracted/Schubert_D911-01/json/Schubert_D911-01_001.json` (out-of-tree scratch clone of the omr-layout-analysis dataset)
 - **Rendered overlay PNG:** `docs/omr_layout_audit_sample.png` (~324KB, committed)
   - Red boxes: `stave` class (15 individual staff rows on a vocal+piano lieder page)
   - Blue boxes: `system_measures` class (28 measure boundaries)
   - Score: Schubert D911-01 (Winterreise), page 2/5
-- **Scratch clone:** `C:\Users\Jonathan Wesely\scratch\omr-layout-analysis\` (not committed)
-- **Source stats code:** `C:\Users\Jonathan Wesely\scratch\omr_audit.py`, `omr_audit2.py`, `omr_audit3.py` (scratch, not committed)
+- **Scratch clone:** local clone of the omr-layout-analysis dataset (out-of-tree; not committed)
+- **Source stats code:** `omr_audit.py`, `omr_audit2.py`, `omr_audit3.py` (out-of-tree scratch utilities used to derive the stats summarised above; not committed)

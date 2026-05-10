@@ -4,6 +4,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+# Repo root resolved relative to this test file (tests/data/<file>.py -> repo root).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _make_entry(dataset: str, sample_id: str, content_tokens: list[str]) -> dict:
     return {
@@ -35,7 +38,7 @@ def test_retokenize_adds_staff_idx_0_marker(tmp_path: Path):
         "--target-dataset", "primus_systems",
         "--output-manifest", str(out),
     ]
-    result = subprocess.run(cmd, cwd="/home/ari/work/Clarity-OMR-Train-RADIO",
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     lines = [json.loads(L) for L in out.read_text().splitlines()]
@@ -75,7 +78,7 @@ def test_retokenize_rejects_malformed_input(tmp_path: Path):
         "--target-dataset", "primus_systems",
         "--output-manifest", str(out),
     ]
-    result = subprocess.run(cmd, cwd="/home/ari/work/Clarity-OMR-Train-RADIO",
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT),
                             capture_output=True, text=True)
     # Should exit non-zero (malformed input is a builder bug, not silent skip)
     assert result.returncode != 0
