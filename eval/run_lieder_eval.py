@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import subprocess
 import sys
 import time
 from collections import deque
@@ -145,6 +146,30 @@ def run_inference(
     diagnostics = StageDExportDiagnostics()
     score = pipeline.run_pdf(pdf, diagnostics=diagnostics)
     pipeline.export_musicxml(score, out, diagnostics=diagnostics)
+
+
+def invoke_scoring_phase(
+    *,
+    predictions_dir: Path,
+    ground_truth_dir: Path,
+    out_csv: Path,
+    with_tedn: bool = False,
+) -> int:
+    """Spawn eval.score_lieder_eval as a subprocess for Phase 2 scoring.
+
+    NEVER imports the scorer inline — keeps music21/zss isolated from the
+    long-running inference process.
+    """
+    cmd = [
+        sys.executable, "-m", "eval.score_lieder_eval",
+        "--predictions-dir", str(predictions_dir),
+        "--ground-truth-dir", str(ground_truth_dir),
+        "--out-csv", str(out_csv),
+    ]
+    if with_tedn:
+        cmd.append("--tedn")
+    result = subprocess.run(cmd, check=False)
+    return result.returncode
 
 
 def _run_piece(
@@ -329,6 +354,21 @@ def main() -> None:
         "--work-dir", type=Path, default=None,
         help="Override default working directory (eval/results/lieder_<name>_workdirs/).",
     )
+    p.add_argument(
+        "--run-scoring", action="store_true",
+        help=(
+            "After the inference loop completes, automatically spawn "
+            "eval.score_lieder_eval as a subprocess to compute metrics. "
+            "Subprocess-isolated to prevent music21/zss memory accumulation (PR #26)."
+        ),
+    )
+    p.add_argument(
+        "--tedn", action="store_true",
+        help=(
+            "Pass --tedn to eval.score_lieder_eval when --run-scoring is set. "
+            "Enables tree-edit-distance normalization in the scorer."
+        ),
+    )
     args = p.parse_args()
 
     # --- Validate inputs ---------------------------------------------------
@@ -511,6 +551,21 @@ def main() -> None:
     print(f"      --predictions-dir {out_dir} \\")
     print(f"      --reference-dir {(repo_root / 'data/openscore_lieder/scores').resolve()} \\")
     print(f"      --name {args.name}")
+
+    if args.run_scoring:
+        ground_truth_dir = (repo_root / "data/openscore_lieder/scores").resolve()
+        out_csv = (repo_root / "eval/results" / f"lieder_{args.name}_scores.csv").resolve()
+        print()
+        print(f"--run-scoring: spawning eval.score_lieder_eval ...")
+        rc = invoke_scoring_phase(
+            predictions_dir=out_dir,
+            ground_truth_dir=ground_truth_dir,
+            out_csv=out_csv,
+            with_tedn=args.tedn,
+        )
+        if rc != 0:
+            raise SystemExit(f"eval.score_lieder_eval exited with code {rc}")
+        print(f"Scoring complete. Results: {out_csv}")
 
 
 if __name__ == "__main__":

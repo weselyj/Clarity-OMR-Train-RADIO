@@ -326,6 +326,39 @@ class TestDiagnosticsSidecarCheck(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# F. test_run_scoring_spawns_subprocess_not_inline
+# ---------------------------------------------------------------------------
+def test_run_scoring_spawns_subprocess_not_inline(monkeypatch, tmp_path):
+    """When --run-scoring is set, eval driver must spawn score_lieder_eval
+    as a subprocess (NOT call score_one_piece inline). This guards against
+    accidentally re-introducing the in-process music21 OOM."""
+    from unittest.mock import MagicMock
+    import sys
+
+    captured_calls = []
+
+    def _fake_run(cmd, **kwargs):
+        captured_calls.append(cmd)
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr("eval.run_lieder_eval.subprocess.run", _fake_run)
+
+    import eval.run_lieder_eval as rle
+    rle.invoke_scoring_phase(
+        predictions_dir=tmp_path / "preds",
+        ground_truth_dir=tmp_path / "gt",
+        out_csv=tmp_path / "scores.csv",
+        with_tedn=True,
+    )
+
+    assert len(captured_calls) == 1
+    cmd = captured_calls[0]
+    assert sys.executable in cmd[0:1] or "python" in str(cmd[0]).lower()
+    assert "eval.score_lieder_eval" in cmd
+    assert "--tedn" in cmd
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
