@@ -399,8 +399,7 @@ def test_main_errors_when_stage_a_weights_missing(tmp_path, capsys, monkeypatch)
 
 def test_default_max_decode_steps_aligns_with_pipeline():
     """Default --max-decode-steps matches SystemInferencePipeline's 2048."""
-    from eval.run_lieder_eval import build_argument_parser
-    parser = build_argument_parser()
+    parser = rle.build_argument_parser()
     namespace = parser.parse_args([
         "--checkpoint", "x.pt",
         "--config", "x.yaml",

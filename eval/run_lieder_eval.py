@@ -65,6 +65,11 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from eval.lieder_split import get_eval_pieces, split_hash
 
+# Mirrors SystemInferencePipeline's max_decode_steps default
+# (src/inference/system_pipeline.py). Keep in sync — the help text and
+# docstring claim alignment.
+_PIPELINE_MAX_DECODE_STEPS_DEFAULT = 2048
+
 # Default Stage A YOLO checkpoint (in-repo, produced by Stage A training).
 # Override via --stage-a-weights. Path is repo-relative; resolved against
 # the current working directory (typically the repo root).
@@ -321,9 +326,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Stage-B beam width (default 1 = greedy; ~5x slower per beam at 5)",
     )
     p.add_argument(
-        "--max-decode-steps", type=int, default=2048,
-        help="Stage-B max decode steps per system crop (default 2048; aligns with "
-             "SystemInferencePipeline default).",
+        "--max-decode-steps", type=int, default=_PIPELINE_MAX_DECODE_STEPS_DEFAULT,
+        help=f"Stage-B max decode steps per system crop (default "
+             f"{_PIPELINE_MAX_DECODE_STEPS_DEFAULT}; aligns with "
+             "SystemInferencePipeline default)",
     )
     p.add_argument(
         "--max-pieces", type=int, default=None,
