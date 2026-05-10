@@ -1989,15 +1989,15 @@ git checkout -b docs/subproject4-smoke
 - [ ] **Step 16.1: Run Phase 1 (inference) on the GPU box**
 
 ```bash
-ssh 10.10.1.29 "cd /d \"C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\" && python -m eval.run_lieder_eval --checkpoint checkpoints\\full_radio_stage3_v2\\stage3-radio-systems-frozen-encoder_best.pt --stage-a-yolo runs\\detect\\runs\\yolo26m_systems\\weights\\best.pt --predictions-dir eval\\results\\subproject4_run\\predictions --status-jsonl eval\\results\\subproject4_run\\status.jsonl --max-pieces 50 --stage-b-device cuda --beam-width 1"
+ssh 10.10.1.29 "cd /d \"C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\" && python -m eval.run_lieder_eval --checkpoint checkpoints\\full_radio_stage3_v2\\stage3-radio-systems-frozen-encoder_best.pt --stage-a-weights runs\\detect\\runs\\yolo26m_systems\\weights\\best.pt --output-dir eval\\results\\subproject4_run\\predictions --max-pieces 50 --stage-b-device cuda --beam-width 1"
 ```
 
-Expected wall time: ~2-3 hours per the spec estimate. Watch for status JSONL appended per piece. Read the file's existing CLI flags via `python -m eval.run_lieder_eval --help` for exact spelling.
+Expected wall time: ~2-3 hours per the spec estimate. Watch for status JSONL appended per piece. The driver writes status to `eval/results/lieder_<name>_inference_status.jsonl` automatically (path derived from `--name`; there is no override flag). Read the file's existing CLI flags via `python -m eval.run_lieder_eval --help` for exact spelling.
 
 - [ ] **Step 16.2: Verify Phase 1 completion**
 
 ```bash
-ssh 10.10.1.29 "cd /d \"C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\" && type eval\\results\\subproject4_run\\status.jsonl | find /c \"\\\"piece_id\\\"\""
+ssh 10.10.1.29 "cd /d \"C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO\" && type eval\\results\\lieder_<name>_inference_status.jsonl | find /c \"\\\"piece_id\\\"\""
 ```
 
 Expected: 50 piece_id rows. Per the ship-gate, ≥ 40 must have `status=ok`.
