@@ -64,13 +64,22 @@ Per-corpus token accuracy:
 
 **Interpretation.** All headline metrics fall below the 80% triage threshold, with mean token accuracy of 0.533 and exact match rate of 0.200 indicating the decoder substantially fails to reproduce its own training labels at inference. The extreme per-corpus spread (synthetic 0.113 vs cameraprimus 0.865) is the most informative signal: synthetic_systems is the hardest to reproduce (dense, algorithmically generated sequences) while cameraprimus is near-pass territory. Given the known confound — the decoder was trained on *cached* encoder features but A3 runs it against the *live* (drifted) encoder — the poor synthetic result could be encoder-mismatch amplified by the complexity of synthetic sequences. However, the frankenstein experiment (Task 3) already showed that swapping in the correct S2v2 encoder produced only +0.001 mean onset_f1, which means encoder drift alone cannot explain the gap. Combined, the evidence points toward the decoder failing to generalize its training-label outputs at inference time, particularly on dense synthetic content — making the decoder (or the cached-feature training paradigm) the dominant failure mode rather than the encoder.
 
-## Phase 3 — Retrain (v3, 9000 steps)
+## Stream B — Pipeline-stage note loss
 
-<TASK 7 SUMMARY GOES HERE>
+**Goal:** Find which pipeline stage(s) drop notes between the raw decoder output and the final MusicXML file.
 
-## Phase 4 — Re-evaluation
+**Per-piece stage counts (`audit_results/pipeline_note_loss_*.json` on seder):**
 
-<TASK 8 RESULTS GO HERE>
+| Piece | ref | 1 raw decoder | 2 staff-split | 3 post-process | 5 music21 mem | 6 reparsed MXL |
+|---|---:|---:|---:|---:|---:|---:|
+| clair-de-lune | 1623 | 1306 | 1306 | 1306 | 1161 | 1202 |
+| fugue-no-2 | 755 | 474 | 474 | 474 | 450 | 450 |
+| gnossienne-no-1 | 836 | 387 | 336 | 336 | 331 | 346 |
+| prelude-op31 | 655 | 498 | 498 | 498 | 482 | 482 |
+
+**Stage D diagnostics (all pieces):** `skipped_notes=0`, `skipped_chords=0`, `missing_durations=0`, `unknown_tokens=0`, `fallback_rests=0` across all four pieces. `padded_measures` is non-zero (3–8 per piece) but padding adds rests, not suppresses notes. Gnossienne-no-1 had 2 systems skipped at the staff-split stage (the `_split_staff_sequences_for_validation` call raised `ValueError`), losing 51 note tokens (387→336) — the only non-decoder pipeline drop worth noting.
+
+**Interpretation.** The dominant note-loss happens before any pipeline stage: the raw decoder output (Stage 1) is already 46–80% of the reference count across the four demo pieces, with the worst case being gnossienne-no-1 at 46% (387 vs 836 reference notes). Once tokens leave the decoder, the pipeline stages are nearly lossless. Stages 2 through 3 are token-identical to Stage 1 on three of four pieces; the only exception is gnossienne-no-1 where 2 systems failed the staff-split validator (51-token drop, 13%). Stage D (token → music21 → MusicXML) introduces a small additional loss of 5–145 notes per piece, with clair-de-lune being the outlier at -145 (stage3→stage5); this is consistent with music21 note-merging or tie-handling on a piece with dense repeated notes and ties, not with Stage D discarding tokens. The `skipped_notes=0` diagnostic on all pieces confirms Stage D is not the cause. Cross-referencing Stream A: synthetic_systems and grandstaff_systems corpora (the multi-staff piano content most similar to these demo pieces) had token accuracies of 0.11 and 0.40 respectively — the decoder simply fails to produce the correct density of note tokens on grand-staff piano content. The fix must target the decoder and its training data, not the assembly pipeline.
 
 ## Verdict
 
