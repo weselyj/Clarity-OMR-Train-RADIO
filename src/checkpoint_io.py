@@ -77,7 +77,8 @@ def load_stage_b_checkpoint(
 
     payload = torch.load(str(checkpoint_path), map_location=device)
     state_dict_raw: Dict[str, Any] = (
-        payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
+        payload.get("model_state_dict", payload.get("model", payload))
+        if isinstance(payload, dict) else payload
     )
     if not isinstance(state_dict_raw, dict):
         raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")

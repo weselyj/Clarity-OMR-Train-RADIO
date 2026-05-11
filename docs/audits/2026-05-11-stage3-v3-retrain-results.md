@@ -11,7 +11,35 @@ The discrepancy between the Stage 3 v2 audit header ("step 4000, val_loss 0.148"
 
 ## Phase 1 — Diagnostic (frankenstein checkpoint)
 
-<TASK 3 RESULTS GO HERE>
+**Checkpoint build:** The frankenstein script ran cleanly against Stage 2 v2 `_best.pt` (step 4000) and Stage 3 v2 `_best.pt` (step 5500). Both checkpoints had exactly 1342 keys. The merge took 774 encoder keys from Stage 2 v2 and 568 non-encoder keys from Stage 3 v2; 0 encoder keys were missing in Stage 2, 0 encoder keys were exclusive to Stage 2, yielding an encoder-key mismatch rate of **0.00%** — the experiment is not confounded. The frankenstein checkpoint was written to `checkpoints/_frankenstein_s2enc_s3dec.pt` on seder (gitignored).
+
+**Loader fix:** The eval driver's `src/checkpoint_io.py` initially failed to load the frankenstein because it looked only for `model_state_dict` as the top-level key, but the frankenstein script writes the state dict under `model`. A one-line fix to the loader (`payload.get("model_state_dict", payload.get("model", payload))`) resolved this and was deployed to seder before re-running the eval. The fixed `checkpoint_io.py` is committed alongside this report.
+
+**Demo eval results (frankenstein: S2 v2 encoder + S3 v2 decoder):**
+
+| Piece | onset_f1 | note_f1 |
+|---|---|---|
+| clair-de-lune-debussy | 0.05258 | 0.01363 |
+| fugue-no-2-bwv-847-in-c-minor | 0.07051 | 0.02712 |
+| gnossienne-no-1 | 0.07809 | 0.03688 |
+| prelude-in-d-flat-major-op31-no1-scriabin | 0.03834 | 0.00613 |
+| **mean** | **0.0599** | **0.0209** |
+
+**Comparison against Stage 3 v2 post-first-emission baseline (PR #47):**
+
+| Piece | S3 v2 baseline | Frankenstein | Delta |
+|---|---|---|---|
+| clair | 0.0340 | 0.0526 | +0.019 |
+| fugue | 0.0631 | 0.0705 | +0.007 |
+| gnoss | 0.1032 | 0.0781 | **-0.025** |
+| prelude | 0.0352 | 0.0383 | +0.003 |
+| mean | 0.0589 | 0.0599 | +0.001 |
+
+**Gate decision: STOP_HALT.**
+
+The frankenstein mean onset_f1 of 0.0599 falls below the 0.10 gate threshold, triggering the "diagnosis incomplete" stop. The improvement over the Stage 3 v2 baseline is +0.001 — within noise, and not the meaningful uplift (>>0.06, target ≥0.15) that would confirm encoder drift as the dominant failure mode. Gnossienne actually regressed 0.025 onset_f1 with the S2 encoder. The hypothesis that the Stage 3 v2 training bug (encoder DoRA adapters not frozen) caused the performance gap is **not confirmed** by this experiment.
+
+**Conclusion:** The retrain plan (v3, 9000 steps) is NOT justified by this evidence. There are failure modes beyond encoder drift. Do NOT proceed to Phase 2/3 (code fix + retrain) without a follow-up investigation to identify what is actually causing the low onset_f1 scores. Opening a sub-project investigation is recommended before committing 8h of GPU time and several hours of human work to a retrain that the diagnostic evidence does not support.
 
 ## Phase 2 — Code fix
 
