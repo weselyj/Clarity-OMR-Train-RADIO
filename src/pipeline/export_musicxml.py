@@ -62,6 +62,11 @@ class StageDExportDiagnostics:
         a malformed token sequence (``<staff_start>`` without a matching
         ``<staff_end>``, typically caused by hitting ``--max-decode-steps``
         mid-staff).  Incremented by ``assemble_score_from_system_predictions``.
+    padded_measures:
+        Whole-measure rests inserted into a part because a system contained
+        fewer staves than the score has parts (or a staff failed to append
+        partway through).  Without this padding, parts diverge in measure
+        count and MuseScore rejects the output as corrupt.
     raised_during_part_append:
         List of dicts recorded when an exception is caught during part
         append (strict=False path).  Each dict has keys:
@@ -75,6 +80,7 @@ class StageDExportDiagnostics:
     unknown_tokens: int = 0
     fallback_rests: int = 0
     skipped_systems: int = 0
+    padded_measures: int = 0
     raised_during_part_append: List[Dict[str, object]] = field(default_factory=list)
 
 
@@ -879,16 +885,60 @@ def _append_tokens_to_part_impl(
             pass  # fall through silently on rare music21 edge cases
 
 
+def _pad_part_with_empty_measures(
+    part,
+    measure_count: int,
+    *,
+    diagnostics: Optional[StageDExportDiagnostics] = None,
+    strict: bool = False,
+) -> None:
+    """Append ``measure_count`` whole-rest measures to *part*.
+
+    Why: partwise MusicXML requires every <part> to share the same measure-index
+    timeline; MuseScore rejects files where parts diverge. A system that the
+    decoder emitted with fewer staves than the score has parts (e.g. only the
+    bass staff of a grand staff) would otherwise leave the missing part short by
+    the system's ``canonical_measure_count``. Padding here per-system keeps every
+    part synchronized regardless of how lopsided any individual system is.
+
+    The token shape mirrors ``_normalize_measure_count`` in assemble_score.py so
+    the pad measures route through the same token-to-music21 machinery as real
+    measures (consistent numbering, voice handling, etc.).
+    """
+    if measure_count <= 0:
+        return
+    pad_tokens: List[str] = []
+    for _ in range(measure_count):
+        pad_tokens.extend(["<measure_start>", "rest", "_whole", "<measure_end>"])
+    if diagnostics is None:
+        append_tokens_to_part(part, pad_tokens)
+    else:
+        append_tokens_to_part_with_diagnostics(part, pad_tokens, diagnostics, strict=strict)
+        diagnostics.padded_measures += measure_count
+
+
 def assembled_score_to_music21(score: AssembledScore):
     _, _, _, _, _, _, stream = _require_music21()
     music_score = stream.Score(id="omr_score")
     parts = {label: stream.Part(id=label) for label in score.part_order}
 
     systems = sorted(score.systems, key=lambda item: (item.page_index, item.system_index))
+    running_total = 0
     for system in systems:
         for staff in system.staves:
             part = parts.setdefault(staff.part_label, stream.Part(id=staff.part_label))
             append_tokens_to_part(part, staff.tokens)
+        running_total += system.canonical_measure_count
+        # Pad-to-running-total: keeps every part on the same measure-index
+        # timeline (partwise MusicXML requires it; MuseScore rejects divergence).
+        # Computed against actual part measure counts so it compensates for
+        # missing-staff systems AND for append_tokens_to_part silently dropping
+        # malformed model-emitted measures.
+        for label in score.part_order:
+            part = parts.setdefault(label, stream.Part(id=label))
+            deficit = running_total - len(part.getElementsByClass(stream.Measure))
+            if deficit > 0:
+                _pad_part_with_empty_measures(part, deficit)
 
     for label in score.part_order:
         music_score.append(parts[label])
@@ -925,6 +975,7 @@ def assembled_score_to_music21_with_diagnostics(
     parts = {label: stream.Part(id=label) for label in score.part_order}
 
     systems = sorted(score.systems, key=lambda item: (item.page_index, item.system_index))
+    running_total = 0
     for system in systems:
         for staff in system.staves:
             part = parts.setdefault(staff.part_label, stream.Part(id=staff.part_label))
@@ -936,6 +987,7 @@ def assembled_score_to_music21_with_diagnostics(
                 if strict:
                     raise
                 # Lenient mode: record the error and continue with the next staff.
+                # The pad-to-running-total loop below will fill any deficit.
                 diagnostics.raised_during_part_append.append(
                     {
                         "part_id": staff.part_label,
@@ -943,6 +995,20 @@ def assembled_score_to_music21_with_diagnostics(
                         "error_type": type(exc).__name__,
                         "error_message": str(exc),
                     }
+                )
+        running_total += system.canonical_measure_count
+        # Pad-to-running-total: keeps every part on the same measure-index
+        # timeline (partwise MusicXML requires it; MuseScore rejects divergence).
+        # Computed against actual part measure counts so it compensates for
+        # missing-staff systems AND for append_tokens_to_part silently dropping
+        # malformed model-emitted measures.
+        for label in score.part_order:
+            part = parts.setdefault(label, stream.Part(id=label))
+            current = len(part.getElementsByClass(stream.Measure))
+            deficit = running_total - current
+            if deficit > 0:
+                _pad_part_with_empty_measures(
+                    part, deficit, diagnostics=diagnostics, strict=strict,
                 )
 
     for label in score.part_order:
