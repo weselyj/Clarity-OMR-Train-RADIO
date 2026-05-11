@@ -289,19 +289,27 @@ def group_staves_into_systems(
 def _enforce_global_key_time(
     staves: Sequence[StaffRecognitionResult],
 ) -> List[StaffRecognitionResult]:
-    """Replace hallucinated key/time signatures with the global majority.
+    """Replace hallucinated key/time signatures with the first-staff emission.
 
-    Most pieces have a single key and time signature throughout.  The model
-    sometimes hallucinates changes (e.g. DM instead of GM, 6/8 instead of 3/4).
-    We take a majority vote across *all* staves and replace any outlier
-    key/time tokens with the consensus value.
+    The time-signature glyph is typically printed only on the first staff of
+    the first system. The decoder reads it correctly there, then has to
+    hallucinate on subsequent staves where no glyph exists. A naive majority
+    vote across all staves drowns the one informed emission in N-1
+    uninformed guesses; the model collapses to its 4/4 prior even when
+    staff 0 correctly emitted a less-common signature.
+
+    Use the first non-None emission in document order as the consensus, and
+    snap all later emissions to it.
     """
-    global_key = _majority_vote(
-        _extract_first(s.tokens, "keySignature-") for s in staves
-    )
-    global_time = _majority_vote(
-        _extract_first(s.tokens, "timeSignature-") for s in staves
-    )
+    global_key: Optional[str] = None
+    global_time: Optional[str] = None
+    for s in staves:
+        if global_key is None:
+            global_key = _extract_first(s.tokens, "keySignature-")
+        if global_time is None:
+            global_time = _extract_first(s.tokens, "timeSignature-")
+        if global_key is not None and global_time is not None:
+            break
 
     fixed: List[StaffRecognitionResult] = []
     for staff in staves:
