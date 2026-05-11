@@ -41,9 +41,28 @@ The frankenstein mean onset_f1 of 0.0599 falls below the 0.10 gate threshold, tr
 
 **Conclusion:** The retrain plan (v3, 9000 steps) is NOT justified by this evidence. There are failure modes beyond encoder drift. Do NOT proceed to Phase 2/3 (code fix + retrain) without a follow-up investigation to identify what is actually causing the low onset_f1 scores. Opening a sub-project investigation is recommended before committing 8h of GPU time and several hours of human work to a retrain that the diagnostic evidence does not support.
 
-## Phase 2 — Code fix
+## Stream A — Decoder round-trip on training data
 
-<TASK 4 SUMMARY GOES HERE>
+**Goal:** Test whether the Stage 3 v2 decoder reproduces its own training labels at inference. Confounding caveat: decoder was trained against cached features; this run uses the live (drifted) encoder, so a low result could mean either decoder is broken OR decoder is fine but mismatched with the live encoder.
+
+**Numbers (full run, 20 samples across 4 corpora, `audit_results/a3_decoder_stage3_v2.json` on seder):**
+
+| Metric | Value |
+|---|---|
+| Mean token accuracy | 0.533 |
+| Exact match rate | 0.200 |
+| timeSig accuracy | 0.545 |
+| keySig accuracy | 0.367 |
+| note accuracy | 0.244 |
+| rest accuracy | 0.739 |
+
+Per-corpus token accuracy:
+- synthetic_systems: n=5 mean=0.113
+- grandstaff_systems: n=5 mean=0.400
+- primus_systems: n=5 mean=0.753
+- cameraprimus_systems: n=5 mean=0.865
+
+**Interpretation.** All headline metrics fall below the 80% triage threshold, with mean token accuracy of 0.533 and exact match rate of 0.200 indicating the decoder substantially fails to reproduce its own training labels at inference. The extreme per-corpus spread (synthetic 0.113 vs cameraprimus 0.865) is the most informative signal: synthetic_systems is the hardest to reproduce (dense, algorithmically generated sequences) while cameraprimus is near-pass territory. Given the known confound — the decoder was trained on *cached* encoder features but A3 runs it against the *live* (drifted) encoder — the poor synthetic result could be encoder-mismatch amplified by the complexity of synthetic sequences. However, the frankenstein experiment (Task 3) already showed that swapping in the correct S2v2 encoder produced only +0.001 mean onset_f1, which means encoder drift alone cannot explain the gap. Combined, the evidence points toward the decoder failing to generalize its training-label outputs at inference time, particularly on dense synthetic content — making the decoder (or the cached-feature training paradigm) the dominant failure mode rather than the encoder.
 
 ## Phase 3 — Retrain (v3, 9000 steps)
 
