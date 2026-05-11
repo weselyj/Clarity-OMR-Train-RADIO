@@ -210,10 +210,10 @@ eval/results/baseline_pre_rebuild/*
 !eval/results/baseline_pre_rebuild/stage_a_recall.csv
 
 # Local-only top-level dirs (training runs, audit/bench outputs, scratch)
-audit/
-bench/
-runs/
-scratch/
+/audit/
+/bench/
+/runs/
+/scratch/
 
 # Model weight files at repo root (use checkpoints/ instead)
 /*.pt
