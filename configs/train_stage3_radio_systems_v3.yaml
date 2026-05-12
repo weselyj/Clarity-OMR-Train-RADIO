@@ -1,0 +1,99 @@
+# Stage 3 Phase 1 v3 — data-pipeline rebalance + encoder-freeze-fix retrain.
+#
+# Supersedes v2 (which had encoder DoRA accidentally unfrozen and the
+# dataset_mix giving synthetic_systems 77.8% of the cached-tier gradient
+# share on the smallest corpus with zero val split). v3 fixes:
+#   - encoder freeze: now structural via cache_root + cache_hash16
+#     (src/train/train.py auto-detects and applies the freeze; runtime
+#     pre-flight assertion at the call site refuses to start if any
+#     encoder param is trainable when uses_cache=True)
+#   - synthetic_systems val split: 35 of 703 sources -> 984 val entries,
+#     applied to data/processed/synthetic_systems_v1/manifests/...
+#     (per scripts/data/add_val_split_synthetic.py)
+#   - dataset_mix rebalanced toward multi-staff content:
+#     synthetic 0.20 / grandstaff 0.55 / primus 0.125 / cameraprimus 0.125
+#     of total gradient share (was synth 0.7 / grand 0.10 / primus 0.10 /
+#     camera 0.10 in v2). Demo eval is piano-heavy; grandstaff is the
+#     largest multi-staff piano corpus.
+#   - max_sequence_length: 512 -> 1024 to cover the truncated multi-staff
+#     tail (Stream 3: synthetic 2.0% / grandstaff 0.73% silently clipped
+#     at 512, exactly the long-form multi-staff sequences the demo needs).
+#   - effective_samples_per_epoch: 9000 (v2 was still descending at 6000).
+#
+# Architecture (vs v2): cached_data_ratio dropped from 0.90 to 0.875 so
+# cameraprimus reaches the intended 0.125 total share via the live tier.
+# Cached tier hosts synthetic + grandstaff + primus; live tier hosts
+# cameraprimus (augmented). Within-cached weights renormalize 0.20/0.55/0.125
+# by /0.875 to 0.228571/0.628572/0.142857.
+#
+# Run command (executed on GPU box at 10.10.1.29):
+#   ssh 10.10.1.29 'cd "C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO" && \
+#     venv-cu132\Scripts\python -u src/train/train.py \
+#       --stage-configs configs/train_stage3_radio_systems_v3.yaml \
+#       --mode execute \
+#       --resume-checkpoint checkpoints/full_radio_stage2_systems_v2/stage2-radio-systems-polyphonic_best.pt \
+#       --start-stage stage3-radio-systems-frozen-encoder \
+#       --checkpoint-dir checkpoints/full_radio_stage3_v3 \
+#       --token-manifest src/data/manifests/token_manifest_stage3.jsonl \
+#       --step-log logs/full_radio_stage3_v3_steps.jsonl'
+
+stage_name: stage3-radio-systems-frozen-encoder
+stage_b_encoder: radio_h
+
+# Step target: 9000 opt-steps (v2 at 6000 was still descending; cached
+# training is cheap enough to absorb 3000 extra steps as insurance).
+epochs: 1
+effective_samples_per_epoch: 9000    # OPT-STEP target
+batch_size: 1                        # SENTINEL — unused when tier_grouped_sampling=True
+max_sequence_length: 1024            # Raised from 512: covers synthetic max (892) and grandstaff max (766) fully (Stream 3 finding)
+grad_accumulation_steps: 1           # SENTINEL — unused when tier_grouped_sampling=True
+
+# Tier-aware mode (Stage 3 only). When tier_grouped_sampling=true the trainer
+# uses b_cached/b_live + grad_accumulation_steps_cached/grad_accumulation_steps_live
+# in place of batch_size + grad_accumulation_steps.
+tier_grouped_sampling: true
+b_cached: 16
+b_live: 2
+grad_accumulation_steps_cached: 1
+grad_accumulation_steps_live: 8
+cached_data_ratio: 0.875             # 87.5% cached / 12.5% live (live = cameraprimus)
+cache_root: data/cache/encoder
+cache_hash16: ac8948ae4b5be3e9
+
+# Optimizer (matches Stage 2 v2 LR pattern; encoder is structurally frozen
+# via the cache-derived auto-detect in _prepare_model_for_dora).
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 500
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.01
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 500
+validate_every_steps: 500
+
+# dataset_mix in tier-grouped mode applies WITHIN the cached tier; the live
+# tier (cameraprimus_systems) is drawn separately. Ratios within cached must
+# sum to 1.0. Total-gradient effective share is (cached_data_ratio × ratio)
+# for cached corpora; cameraprimus gets (1 - cached_data_ratio) via the live
+# tier (8/35, 22/35, 5/35, 0 -> total 0.20 / 0.55 / 0.125 / 0.125).
+dataset_mix:
+  - dataset: synthetic_systems
+    ratio: 0.228571     # 8/35; total share = 0.875 × 8/35 = 0.20
+    split: train
+    required: true
+  - dataset: grandstaff_systems
+    ratio: 0.628572     # 22/35; total share = 0.55
+    split: train
+    required: true
+  - dataset: primus_systems
+    ratio: 0.142857     # 5/35; total share = 0.125
+    split: train
+    required: true
+  - dataset: cameraprimus_systems
+    ratio: 0.0          # live-tier exclusive; effective share = 1 - cached_data_ratio = 0.125
+    split: train
+    required: true
