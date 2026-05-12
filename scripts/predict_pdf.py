@@ -109,8 +109,8 @@ def main() -> int:
     print("Running inference ...")
     t1 = time.time()
     score = pipeline.run_pdf(args.pdf, diagnostics=diags)
-    n_systems = sum(len(sys.staves) for sys in score.systems)
-    print(f"  decoded {len(score.systems)} systems, {n_systems} staves total "
+    n_staves = sum(len(system.staves) for system in score.systems)
+    print(f"  decoded {len(score.systems)} systems, {n_staves} staves total "
           f"in {time.time() - t1:.1f}s")
 
     print(f"Exporting MusicXML to {args.out} ...")
