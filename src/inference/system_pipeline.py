@@ -70,6 +70,7 @@ class SystemInferencePipeline:
         pdf_path,
         *,
         diagnostics=None,
+        token_log: Optional[list] = None,
     ) -> AssembledScore:
         """Render PDF pages, run Stage A + Stage B per page, assemble.
 
@@ -78,6 +79,12 @@ class SystemInferencePipeline:
         `skipped_systems` for each system whose decoder output failed
         token validation (decoder truncation). It is also forwarded to
         `export_musicxml` for Stage-D skip recording.
+
+        When `token_log` is supplied (a list), one dict per system is
+        appended to it before assembly with keys ``system_index``,
+        ``page_index``, ``bbox``, ``conf``, ``tokens``, ``n_tokens``.
+        Intended for debugging clef / staff-ordering failures by
+        inspecting the raw decoder output prior to Stage D export.
         """
         all_token_lists = []
         all_locations = []
@@ -99,6 +106,15 @@ class SystemInferencePipeline:
                         "page_index": page_index,
                         "conf": sys["conf"],
                     })
+                    if token_log is not None:
+                        token_log.append({
+                            "system_index": int(sys["system_index"]),
+                            "page_index": int(page_index),
+                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                            "conf": float(sys["conf"]),
+                            "tokens": list(tokens),
+                            "n_tokens": len(tokens),
+                        })
         return assemble_score_from_system_predictions(
             all_token_lists, all_locations, diagnostics=diagnostics,
         )
@@ -108,6 +124,7 @@ class SystemInferencePipeline:
         image,
         *,
         diagnostics=None,
+        token_log: Optional[list] = None,
     ) -> AssembledScore:
         """Run Stage A + Stage B on a single page image, assemble.
 
@@ -116,6 +133,9 @@ class SystemInferencePipeline:
         without converting to PDF first. ``image`` may be a path
         (``str``/``Path``) or a PIL ``Image.Image``; the file extension is not
         checked, so any format PIL can decode works.
+
+        ``token_log`` (optional list) is appended with one dict per system in
+        the same shape as ``run_pdf`` — see that method for the schema.
         """
         if isinstance(image, Image.Image):
             img = image.convert("RGB") if image.mode != "RGB" else image
@@ -135,6 +155,15 @@ class SystemInferencePipeline:
                 "page_index": 0,
                 "conf": sys["conf"],
             })
+            if token_log is not None:
+                token_log.append({
+                    "system_index": int(sys["system_index"]),
+                    "page_index": 0,
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "conf": float(sys["conf"]),
+                    "tokens": list(tokens),
+                    "n_tokens": len(tokens),
+                })
         return assemble_score_from_system_predictions(
             all_token_lists, all_locations, diagnostics=diagnostics,
         )
