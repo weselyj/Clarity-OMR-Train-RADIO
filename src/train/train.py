@@ -1225,7 +1225,12 @@ def _maybe_compile_decoder_and_bridge(model, *, enabled: bool):
     return model
 
 
-def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
+def _prepare_model_for_dora(
+    model,
+    dora_config: Dict[str, object],
+    *,
+    stage_config: "Optional[StageTrainingConfig]" = None,
+):
     new_module_keywords = (
         "token_embedding",
         "lm_head",
@@ -1324,9 +1329,22 @@ def _prepare_model_for_dora(model, dora_config: Dict[str, object]):
         print(f"DoRA NaN fix: patched {_zero_row_modules_patched} module(s) with zero base-weight rows")
     model._dora_zero_row_fixes_applied = _zero_row_modules_patched
 
+    # Cache-derived encoder freeze: when the stage uses cached encoder features,
+    # the encoder MUST stay frozen — the cache becomes stale after the first
+    # encoder gradient step. Coupling cache use and encoder freeze here closes
+    # the foot-gun behind the Stage 3 v2 audit (PR #48), which found encoder
+    # DoRA silently trained despite a "frozen-encoder" config claim.
+    uses_cache = bool(
+        stage_config is not None
+        and stage_config.cache_root
+        and stage_config.cache_hash16
+    )
+
     for parameter in model.parameters():
         parameter.requires_grad = False
     for name, parameter in model.named_parameters():
+        if uses_cache and "encoder" in name:
+            continue
         if "lora_" in name or any(marker in name for marker in new_module_keywords):
             parameter.requires_grad = True
     if not any(parameter.requires_grad for parameter in model.parameters()):
@@ -2178,7 +2196,50 @@ def run_execute_mode(
     # tensor shapes; explicit metadata is cleaner.
     stage_b_config_dict["encoder"] = factory_cfg.stage_b_encoder
     base_model = components["model"]
-    model, dora_applied = _prepare_model_for_dora(base_model, components["dora_config"])
+
+    # The model is constructed once for the whole run, but encoder-freeze policy
+    # is per-stage (each stage decides whether it uses a cache). Require all
+    # stages to agree on cache use here; mixing within one run would mean the
+    # encoder is sometimes-frozen and sometimes-not, which contradicts itself.
+    if len(stages) > 1:
+        first_cache = (stages[0].cache_root, stages[0].cache_hash16)
+        for s in stages[1:]:
+            if (s.cache_root, s.cache_hash16) != first_cache:
+                raise ValueError(
+                    f"All stages must agree on cache_root/cache_hash16 (encoder freeze is "
+                    f"a per-model decision, not per-stage). Got: "
+                    f"{[(s.stage_name, s.cache_root, s.cache_hash16) for s in stages]}"
+                )
+    representative_stage = stages[0] if stages else None
+    model, dora_applied = _prepare_model_for_dora(
+        base_model, components["dora_config"], stage_config=representative_stage
+    )
+
+    # Pre-flight: when the run uses an encoder cache, every encoder-side parameter
+    # MUST be frozen. This catches a regression in _prepare_model_for_dora before
+    # 8h of training are wasted. (Audit PR #48 finding; Stage 3 v2 trained for 5.6h
+    # before the encoder DoRA drift was diagnosed.)
+    _uses_cache = bool(
+        representative_stage is not None
+        and representative_stage.cache_root
+        and representative_stage.cache_hash16
+    )
+    if _uses_cache:
+        _trainable_encoder = sum(
+            1 for n, p in model.named_parameters() if "encoder" in n and p.requires_grad
+        )
+        _trainable_decoder = sum(
+            1 for n, p in model.named_parameters() if "encoder" not in n and p.requires_grad
+        )
+        print(f"[freeze] trainable encoder params: {_trainable_encoder}", file=sys.stderr)
+        print(f"[freeze] trainable decoder params: {_trainable_decoder}", file=sys.stderr)
+        if _trainable_encoder != 0:
+            raise RuntimeError(
+                f"Stage {representative_stage.stage_name!r} uses encoder cache "
+                f"(hash16={representative_stage.cache_hash16!r}), so all encoder params must be "
+                f"frozen, but {_trainable_encoder} are trainable. "
+                f"_prepare_model_for_dora freeze logic regressed; refusing to train."
+            )
 
     use_cuda = bool(torch.cuda.is_available() and torch.cuda.device_count() > 0)
     if use_cuda:
