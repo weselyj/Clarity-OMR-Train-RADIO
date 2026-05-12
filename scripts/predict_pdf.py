@@ -71,6 +71,12 @@ def main() -> int:
                    help="Max decode steps per system crop. Default 2048.")
     p.add_argument("--page-dpi", type=int, default=300,
                    help="PDF render DPI for Stage A. Default 300 (matches training).")
+    p.add_argument("--yolo-conf", type=float, default=0.25,
+                   help=(
+                       "Stage A YOLO confidence threshold. Default 0.25 (YOLO's default). "
+                       "Lower values (0.05-0.15) can recover systems on noisy scans at "
+                       "the cost of more false-positive detections."
+                   ))
     p.add_argument("--fp16", action="store_true",
                    help="Use fp16 for Stage B inference (small accuracy risk, faster).")
     p.add_argument(
@@ -111,6 +117,7 @@ def main() -> int:
     print(f"YOLO weights:    {args.yolo_weights}")
     print(f"Device:          {args.device}  fp16={args.fp16}")
     print(f"Beam:            {args.beam_width}  max_decode_steps={args.max_decode_steps}")
+    print(f"YOLO conf:       {args.yolo_conf}")
     print()
 
     from src.inference.system_pipeline import SystemInferencePipeline
@@ -126,6 +133,7 @@ def main() -> int:
         max_decode_steps=args.max_decode_steps,
         page_dpi=args.page_dpi,
         use_fp16=args.fp16,
+        yolo_conf=args.yolo_conf,
     )
     print(f"  ready in {time.time() - t0:.1f}s")
 

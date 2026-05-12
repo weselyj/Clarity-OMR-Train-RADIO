@@ -52,9 +52,10 @@ class SystemInferencePipeline:
         length_penalty_alpha: float = 0.4,
         use_fp16: bool = False,
         quantize: bool = False,
+        yolo_conf: float = 0.25,
     ):
         self._device = torch.device(device)
-        self._stage_a = YoloStageASystems(yolo_weights)
+        self._stage_a = YoloStageASystems(yolo_weights, conf=yolo_conf)
         self._bundle: StageBInferenceBundle = load_stage_b_for_inference(
             stage_b_ckpt, self._device, use_fp16=use_fp16, quantize=quantize,
         )
