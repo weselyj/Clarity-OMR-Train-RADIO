@@ -37,6 +37,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -75,6 +76,15 @@ def main() -> int:
     p.add_argument(
         "--diagnostics-out", type=Path, default=None,
         help="Optional path to write Stage D export diagnostics JSON sidecar.",
+    )
+    p.add_argument(
+        "--dump-tokens", type=Path, default=None,
+        help=(
+            "Optional path to write a JSONL sidecar containing one record per "
+            "detected system: {system_index, page_index, bbox, conf, tokens, "
+            "n_tokens}. Useful for debugging clef/staff-ordering failures by "
+            "inspecting the raw decoder output prior to Stage D export."
+        ),
     )
     args = p.parse_args()
 
@@ -120,12 +130,13 @@ def main() -> int:
     print(f"  ready in {time.time() - t0:.1f}s")
 
     diags = StageDExportDiagnostics()
+    token_log: Optional[list] = [] if args.dump_tokens is not None else None
     print("Running inference ...")
     t1 = time.time()
     if is_pdf:
-        score = pipeline.run_pdf(args.input, diagnostics=diags)
+        score = pipeline.run_pdf(args.input, diagnostics=diags, token_log=token_log)
     else:
-        score = pipeline.run_image(args.input, diagnostics=diags)
+        score = pipeline.run_image(args.input, diagnostics=diags, token_log=token_log)
     n_staves = sum(len(system.staves) for system in score.systems)
     print(f"  decoded {len(score.systems)} systems, {n_staves} staves total "
           f"in {time.time() - t1:.1f}s")
@@ -142,6 +153,13 @@ def main() -> int:
         diag_payload = {k: v for k, v in vars(diags).items() if not k.startswith("_")}
         args.diagnostics_out.write_text(json.dumps(diag_payload, indent=2, default=str), encoding="utf-8")
         print(f"  diagnostics JSON: {args.diagnostics_out}")
+
+    if args.dump_tokens is not None:
+        args.dump_tokens.parent.mkdir(parents=True, exist_ok=True)
+        with args.dump_tokens.open("w", encoding="utf-8") as f:
+            for entry in token_log or []:
+                f.write(json.dumps(entry) + "\n")
+        print(f"  raw token JSONL: {args.dump_tokens}  ({len(token_log or [])} systems)")
 
     total = time.time() - t0
     print()
