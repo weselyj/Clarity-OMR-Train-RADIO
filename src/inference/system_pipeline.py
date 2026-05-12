@@ -72,6 +72,8 @@ class SystemInferencePipeline:
         *,
         diagnostics=None,
         token_log: Optional[list] = None,
+        postprocess: bool = True,
+        postprocess_repair_bass_clef: bool = False,
     ) -> AssembledScore:
         """Render PDF pages, run Stage A + Stage B per page, assemble.
 
@@ -87,6 +89,8 @@ class SystemInferencePipeline:
         Intended for debugging clef / staff-ordering failures by
         inspecting the raw decoder output prior to Stage D export.
         """
+        from src.pipeline.post_decode import clean_system_tokens
+
         all_token_lists = []
         all_locations = []
         with fitz.open(str(pdf_path)) as doc:
@@ -99,7 +103,15 @@ class SystemInferencePipeline:
                 for sys in systems:
                     x1, y1, x2, y2 = sys["bbox_extended"]
                     crop = img.crop((int(x1), int(y1), int(x2), int(y2)))
-                    tokens = self._decode_one_crop(crop)
+                    raw_tokens = self._decode_one_crop(crop)
+                    tokens = (
+                        clean_system_tokens(
+                            raw_tokens,
+                            repair_bass_clef=postprocess_repair_bass_clef,
+                        )
+                        if postprocess
+                        else raw_tokens
+                    )
                     all_token_lists.append(tokens)
                     all_locations.append({
                         "system_index": sys["system_index"],
@@ -114,6 +126,7 @@ class SystemInferencePipeline:
                             "bbox": [int(x1), int(y1), int(x2), int(y2)],
                             "conf": float(sys["conf"]),
                             "tokens": list(tokens),
+                            "raw_tokens": list(raw_tokens) if postprocess else None,
                             "n_tokens": len(tokens),
                         })
         return assemble_score_from_system_predictions(
@@ -126,6 +139,8 @@ class SystemInferencePipeline:
         *,
         diagnostics=None,
         token_log: Optional[list] = None,
+        postprocess: bool = True,
+        postprocess_repair_bass_clef: bool = False,
     ) -> AssembledScore:
         """Run Stage A + Stage B on a single page image, assemble.
 
@@ -138,6 +153,8 @@ class SystemInferencePipeline:
         ``token_log`` (optional list) is appended with one dict per system in
         the same shape as ``run_pdf`` — see that method for the schema.
         """
+        from src.pipeline.post_decode import clean_system_tokens
+
         if isinstance(image, Image.Image):
             img = image.convert("RGB") if image.mode != "RGB" else image
         else:
@@ -148,7 +165,15 @@ class SystemInferencePipeline:
         for sys in systems:
             x1, y1, x2, y2 = sys["bbox_extended"]
             crop = img.crop((int(x1), int(y1), int(x2), int(y2)))
-            tokens = self._decode_one_crop(crop)
+            raw_tokens = self._decode_one_crop(crop)
+            tokens = (
+                clean_system_tokens(
+                    raw_tokens,
+                    repair_bass_clef=postprocess_repair_bass_clef,
+                )
+                if postprocess
+                else raw_tokens
+            )
             all_token_lists.append(tokens)
             all_locations.append({
                 "system_index": sys["system_index"],
@@ -163,6 +188,7 @@ class SystemInferencePipeline:
                     "bbox": [int(x1), int(y1), int(x2), int(y2)],
                     "conf": float(sys["conf"]),
                     "tokens": list(tokens),
+                    "raw_tokens": list(raw_tokens) if postprocess else None,
                     "n_tokens": len(tokens),
                 })
         return assemble_score_from_system_predictions(

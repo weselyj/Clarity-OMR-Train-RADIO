@@ -88,8 +88,30 @@ def main() -> int:
         help=(
             "Optional path to write a JSONL sidecar containing one record per "
             "detected system: {system_index, page_index, bbox, conf, tokens, "
-            "n_tokens}. Useful for debugging clef/staff-ordering failures by "
-            "inspecting the raw decoder output prior to Stage D export."
+            "raw_tokens (if --no-postprocess not set), n_tokens}. Useful for "
+            "debugging clef/staff-ordering failures by inspecting the raw "
+            "decoder output prior to Stage D export."
+        ),
+    )
+    p.add_argument(
+        "--no-postprocess", action="store_true",
+        help=(
+            "Disable the default post-decode cleanup (phantom-staff drop). "
+            "Use when you want to inspect the raw decoder output unmodified, "
+            "or to verify whether a wrong MXL is caused by the post-processor "
+            "vs the model itself."
+        ),
+    )
+    p.add_argument(
+        "--repair-bass-clef", action="store_true",
+        help=(
+            "Experimental: also swap clef-G2 to clef-F4 on the bottom staff "
+            "of a system when its notes are predominantly below middle C "
+            "(median octave < 4). Off by default because the swap doesn't "
+            "transpose pitches — the decoder may have produced pitches under "
+            "a wrong-clef assumption and they'll stay wrong even after the "
+            "clef is corrected. Useful only when visual clef-correctness "
+            "matters more than pitch correctness."
         ),
     )
     args = p.parse_args()
@@ -118,6 +140,12 @@ def main() -> int:
     print(f"Device:          {args.device}  fp16={args.fp16}")
     print(f"Beam:            {args.beam_width}  max_decode_steps={args.max_decode_steps}")
     print(f"YOLO conf:       {args.yolo_conf}")
+    pp_parts = []
+    if not args.no_postprocess:
+        pp_parts.append("phantom-drop")
+        if args.repair_bass_clef:
+            pp_parts.append("bass-clef-repair")
+    print(f"Postprocess:     {', '.join(pp_parts) if pp_parts else 'OFF'}")
     print()
 
     from src.inference.system_pipeline import SystemInferencePipeline
@@ -142,9 +170,21 @@ def main() -> int:
     print("Running inference ...")
     t1 = time.time()
     if is_pdf:
-        score = pipeline.run_pdf(args.input, diagnostics=diags, token_log=token_log)
+        score = pipeline.run_pdf(
+            args.input,
+            diagnostics=diags,
+            token_log=token_log,
+            postprocess=not args.no_postprocess,
+            postprocess_repair_bass_clef=args.repair_bass_clef,
+        )
     else:
-        score = pipeline.run_image(args.input, diagnostics=diags, token_log=token_log)
+        score = pipeline.run_image(
+            args.input,
+            diagnostics=diags,
+            token_log=token_log,
+            postprocess=not args.no_postprocess,
+            postprocess_repair_bass_clef=args.repair_bass_clef,
+        )
     n_staves = sum(len(system.staves) for system in score.systems)
     print(f"  decoded {len(score.systems)} systems, {n_staves} staves total "
           f"in {time.time() - t1:.1f}s")
