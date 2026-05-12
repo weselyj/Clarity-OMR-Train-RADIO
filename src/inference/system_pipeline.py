@@ -103,6 +103,42 @@ class SystemInferencePipeline:
             all_token_lists, all_locations, diagnostics=diagnostics,
         )
 
+    def run_image(
+        self,
+        image,
+        *,
+        diagnostics=None,
+    ) -> AssembledScore:
+        """Run Stage A + Stage B on a single page image, assemble.
+
+        Mirrors ``run_pdf`` but takes one already-rendered page image instead of
+        a PDF. Useful for direct image input (scans, single-page JPG/PNG/etc.)
+        without converting to PDF first. ``image`` may be a path
+        (``str``/``Path``) or a PIL ``Image.Image``; the file extension is not
+        checked, so any format PIL can decode works.
+        """
+        if isinstance(image, Image.Image):
+            img = image.convert("RGB") if image.mode != "RGB" else image
+        else:
+            img = Image.open(str(image)).convert("RGB")
+        all_token_lists = []
+        all_locations = []
+        systems = self._stage_a.detect_systems(img)
+        for sys in systems:
+            x1, y1, x2, y2 = sys["bbox_extended"]
+            crop = img.crop((int(x1), int(y1), int(x2), int(y2)))
+            tokens = self._decode_one_crop(crop)
+            all_token_lists.append(tokens)
+            all_locations.append({
+                "system_index": sys["system_index"],
+                "bbox": sys["bbox_extended"],
+                "page_index": 0,
+                "conf": sys["conf"],
+            })
+        return assemble_score_from_system_predictions(
+            all_token_lists, all_locations, diagnostics=diagnostics,
+        )
+
     def run_page(
         self,
         page_image: Image.Image,

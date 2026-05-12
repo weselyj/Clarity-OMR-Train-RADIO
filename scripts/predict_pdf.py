@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-"""Predict MusicXML for a single PDF using a trained Stage A + Stage B checkpoint.
+"""Predict MusicXML for a single PDF or page image using a trained checkpoint.
 
 Runs the full SystemInferencePipeline (YOLO system detection -> Stage B
-seq2seq decode per system -> assembly -> Stage D MusicXML export) on one PDF
-and writes the resulting MusicXML to the path you choose. Defaults to the
-latest Stage 3 v3 checkpoint and the standard YOLO weights so the common case
-is a one-line invocation.
+seq2seq decode per system -> assembly -> Stage D MusicXML export) on one
+input and writes the resulting MusicXML to the path you choose. Defaults to
+the latest Stage 3 v3 checkpoint and the standard YOLO weights so the common
+case is a one-line invocation.
+
+Input format is dispatched on file extension:
+  * ``.pdf``                       -> SystemInferencePipeline.run_pdf
+  * any image PIL can open
+    (``.jpg``, ``.png``, ``.tif``, etc.) -> SystemInferencePipeline.run_image
 
 Usage (on seder):
     venv-cu132\\Scripts\\python -m scripts.predict_pdf \\
         data\\scratch\\score.pdf \\
         data\\scratch\\score.musicxml
+
+    venv-cu132\\Scripts\\python -m scripts.predict_pdf \\
+        Downloads\\Scanned_20251208-0833.jpg \\
+        Downloads\\Scanned_20251208-0833.musicxml
 
 With overrides:
     venv-cu132\\Scripts\\python -m scripts.predict_pdf \\
@@ -41,8 +50,10 @@ _DEFAULT_YOLO_WEIGHTS = "runs/detect/runs/yolo26m_systems/weights/best.pt"
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("pdf", type=Path, help="Input PDF to transcribe.")
-    p.add_argument("out", type=Path, help="Output MusicXML path (parent dir auto-created).")
+    p.add_argument("input", type=Path,
+                   help="Input PDF or page image (.jpg/.png/.tif/.bmp/.webp/etc.) to transcribe.")
+    p.add_argument("out", type=Path,
+                   help="Output MusicXML path (parent dir auto-created).")
     p.add_argument(
         "--stage-b-ckpt", type=Path, default=Path(_DEFAULT_STAGE_B_CKPT),
         help=f"Path to Stage B checkpoint (.pt). Default: {_DEFAULT_STAGE_B_CKPT}",
@@ -67,8 +78,8 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    if not args.pdf.is_file():
-        p.error(f"PDF not found: {args.pdf}")
+    if not args.input.is_file():
+        p.error(f"Input not found: {args.input}")
     if not args.stage_b_ckpt.is_file():
         p.error(
             f"Stage B checkpoint not found: {args.stage_b_ckpt}. "
@@ -81,7 +92,10 @@ def main() -> int:
         )
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"PDF:             {args.pdf}")
+    is_pdf = args.input.suffix.lower() == ".pdf"
+    input_kind = "PDF" if is_pdf else "image"
+
+    print(f"Input ({input_kind}): {args.input}")
     print(f"Output MusicXML: {args.out}")
     print(f"Stage B ckpt:    {args.stage_b_ckpt}")
     print(f"YOLO weights:    {args.yolo_weights}")
@@ -108,7 +122,10 @@ def main() -> int:
     diags = StageDExportDiagnostics()
     print("Running inference ...")
     t1 = time.time()
-    score = pipeline.run_pdf(args.pdf, diagnostics=diags)
+    if is_pdf:
+        score = pipeline.run_pdf(args.input, diagnostics=diags)
+    else:
+        score = pipeline.run_image(args.input, diagnostics=diags)
     n_staves = sum(len(system.staves) for system in score.systems)
     print(f"  decoded {len(score.systems)} systems, {n_staves} staves total "
           f"in {time.time() - t1:.1f}s")
