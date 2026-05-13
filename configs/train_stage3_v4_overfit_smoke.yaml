@@ -58,9 +58,9 @@ stage_b_encoder: radio_h
 
 epochs: 125
 effective_samples_per_epoch: 20
-batch_size: 4
-max_sequence_length: 1024
-grad_accumulation_steps: 1
+batch_size: 1                        # live-encoder smoke (no cache); C-RADIO-H + bs>1 OOMs on 5090 at imgsz~768
+max_sequence_length: 512             # smoke entries are <=256 tokens; 512 ceiling keeps memory tight
+grad_accumulation_steps: 4           # effective batch 4 via accumulation (same gradient signal, lower peak memory)
 
 tier_grouped_sampling: false
 
