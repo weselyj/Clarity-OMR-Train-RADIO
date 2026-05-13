@@ -1,0 +1,84 @@
+# Stage 3 v4 — Phase 0b overfit smoke check.
+#
+# PURPOSE
+# Before launching the full v4 retrain, verify the Stage 3 training pipeline
+# can overfit a tiny clean grand-staff subset. If it can't, there is a
+# regression somewhere in the trainer, model, or data path and the full
+# v4 launch must be blocked.
+#
+# DATA
+# The 20-sample manifest lives at:
+#   data/manifests/overfit_smoke_v4.jsonl
+# All entries carry dataset == "grandstaff_systems" (verified by inspection),
+# so dataset_mix references that real corpus tag with ratio 1.0. The 20-sample
+# scope is enforced by passing the small manifest to the trainer via
+# --token-manifest; no manifest_path field is supported on DatasetMix.
+#
+# PARAMETER CHOICES
+#   epochs=125, effective_samples_per_epoch=20  -> 2500 sample-passes total,
+#     enough for a healthy overfit signal at batch_size=4 (~625 opt-steps).
+#   batch_size=4                  small set; 4 batches fit comfortably.
+#   max_sequence_length=1024      matches v3 to exercise the same code path.
+#   grad_accumulation_steps=1     no accumulation; smaller signal-to-noise gap.
+#   tier_grouped_sampling=false   smoke set is too small for the tier sampler
+#                                 (and grandstaff is a single cached corpus
+#                                 anyway). Naive batching only.
+#   lr_dora=0.002                 4x the v3 value (0.0005); we want to drive
+#                                 the loss down fast on a memorized set.
+#   lr_new_modules=0.001          ~3x v3 (0.0003) for the same reason.
+#   loraplus_lr_ratio=2.0         match v3.
+#   warmup_steps=50               short warmup; total step budget is ~625.
+#   schedule=cosine               match v3 shape.
+#   weight_decay=0.0              no regularization; we want pure memorization.
+#   label_smoothing=0.0           we want the model to be confident on the
+#                                 memorized targets; smoothing fights that.
+#   contour_loss_weight=0.0       isolate CE; contour aux loss is noise here.
+#   checkpoint_every_steps=100    frequent enough to inspect mid-run.
+#   validate_every_steps=50       want a dense val-CE curve (val == train set).
+#
+# GATE CRITERIA (pipeline is healthy iff BOTH hold)
+#   - train CE < 0.05 by step 500
+#   - val CE  < 0.10 on the same 20-sample set
+# If either misses, do NOT launch the full v4 retrain — there is a regression
+# to diagnose first.
+#
+# RUN COMMAND (on the GPU box; pass --token-manifest to scope to 20 entries)
+#   ssh 10.10.1.29 'cd "C:\Users\Jonathan Wesely\Clarity-OMR-Train-RADIO" && \
+#     venv-cu132\Scripts\python -u src/train/train.py \
+#       --stage-configs configs/train_stage3_v4_overfit_smoke.yaml \
+#       --mode execute \
+#       --resume-checkpoint checkpoints/full_radio_stage2_systems_v2/stage2-radio-systems-polyphonic_best.pt \
+#       --start-stage stage3-v4-overfit-smoke \
+#       --checkpoint-dir checkpoints/stage3_v4_overfit_smoke \
+#       --token-manifest data/manifests/overfit_smoke_v4.jsonl \
+#       --step-log logs/stage3_v4_overfit_smoke_steps.jsonl'
+
+stage_name: stage3-v4-overfit-smoke
+stage_b_encoder: radio_h
+
+epochs: 125
+effective_samples_per_epoch: 20
+batch_size: 4
+max_sequence_length: 1024
+grad_accumulation_steps: 1
+
+tier_grouped_sampling: false
+
+lr_dora: 0.002
+lr_new_modules: 0.001
+loraplus_lr_ratio: 2.0
+warmup_steps: 50
+schedule: cosine
+weight_decay: 0.0
+
+label_smoothing: 0.0
+contour_loss_weight: 0.0
+
+checkpoint_every_steps: 100
+validate_every_steps: 50
+
+dataset_mix:
+  - dataset: grandstaff_systems
+    ratio: 1.0
+    split: train
+    required: true
