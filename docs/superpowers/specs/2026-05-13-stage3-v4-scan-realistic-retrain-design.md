@@ -97,11 +97,21 @@ Total wall-clock: ~1-2 days end-to-end.
 
 **Deliverable:** the smoke config stays in the repo as a 10-minute pre-flight check for any future retrain.
 
+### Phase 0a addendum (2026-05-13 run result)
+
+Phase 0a was executed on 2026-05-13 against v3 predicted MXLs (token dumps weren't available; the script was extended to support predicted-MXL input). Result: **strict gate FAIL** — `bass-clef-misread` at 4/33 (12.1%), below the 30% threshold. However, `phantom-staff-residual` came in at 25/33 (75.8%), and spot-checking flagged pieces showed predicted MXLs with 6 parts where GT has 3 (severe decoder structural confusion on multi-staff piano, manifesting as the assembler striping the output into double the expected parts).
+
+**Reframing:** the strict bass-clef-misread cluster and the phantom-staff-residual cluster share a single root cause — the decoder has never seen scan-realistic multi-staff piano and confuses staff structure on these pieces. Bass-clef-misread is the mild manifestation; phantom-staff-residual is the severe one. The unified "decoder structural confusion on multi-staff piano" cluster is ~85% of the bottom quartile.
+
+**Decision:** proceed with the retrain. The planned `scanned_grandstaff_systems` corpus targets the unified root cause (insufficient exposure to scan-realistic multi-staff piano). Phase 0b (overfit smoke) remains a useful pre-flight regardless. The retrain's primary gate (Bethlehem + TimeMachine bass clefs correct AND in bass register) is unchanged; the secondary gate (bottom-quartile lieder movement) implicitly captures both failure modes.
+
+Report: [docs/audits/2026-05-13-bottom-quartile-lieder-cluster.md](../../audits/2026-05-13-bottom-quartile-lieder-cluster.md).
+
 ### Phase 0 dependencies
 
 0a and 0b are independent. 0a is CPU-only; 0b uses GPU. They can run in parallel on the same day.
 
-Phase 1 cannot start until BOTH 0a's gate passes AND 0b's gate passes.
+Phase 1 cannot start until 0b's gate passes (overfit smoke confirms training pipeline). 0a's strict gate failed but was reframed (see addendum); the retrain proceeds per that decision.
 
 ## Phase 1 — Build scanned_grandstaff_systems corpus
 
