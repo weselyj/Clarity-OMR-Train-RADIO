@@ -271,3 +271,43 @@ def test_pitch_to_octave_handles_double_accidentals():
     assert _pitch_to_octave("note-F##5") == 5
     assert _pitch_to_octave("note-C#6") == 6
     assert _pitch_to_octave("not-a-pitch-token") is None
+
+
+def test_extract_part_clefs_from_mxl(tmp_path):
+    """Parse a synthetic MXL and check returned per-part clef list."""
+    import music21
+    score = music21.stream.Score()
+    p1 = music21.stream.Part()
+    p1.append(music21.clef.TrebleClef())
+    p1.append(music21.note.Note("C5"))
+    p2 = music21.stream.Part()
+    p2.append(music21.clef.BassClef())
+    p2.append(music21.note.Note("C3"))
+    score.append([p1, p2])
+    # Roundtrip through file to test the actual parser path.
+    mxl_path = tmp_path / "test.xml"
+    score.write("musicxml", fp=mxl_path)
+
+    from scripts.audit.cluster_bottom_quartile_lieder import extract_part_clefs
+    parsed = music21.converter.parse(str(mxl_path))
+    result = extract_part_clefs(parsed)
+    assert result["clefs"] == ["clef-G2", "clef-F4"]
+    assert result["staff_count"] == 2
+
+
+def test_csv_load_with_piece_column(tmp_path):
+    """load_bottom_quartile accepts 'piece' column."""
+    csv_path = tmp_path / "scores.csv"
+    csv_path.write_text("index,piece,onset_f1\n1,lc111,0.05\n2,lc222,0.20\n")
+    from scripts.audit.cluster_bottom_quartile_lieder import load_bottom_quartile
+    result = load_bottom_quartile(csv_path)
+    assert result == ["lc111"]
+
+
+def test_csv_load_with_piece_id_column(tmp_path):
+    """load_bottom_quartile accepts 'piece_id' column (legacy)."""
+    csv_path = tmp_path / "scores.csv"
+    csv_path.write_text("piece_id,onset_f1\nlc111,0.05\nlc222,0.20\n")
+    from scripts.audit.cluster_bottom_quartile_lieder import load_bottom_quartile
+    result = load_bottom_quartile(csv_path)
+    assert result == ["lc111"]

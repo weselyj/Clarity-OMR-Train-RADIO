@@ -1,10 +1,20 @@
 """Cluster bottom-quartile lieder pieces by observable failure mode.
 
+Two input modes:
+
+1. **Token-dump mode** (`--tokens-dir`): per-piece `<piece>.tokens.jsonl` raw decoder
+   dumps emitted by `predict_pdf --dump-tokens`. Highest fidelity but requires
+   re-running inference if dumps weren't captured.
+
+2. **Predicted-MXL mode** (`--predicted-mxl-dir`): per-piece `<piece>.musicxml`
+   predicted-output files. No re-inference required; clef/time-sig/octave signal
+   is preserved in the rendered MXL. Use when token dumps are unavailable.
+
 Reads:
-  - eval/results/lieder_stage3_v3_best_scores.csv (139 pieces, with onset_f1)
-  - eval/results/lieder_stage3_v3_best/<piece_id>.musicxml.diagnostics.json
-  - eval/results/lieder_stage3_v3_best/<piece_id>.tokens.jsonl (if available; else re-run predict_pdf)
-  - data/openscore_lieder/scores/.../<piece_id>.mxl (for ground-truth clef extraction)
+  - --scores-csv (with `piece` or `piece_id` column + `onset_f1`)
+  - --tokens-dir/<piece>.tokens.jsonl   (token-dump mode), OR
+  - --predicted-mxl-dir/<piece>.musicxml (predicted-MXL mode)
+  - --gt-mxl-root/.../<piece>.mxl (ground truth, both modes)
 
 Writes:
   - docs/audits/2026-05-13-bottom-quartile-lieder-cluster.md
@@ -26,48 +36,106 @@ BOTTOM_QUARTILE_THRESHOLD = 0.10
 
 
 def load_bottom_quartile(scores_csv: Path, threshold: float = BOTTOM_QUARTILE_THRESHOLD) -> List[str]:
+    """Load piece IDs whose onset_f1 is below the bottom-quartile threshold.
+
+    Accepts either ``piece`` (preferred — matches the current eval CSV) or
+    ``piece_id`` (legacy) as the identifier column.
+    """
     bottom = []
     with scores_csv.open() as f:
         reader = csv.DictReader(f)
         for row in reader:
+            piece_id = row.get("piece") or row.get("piece_id")
+            if piece_id is None:
+                raise ValueError(
+                    f"CSV missing 'piece' or 'piece_id' column. Headers: {reader.fieldnames}"
+                )
             if float(row["onset_f1"]) < threshold:
-                bottom.append(row["piece_id"])
+                bottom.append(piece_id)
     return bottom
+
+
+def extract_part_clefs(score, with_octaves: bool = False) -> Dict:
+    """Extract per-part clef / time-sig / staff-count features from a music21 score.
+
+    The score is treated as a flat sequence of parts (each music21 ``Part`` is one
+    staff). This works uniformly for ground-truth MXLs and predicted MXLs because
+    both encode each staff as a separate ``Part``.
+
+    Args:
+        score: A parsed ``music21.stream.Score`` (or compatible Stream with .parts).
+        with_octaves: If True, also compute the median pitch octave per part and
+            return ``median_octaves_by_part``. Used by the predicted-MXL path.
+
+    Returns:
+        A dict with keys:
+            - ``clefs``: list of model-vocab clef tokens, one per part (first clef
+              in each part). Parts with no clef are skipped (empty entry omitted).
+            - ``time_sig``: ``timeSignature-<ratio>`` from the first explicit
+              TimeSignature anywhere in the score, or ``None``.
+            - ``staff_count``: total number of parts (one staff per part).
+            - ``median_octaves_by_part`` (only if with_octaves=True): list with one
+              entry per part, value is the median ``pitch.octave`` across notes in
+              the part, or ``None`` for empty parts.
+    """
+    import music21
+    clefs: List[str] = []
+    median_octaves: List[Optional[int]] = []
+    parts = list(score.parts)
+    for part in parts:
+        flat = part.flatten()
+        # First clef in the part (matches the original gt extractor's behavior).
+        first_clef = None
+        for clef in flat.getElementsByClass(music21.clef.Clef):
+            first_clef = clef
+            break
+        if first_clef is not None:
+            clefs.append(_music21_clef_to_token(first_clef))
+        if with_octaves:
+            octaves = [p.octave for p in flat.pitches if p.octave is not None]
+            if octaves:
+                octaves_sorted = sorted(octaves)
+                median_octaves.append(octaves_sorted[len(octaves_sorted) // 2])
+            else:
+                median_octaves.append(None)
+
+    # Time signature: take the first explicit one across the score.
+    time_sig: Optional[str] = None
+    for ts in score.flatten().getElementsByClass(music21.meter.TimeSignature):
+        time_sig = f"timeSignature-{ts.ratioString}"
+        break
+
+    result: Dict = {
+        "clefs": clefs,
+        "time_sig": time_sig,
+        "staff_count": len(parts),
+    }
+    if with_octaves:
+        result["median_octaves_by_part"] = median_octaves
+    return result
 
 
 def extract_ground_truth_clefs(mxl_path: Path) -> Tuple[List[List[str]], int, Optional[str]]:
     """Extract ground-truth attributes from a MusicXML source.
+
+    Backward-compatible wrapper around :func:`extract_part_clefs` that returns
+    the legacy ``(clefs_by_system, gt_staff_count, gt_time_sig)`` tuple shape
+    expected by the token-dump code path.
 
     Returns:
         (clefs_by_system, gt_staff_count, gt_time_sig)
 
         - clefs_by_system: single-system-equivalent list (flattened per-part clefs)
           for backwards compatibility with classify_piece's system-fallback logic.
-        - gt_staff_count: total staff count across all parts — the legitimate number
-          of staves the model should emit per system.
+        - gt_staff_count: total staff count across all parts.
         - gt_time_sig: model-format time-signature token from the first explicit
-          TimeSignature, or None if the score has no explicit time signature.
+          TimeSignature, or None.
     """
     import music21
     score = music21.converter.parse(str(mxl_path))
-    clefs: List[List[str]] = []
-    gt_staff_count = 0
-    for part in score.parts:
-        part_clefs: List[str] = []
-        for clef in part.flatten().getElementsByClass(music21.clef.Clef):
-            part_clefs.append(_music21_clef_to_token(clef))
-            break  # first clef in the part only
-        clefs.append(part_clefs)
-        gt_staff_count += max(1, len(part_clefs))
-
-    # Time signature: take the first explicit one across the score.
-    gt_time_sig: Optional[str] = None
-    for ts in score.flatten().getElementsByClass(music21.meter.TimeSignature):
-        gt_time_sig = f"timeSignature-{ts.ratioString}"
-        break
-
-    # Return as single-system-equivalent (caller handles per-system fallback).
-    return [[c for part in clefs for c in part]], gt_staff_count, gt_time_sig
+    parts_info = extract_part_clefs(score, with_octaves=False)
+    # Legacy shape: single-system-equivalent (caller handles per-system fallback).
+    return [parts_info["clefs"]], parts_info["staff_count"], parts_info["time_sig"]
 
 
 def _music21_clef_to_token(clef) -> str:
@@ -182,36 +250,92 @@ def classify_piece(piece_tokens: Dict) -> List[str]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--scores-csv", type=Path, default=DEFAULT_SCORES_CSV)
-    ap.add_argument("--tokens-dir", type=Path, default=DEFAULT_TOKENS_DIR)
-    ap.add_argument("--gt-mxl-root", type=Path, default=DEFAULT_GT_MXL_ROOT)
+    ap = argparse.ArgumentParser(
+        description=(
+            "Cluster bottom-quartile lieder pieces by observable failure mode. "
+            "Supports two input modes: --tokens-dir (raw decoder dumps from "
+            "predict_pdf --dump-tokens) or --predicted-mxl-dir (parses predicted "
+            "MusicXML files). Exactly one of the two must be supplied."
+        )
+    )
+    ap.add_argument(
+        "--scores-csv",
+        type=Path,
+        default=DEFAULT_SCORES_CSV,
+        help=(
+            "CSV with per-piece onset_f1. Accepts either 'piece' or 'piece_id' "
+            "as the identifier column."
+        ),
+    )
+    ap.add_argument(
+        "--tokens-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of per-piece <piece>.tokens.jsonl raw decoder dumps. "
+            "Mutually exclusive with --predicted-mxl-dir."
+        ),
+    )
+    ap.add_argument(
+        "--predicted-mxl-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of per-piece <piece>.musicxml predicted-output files. "
+            "Mutually exclusive with --tokens-dir."
+        ),
+    )
+    ap.add_argument(
+        "--gt-mxl-root",
+        type=Path,
+        default=DEFAULT_GT_MXL_ROOT,
+        help="Directory tree containing ground-truth <piece>.mxl files (searched recursively).",
+    )
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_MD)
     args = ap.parse_args()
+
+    # Validate input mode selection.
+    if args.tokens_dir is not None and args.predicted_mxl_dir is not None:
+        ap.error("--tokens-dir and --predicted-mxl-dir are mutually exclusive; provide exactly one.")
+    if args.tokens_dir is None and args.predicted_mxl_dir is None:
+        ap.error(
+            "must provide one of --tokens-dir (raw decoder dumps) or "
+            "--predicted-mxl-dir (predicted MXL files)."
+        )
 
     pieces = load_bottom_quartile(args.scores_csv)
     print(f"Bottom-quartile pieces (onset_f1 < {BOTTOM_QUARTILE_THRESHOLD}): {len(pieces)}")
 
     cluster_counts: Dict[str, int] = {}
     cluster_examples: Dict[str, List[str]] = {}
-    missing_tokens = 0
+    missing_inputs = 0
 
+    use_mxl_mode = args.predicted_mxl_dir is not None
     for piece_id in pieces:
-        tokens_path = args.tokens_dir / f"{piece_id}.tokens.jsonl"
-        if not tokens_path.exists():
-            print(f"  SKIP {piece_id} — no tokens dump (re-run predict_pdf --dump-tokens)")
-            missing_tokens += 1
-            continue
-        # Build piece_tokens dict from dump + ground truth.
-        piece_tokens = _build_piece_tokens(piece_id, tokens_path, args.gt_mxl_root)
+        if use_mxl_mode:
+            mxl_path = args.predicted_mxl_dir / f"{piece_id}.musicxml"
+            if not mxl_path.exists():
+                print(f"  SKIP {piece_id} — no predicted MXL at {mxl_path}")
+                missing_inputs += 1
+                continue
+            piece_tokens = _build_piece_tokens_from_mxl(piece_id, mxl_path, args.gt_mxl_root)
+        else:
+            tokens_path = args.tokens_dir / f"{piece_id}.tokens.jsonl"
+            if not tokens_path.exists():
+                print(f"  SKIP {piece_id} — no tokens dump (re-run predict_pdf --dump-tokens)")
+                missing_inputs += 1
+                continue
+            piece_tokens = _build_piece_tokens(piece_id, tokens_path, args.gt_mxl_root)
+
         tags = classify_piece(piece_tokens)
         for tag in tags:
             cluster_counts[tag] = cluster_counts.get(tag, 0) + 1
             cluster_examples.setdefault(tag, []).append(piece_id)
 
-    classified = len(pieces) - missing_tokens
-    print(f"Classified: {classified}/{len(pieces)} (missing token dumps: {missing_tokens})")
-    _write_report(args.output, len(pieces), cluster_counts, cluster_examples, missing_tokens)
+    classified = len(pieces) - missing_inputs
+    label = "predicted MXLs" if use_mxl_mode else "token dumps"
+    print(f"Classified: {classified}/{len(pieces)} (missing {label}: {missing_inputs})")
+    _write_report(args.output, len(pieces), cluster_counts, cluster_examples, missing_inputs)
     return 0
 
 
@@ -225,6 +349,49 @@ def _build_piece_tokens(piece_id: str, tokens_path: Path, gt_root: Path) -> Dict
             staves = _extract_staves_from_token_stream(entry["tokens"])
             systems.append({"staves": staves})
     # Locate matching .mxl in gt_root recursively
+    mxl_candidates = list(gt_root.rglob(f"{piece_id}.mxl"))
+    if mxl_candidates:
+        gt_clefs, gt_staff_count, gt_time_sig = extract_ground_truth_clefs(mxl_candidates[0])
+    else:
+        print(f"  WARN: no GT MXL found for {piece_id} under {gt_root} — phantom + time-sig checks degraded")
+        gt_clefs, gt_staff_count, gt_time_sig = [], None, None
+    return {
+        "systems": systems,
+        "ground_truth_clefs_by_system": gt_clefs,
+        "ground_truth_staff_count": gt_staff_count,
+        "ground_truth_time_sig": gt_time_sig,
+    }
+
+
+def _build_piece_tokens_from_mxl(piece_id: str, predicted_mxl_path: Path, gt_root: Path) -> Dict:
+    """Parse a predicted MusicXML into the structure classify_piece expects.
+
+    Unlike the token-dump path, predicted MXLs don't preserve per-system boundaries
+    — music21 flattens the score back to a list of parts. We model this as a
+    single "system" containing all predicted parts as staves, which is the same
+    shape used by :func:`extract_ground_truth_clefs` for GT extraction. This
+    matches how ``classify_piece`` handles the single-system-GT case via its
+    sys-0 fallback.
+    """
+    import music21
+    score = music21.converter.parse(str(predicted_mxl_path))
+    pred = extract_part_clefs(score, with_octaves=True)
+    # Predicted MXL doesn't have per-staff time-sig granularity in music21's
+    # part model; we attach the score-level time signature as the system pred.
+    staves: List[Dict] = []
+    median_octaves = pred.get("median_octaves_by_part", [])
+    for i, clef in enumerate(pred["clefs"]):
+        med_oct = median_octaves[i] if i < len(median_octaves) else None
+        staves.append({
+            "clef_pred": clef,
+            "median_octave_pred": med_oct,
+        })
+    systems = [{
+        "staves": staves,
+        "time_sig_pred": pred["time_sig"],
+    }]
+
+    # Ground truth (same lookup as the token-dump path).
     mxl_candidates = list(gt_root.rglob(f"{piece_id}.mxl"))
     if mxl_candidates:
         gt_clefs, gt_staff_count, gt_time_sig = extract_ground_truth_clefs(mxl_candidates[0])
@@ -293,7 +460,10 @@ def _write_report(
         f"**Input:** `eval/results/lieder_stage3_v3_best_scores.csv` — {total} pieces with onset_f1 < {BOTTOM_QUARTILE_THRESHOLD}",
     ]
     if missing_tokens:
-        lines.append(f"**Missing token dumps:** {missing_tokens}/{total} pieces skipped (re-run predict_pdf --dump-tokens)")
+        lines.append(
+            f"**Missing inputs:** {missing_tokens}/{total} pieces skipped "
+            "(no token dump or predicted MXL for these pieces)"
+        )
     lines.extend([
         "",
         "## Cluster counts",
