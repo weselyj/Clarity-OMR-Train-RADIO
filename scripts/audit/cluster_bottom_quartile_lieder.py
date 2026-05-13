@@ -74,10 +74,13 @@ def classify_piece(piece_tokens: Dict) -> List[str]:
         # Phantom-staff residual: more than 2 staves
         if len(staves) > 2:
             phantom = True
-        # Bass-clef-misread: bottom staff predicted G2, ground truth F4
-        if sys_idx < len(gt_clefs) and len(gt_clefs[sys_idx]) >= 2 and len(staves) >= 2:
+        # Bass-clef-misread: bottom staff predicted G2, ground truth F4.
+        # Lieder clef pairs are stable across systems; if GT doesn't have an entry
+        # for this system, fall back to system 0.
+        gt_for_sys = gt_clefs[sys_idx] if sys_idx < len(gt_clefs) else (gt_clefs[0] if gt_clefs else [])
+        if len(gt_for_sys) >= 2 and len(staves) >= 2:
             bottom_pred = staves[-1].get("clef_pred")
-            bottom_gt = gt_clefs[sys_idx][-1]
+            bottom_gt = gt_for_sys[-1]
             if bottom_pred == "clef-G2" and bottom_gt == "clef-F4":
                 bass_clef_misread = True
 
