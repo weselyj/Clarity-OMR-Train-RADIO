@@ -103,9 +103,9 @@ def build_corpus(
             new_entry = dict(entry)
             new_entry["original_image_path"] = entry["image_path"]
             try:
-                new_entry["image_path"] = str(out_img_path.relative_to(repo_root))
+                new_entry["image_path"] = out_img_path.relative_to(repo_root).as_posix()
             except ValueError:
-                new_entry["image_path"] = str(out_img_path)
+                new_entry["image_path"] = out_img_path.as_posix()
             if new_entry.get("dataset") == SOURCE_CORPUS_TAG:
                 new_entry["dataset"] = TARGET_CORPUS_TAG
             if new_entry.get("variant") == "clean":
