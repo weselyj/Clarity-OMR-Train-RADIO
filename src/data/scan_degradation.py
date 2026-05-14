@@ -4,15 +4,19 @@ Used to derive scanned_grandstaff_systems from grandstaff_systems. Deterministic
 per source via seeded RNG so the corpus is reproducible across machines.
 
 Pipeline (applied in order):
-    1. Rotation: ±1.5° uniform (border replicate)
+    1. Rotation: ±2.3° uniform (border replicate)
     2. Perspective warp: corners offset up to 3% of dimension
     3. Brightness ±0.10, contrast ±0.12
-    4. Paper-texture overlay: low-amplitude noise field, σ=0.04
+    4. Paper-texture overlay: low-amplitude noise field, σ=0.06
     5. Light Gaussian blur: kernel 3, σ uniform[0.3, 0.9]
     6. Salt-and-pepper noise: fraction 0.0015
-    7. JPEG round-trip: quality uniform[75, 90]
+    7. JPEG round-trip: quality uniform[60, 90]
 
-Parameter ranges are starting points; revise per Phase 1a calibration report.
+Parameter ranges tuned to span the Phase 1a calibration distribution
+(docs/audits/2026-05-13-real-scan-degradation-calibration.md). JPEG lower
+bound widened to 60 (cf. calibration's [50, 60] from a single q=29 outlier);
+60 keeps a single heavily-compressed scan in distribution without
+over-degrading the rest of the synthetic corpus.
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ def apply_scan_degradation(img: Image.Image, seed: int) -> Image.Image:
     out = img
 
     # 1. Rotation
-    rot_deg = float(rng.uniform(-1.5, 1.5))
+    rot_deg = float(rng.uniform(-2.3, 2.3))
     out = out.rotate(rot_deg, resample=Image.BICUBIC, fillcolor=255)
 
     # 2. Perspective warp (mild)
@@ -40,7 +44,7 @@ def apply_scan_degradation(img: Image.Image, seed: int) -> Image.Image:
 
     # 4. Paper-texture overlay
     arr = np.asarray(out, dtype=np.float32) / 255.0
-    noise = rng.normal(0.0, 0.04, arr.shape).astype(np.float32)
+    noise = rng.normal(0.0, 0.06, arr.shape).astype(np.float32)
     arr = np.clip(arr + noise, 0.0, 1.0)
     out = Image.fromarray((arr * 255.0).round().astype(np.uint8), mode="L")
 
@@ -52,7 +56,7 @@ def apply_scan_degradation(img: Image.Image, seed: int) -> Image.Image:
     out = _apply_salt_pepper(out, rng, fraction=0.0015)
 
     # 7. JPEG round-trip
-    quality = int(rng.integers(75, 91))
+    quality = int(rng.integers(60, 91))
     buf = BytesIO()
     out.save(buf, format="JPEG", quality=quality)
     buf.seek(0)
