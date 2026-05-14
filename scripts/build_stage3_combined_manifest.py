@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the combined Stage 3 token manifest by concatenating four source manifests.
+"""Build the combined Stage 3 token manifest by concatenating four (or five) source manifests.
 
 Schema normalisation
 --------------------
@@ -111,6 +111,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-systems-manifest", type=Path, required=True)
     parser.add_argument("--grandstaff-systems-manifest", type=Path, required=True)
+    parser.add_argument("--scanned-grandstaff-systems-manifest", type=Path,
+                        required=False, default=None,
+                        help="Optional 5th source: scanned_grandstaff_systems manifest. "
+                             "When omitted the corpus is silently skipped.")
     parser.add_argument("--primus-systems-manifest", type=Path, required=True)
     parser.add_argument("--cameraprimus-systems-manifest", type=Path, required=True)
     parser.add_argument("--output-manifest", type=Path, required=True)
@@ -120,6 +124,10 @@ def main() -> int:
     sources = [
         ("synthetic_systems", args.synthetic_systems_manifest),
         ("grandstaff_systems", args.grandstaff_systems_manifest),
+    ]
+    if args.scanned_grandstaff_systems_manifest is not None:
+        sources.append(("scanned_grandstaff_systems", args.scanned_grandstaff_systems_manifest))
+    sources += [
         ("primus_systems", args.primus_systems_manifest),
         ("cameraprimus_systems", args.cameraprimus_systems_manifest),
     ]

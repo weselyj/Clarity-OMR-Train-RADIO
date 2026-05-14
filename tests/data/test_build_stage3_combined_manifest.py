@@ -273,3 +273,84 @@ def test_synthetic_entry_gets_grandstaff_field_defaults(tmp_path: Path):
     assert syn_entry["modality"] is None
     assert syn_entry["variant"] is None
     assert syn_entry["krn_path"] is None
+
+
+# ---------------------------------------------------------------------------
+# scanned_grandstaff_systems — optional 5th source
+# ---------------------------------------------------------------------------
+
+def _make_scanned_grandstaff_entries(n: int) -> list[dict]:
+    """Entries that look like scanned_grandstaff_systems output.
+
+    Mirror of the real on-disk schema: sample_id namespace starts with
+    "scanned_grandstaff_systems:", variant="scanned", and the extra
+    original_image_path field is present (passed through _normalise unchanged).
+    """
+    return [
+        {
+            "sample_id": f"scanned_grandstaff_systems:dir/piece{i}:piece{i}",
+            "dataset": "scanned_grandstaff_systems",
+            "group_id": f"dir/piece{i}",
+            "modality": "image+notation",
+            "variant": "scanned",
+            "split": "train",
+            "image_path": f"data/processed/scanned_grandstaff_systems/images/data/grandstaff/{i}.png",
+            "original_image_path": f"data/grandstaff/{i}.jpg",
+            "krn_path": f"data/grandstaff/{i}.krn",
+            "token_sequence": ["<bos>", "<staff_start>", "<staff_idx_0>", "y", "<staff_end>", "<eos>"],
+            "staves_in_system": 2,
+        }
+        for i in range(n)
+    ]
+
+
+def test_combined_manifest_includes_scanned_grandstaff_when_provided(tmp_path: Path):
+    """When --scanned-grandstaff-systems-manifest is supplied the entries appear
+    in the combined manifest and the audit JSON reflects the correct counts."""
+    syn = tmp_path / "synth.jsonl"
+    gs = tmp_path / "gs.jsonl"
+    sgs = tmp_path / "scanned_gs.jsonl"
+    pr = tmp_path / "primus.jsonl"
+    cp = tmp_path / "cp.jsonl"
+
+    _write_manifest(syn, _make_synthetic_entries(3))
+    _write_manifest(gs, _make_grandstaff_entries(2))
+    _write_manifest(sgs, _make_scanned_grandstaff_entries(2))
+    _write_manifest(pr, _make_primus_entries(2))
+    _write_manifest(cp, _make_cameraprimus_entries(2))
+
+    out = tmp_path / "combined.jsonl"
+    audit = tmp_path / "combined_audit.json"
+    cmd = [
+        sys.executable, "scripts/build_stage3_combined_manifest.py",
+        "--synthetic-systems-manifest", str(syn),
+        "--grandstaff-systems-manifest", str(gs),
+        "--scanned-grandstaff-systems-manifest", str(sgs),
+        "--primus-systems-manifest", str(pr),
+        "--cameraprimus-systems-manifest", str(cp),
+        "--output-manifest", str(out),
+        "--audit-output", str(audit),
+    ]
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+    lines = [json.loads(L) for L in out.read_text().splitlines()]
+
+    # 3 + 2 + 2 + 2 + 2 = 11 total entries
+    assert len(lines) == 11
+
+    # scanned_grandstaff_systems entries are present with correct fields
+    sgs_entries = [e for e in lines if e["dataset"] == "scanned_grandstaff_systems"]
+    assert len(sgs_entries) == 2
+    for e in sgs_entries:
+        assert e["sample_id"].startswith("scanned_grandstaff_systems:")
+        assert e["variant"] == "scanned"
+
+    # audit JSON reflects the 5-source breakdown
+    audit_data = json.loads(audit.read_text())
+    assert audit_data["total_entries"] == 11
+    assert audit_data["per_dataset"]["scanned_grandstaff_systems"] == 2
+    assert audit_data["per_dataset"]["synthetic_systems"] == 3
+    assert audit_data["per_dataset"]["grandstaff_systems"] == 2
+    assert audit_data["per_dataset"]["primus_systems"] == 2
+    assert audit_data["per_dataset"]["cameraprimus_systems"] == 2
