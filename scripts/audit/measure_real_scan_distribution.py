@@ -140,7 +140,12 @@ def main() -> int:
             f"- Blur kernel σ: scaled so output blur_laplacian_var matches [{min(blurs):.0f}, {max(blurs):.0f}]",
         ]
         if jpegs:
-            lines.append(f"- JPEG quality: uniform [{max(50, min(jpegs) - 5)}, {min(95, max(jpegs) + 5)}]")
+            lo = max(50, min(jpegs) - 5)
+            hi = min(95, max(jpegs) + 5)
+            if hi < lo:
+                # All observed below the 50 floor; widen 10 q-points above lo.
+                hi = min(95, lo + 10)
+            lines.append(f"- JPEG quality: uniform [{lo}, {hi}]")
 
     args.output.write_text("\n".join(lines), encoding="utf-8")
     print(f"Wrote {args.output}")
