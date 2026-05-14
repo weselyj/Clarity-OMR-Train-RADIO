@@ -1,0 +1,81 @@
+# Stage 3 Phase 1 v4 — scan-realistic retrain.
+#
+# Supersedes v3 by adding scanned_grandstaff_systems (offline scan-degraded
+# grandstaff). Dataset_mix rebalances grandstaff's share half-and-half between
+# clean and scanned variants:
+#   synth 0.15 / grand 0.30 / scanned_grand 0.30 / primus 0.125 / camera 0.125
+#
+# Phase 0a (bottom-quartile lieder cluster) and Phase 0b (overfit smoke) gates
+# must pass before launching this run. See:
+#   docs/audits/2026-05-13-bottom-quartile-lieder-cluster.md
+#   docs/audits/2026-05-13-stage3-v4-results.md (Phase 0b section)
+#
+# Run command (on seder):
+#   ssh 10.10.1.29 'cd "C:\\Users\\Jonathan Wesely\\Clarity-OMR-Train-RADIO" && \
+#     venv-cu132\\Scripts\\python -u src/train/train.py \
+#       --stage-configs configs/train_stage3_radio_systems_v4.yaml \
+#       --mode execute \
+#       --resume-checkpoint checkpoints/full_radio_stage2_systems_v2/stage2-radio-systems-polyphonic_best.pt \
+#       --start-stage stage3-radio-systems-frozen-encoder-v4 \
+#       --checkpoint-dir checkpoints/full_radio_stage3_v4 \
+#       --token-manifest src/data/manifests/token_manifest_stage3.jsonl \
+#       --step-log logs/full_radio_stage3_v4_steps.jsonl'
+
+stage_name: stage3-radio-systems-frozen-encoder-v4
+stage_b_encoder: radio_h
+
+epochs: 1
+effective_samples_per_epoch: 9000
+batch_size: 1                        # SENTINEL — unused with tier_grouped_sampling
+max_sequence_length: 1024
+grad_accumulation_steps: 1           # SENTINEL — unused with tier_grouped_sampling
+
+tier_grouped_sampling: true
+b_cached: 16
+b_live: 2
+grad_accumulation_steps_cached: 1
+grad_accumulation_steps_live: 8
+cached_data_ratio: 0.875
+cache_root: data/cache/encoder
+cache_hash16: f3ab6e7c68ba3621
+
+lr_dora: 0.0005
+lr_new_modules: 0.0003
+loraplus_lr_ratio: 2.0
+warmup_steps: 500
+schedule: cosine
+weight_decay: 0.01
+
+label_smoothing: 0.01
+contour_loss_weight: 0.01
+
+checkpoint_every_steps: 500
+validate_every_steps: 500
+
+# Within-cached weights (sum 1.0); total share = 0.875 × ratio.
+#   synth:        6/35 = 0.171428 → 0.150
+#   grand:       12/35 = 0.342857 → 0.300
+#   scanned:     12/35 = 0.342857 → 0.300
+#   primus:       5/35 = 0.142857 → 0.125
+# cameraprimus: 0.125 via live tier.
+dataset_mix:
+  - dataset: synthetic_systems
+    ratio: 0.171428
+    split: train
+    required: true
+  - dataset: grandstaff_systems
+    ratio: 0.342857
+    split: train
+    required: true
+  - dataset: scanned_grandstaff_systems
+    ratio: 0.342857
+    split: train
+    required: true
+  - dataset: primus_systems
+    ratio: 0.142857
+    split: train
+    required: true
+  - dataset: cameraprimus_systems
+    ratio: 0.0
+    split: train
+    required: true
