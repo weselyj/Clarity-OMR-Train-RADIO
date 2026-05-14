@@ -14,14 +14,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
+import sys
 from pathlib import Path
 
-from PIL import Image
-
-from src.data.scan_degradation import apply_scan_degradation
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from PIL import Image  # noqa: E402
+
+from src.data.scan_degradation import apply_scan_degradation  # noqa: E402
+
 DEFAULT_SRC = REPO_ROOT / "data/processed/grandstaff_systems"
 DEFAULT_OUT = REPO_ROOT / "data/processed/scanned_grandstaff_systems"
 
