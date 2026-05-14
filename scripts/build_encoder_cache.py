@@ -50,7 +50,12 @@ from src.data.encoder_cache import (
     write_cache_metadata,
 )
 
-CACHED_TIER_DATASETS = {"synthetic_systems", "grandstaff_systems", "primus_systems"}
+CACHED_TIER_DATASETS = {
+    "synthetic_systems",
+    "grandstaff_systems",
+    "scanned_grandstaff_systems",
+    "primus_systems",
+}
 DRY_RUN_SAMPLE_LIMIT = 1_000
 
 
