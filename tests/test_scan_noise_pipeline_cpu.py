@@ -122,7 +122,9 @@ class TestFaintInkErosionWithBboxes:
 
         This test asserts that the UNFIXED code (A.Morphological) raises that
         exact error.  It is intentionally asserting the broken behaviour to pin
-        the regression.  It will always pass (it expects the error).
+        the regression.  It will always pass on albumentations==2.0.8 (it
+        expects the error); a future version that fixes the upstream bug could
+        change this behaviour.
         """
         transform = self._make_buggy_compose()
         image = np.ones((640, 640, 3), dtype=np.uint8) * 200
@@ -207,4 +209,55 @@ class TestFaintInkErosionWithBboxes:
         assert not np.array_equal(result["image"], image), (
             "ImageOnlyErosion must alter at least some pixels; "
             "if this fails, the transform did not actually run"
+        )
+
+    def test_image_only_erosion_seeded_compose_is_deterministic(self):
+        """Regression guard: ImageOnlyErosion must honour Compose(seed=) for reproducibility.
+
+        Two Compose instances constructed with the same seed=1234 must produce
+        pixel-identical outputs when given the same input image.  This would
+        FAIL with the old global-random.randint kernel draw (because the global
+        RNG state is not reset between the two Compose constructions), and PASS
+        after switching to self.py_random.randint (because Albumentations seeds
+        each transform's py_random from the Compose seed, making kernel-size
+        selection deterministic per seed).
+
+        Determinism API used: A.Compose(..., seed=<int>) — available in
+        albumentations 2.0.8.  The sibling RandomBrightnessContrast is disabled
+        (p=0.0) so ImageOnlyErosion fires on every call, making the kernel-size
+        draw the sole source of variance.
+        """
+        from src.train.scan_noise import ImageOnlyErosion
+
+        def _make_seeded_compose():
+            return A.Compose(
+                [
+                    A.OneOf(
+                        [
+                            A.RandomBrightnessContrast(
+                                brightness_limit=(0.2, 0.5),
+                                contrast_limit=(-0.4, -0.1),
+                                p=0.0,  # disabled — forces ImageOnlyErosion every call
+                            ),
+                            ImageOnlyErosion(scale=(2, 3), p=1.0),
+                        ],
+                        p=1.0,
+                    ),
+                ],
+                seed=1234,
+            )
+
+        image = self._make_structured_image(128, 128)
+
+        compose_a = _make_seeded_compose()
+        compose_b = _make_seeded_compose()
+
+        out_a = compose_a(image=image.copy())["image"]
+        out_b = compose_b(image=image.copy())["image"]
+
+        assert np.array_equal(out_a, out_b), (
+            "Two A.Compose(seed=1234) instances with ImageOnlyErosion must produce "
+            "pixel-identical outputs for the same input.  A failure here means "
+            "ImageOnlyErosion is drawing kernel size from global random instead of "
+            "self.py_random, violating the Albumentations reproducibility contract."
         )

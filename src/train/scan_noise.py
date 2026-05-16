@@ -14,7 +14,6 @@ motivated PR #38's two-phase clean→noise curriculum).
 """
 from __future__ import annotations
 
-import random
 from typing import Any, Dict
 
 
@@ -57,11 +56,10 @@ try:
 
         def apply(self, img: Any, **params: Any) -> Any:  # noqa: ANN401
             """Erode ``img`` with a randomly-sized rectangular kernel."""
-            import cv2  # noqa: PLC0415 — keep cv2 import scoped
             min_k, max_k = self.scale
-            k = random.randint(min_k, max_k)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-            return cv2.erode(img, kernel, iterations=1)
+            k = self.py_random.randint(min_k, max_k)
+            kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (k, k))
+            return _cv2.erode(img, kernel, iterations=1)
 
         def get_transform_init_args_names(self) -> tuple[str, ...]:
             return ("scale",)
