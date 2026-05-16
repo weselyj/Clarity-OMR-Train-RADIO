@@ -204,6 +204,7 @@ eval/results/*
 !eval/results/lieder_stage3_v2_smoke.csv
 !eval/results/lieder_subproject4_inference_status.jsonl
 !eval/results/lieder_subproject4_scores.csv
+!eval/results/stagea_baseline_pre_faintink.csv
 !eval/results/baseline_pre_rebuild/
 eval/results/baseline_pre_rebuild/*
 !eval/results/baseline_pre_rebuild/measure_stage_a.py
@@ -222,6 +223,7 @@ eval/results/baseline_pre_rebuild/*
 eval/results/*
 !eval/results/.gitkeep
 !eval/results/README.md
+!eval/results/stagea_baseline_pre_faintink.csv
 
 # YOLO training output trees (Stage A weights live on the GPU box)
 runs/
