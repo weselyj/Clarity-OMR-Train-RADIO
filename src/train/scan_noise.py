@@ -25,6 +25,7 @@ BASE_NOISE_PROBABILITIES: Dict[str, float] = {
     "noise_oneof": 0.3,
     "blur_oneof": 0.15,
     "brightness_contrast": 0.4,
+    "faint_ink": 0.25,
     "rotate": 0.3,
     "grid_distortion": 0.2,
     "elastic_transform": 0.10,
@@ -82,6 +83,14 @@ def patch_albumentations_for_scan_noise(warmup_steps: int = 0) -> None:
                 brightness_limit=0.15, contrast_limit=0.15,
                 p=p_overrides["brightness_contrast"],
             ),
+            A.OneOf([
+                A.RandomBrightnessContrast(
+                    brightness_limit=(0.2, 0.5),   # asymmetric: wash toward white
+                    contrast_limit=(-0.4, -0.1),   # reduce contrast (faint ink)
+                    p=0.7,
+                ),
+                A.Morphological(scale=(2, 3), operation="erosion", p=0.3),
+            ], p=p_overrides["faint_ink"]),
             A.Rotate(
                 limit=2, border_mode=cv2.BORDER_REPLICATE, fill=255,
                 p=p_overrides["rotate"],

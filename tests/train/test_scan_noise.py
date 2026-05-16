@@ -68,8 +68,38 @@ class TestScaledProbabilities:
             "noise_oneof",
             "blur_oneof",
             "brightness_contrast",
+            "faint_ink",
             "rotate",
             "grid_distortion",
             "elastic_transform",
         }
         assert set(BASE_NOISE_PROBABILITIES.keys()) == expected
+
+
+def test_faint_ink_key_present_and_scaled():
+    from src.train.scan_noise import BASE_NOISE_PROBABILITIES, scaled_probabilities
+    assert "faint_ink" in BASE_NOISE_PROBABILITIES
+    assert BASE_NOISE_PROBABILITIES["faint_ink"] > 0.0
+    half = scaled_probabilities(0.5)
+    assert half["faint_ink"] == BASE_NOISE_PROBABILITIES["faint_ink"] * 0.5
+
+
+def test_faint_ink_transform_wired_into_pipeline():
+    """The real patched Albumentations pipeline must contain a transform gated
+    by the faint_ink probability. Exercises the actual closure — no production
+    test-hooks. Skipped where ultralytics/albumentations aren't importable
+    (CPU dev boxes); the Task 5 Bethlehem gate is the integration proof."""
+    pytest.importorskip("ultralytics")
+    pytest.importorskip("albumentations")
+    import ultralytics.data.augment as ua
+    from src.train.scan_noise import (
+        patch_albumentations_for_scan_noise,
+        BASE_NOISE_PROBABILITIES,
+    )
+
+    patch_albumentations_for_scan_noise(warmup_steps=0)
+    alb = ua.Albumentations(p=1.0)
+    probs = [getattr(t, "p", None) for t in alb.transform.transforms]
+    target = BASE_NOISE_PROBABILITIES["faint_ink"]  # 0.25 — unique among the groups
+    assert any(p is not None and abs(p - target) < 1e-9 for p in probs), \
+        f"no transform at faint_ink prob {target}; got {probs}"
