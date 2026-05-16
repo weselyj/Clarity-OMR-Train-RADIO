@@ -14,7 +14,62 @@ motivated PR #38's two-phase clean→noise curriculum).
 """
 from __future__ import annotations
 
-from typing import Dict
+import random
+from typing import Any, Dict
+
+
+# ---------------------------------------------------------------------------
+# Image-only erosion transform (safe for detection pipelines with bboxes)
+# ---------------------------------------------------------------------------
+# A.Morphological(operation="erosion") in Albumentations 2.0.8 applies the
+# morphological op to bboxes via cv2.erode, which aborts with:
+#   cv2.error (-215): dims <= 2 && step[0] > 0 in cv2.Mat.locateROI
+# when bounding-box coordinates are passed to it.
+#
+# Fix: subclass A.ImageOnlyTransform, which Albumentations guarantees is
+# NEVER applied to bboxes, masks, or keypoints — only to the image array.
+# This preserves the stroke-thinning ("faint/broken ink") intent of the
+# original transform while being inherently safe in a YOLO detection pipeline.
+#
+# The class is defined via a soft import so the module stays importable on
+# hosts where albumentations is not installed (e.g. pure-Python CI runners).
+# A.ImageOnlyTransform is the documented base for image-only operations and
+# is available in all Albumentations versions >= 1.x.
+
+try:
+    import albumentations as _A
+    import cv2 as _cv2
+
+    class ImageOnlyErosion(_A.ImageOnlyTransform):
+        """Apply cv2.erode to the image only; never touches bboxes/masks/keypoints.
+
+        Args:
+            scale: Tuple ``(min_px, max_px)`` for the square erosion kernel
+                   side-length.  A random value is drawn each call so the
+                   transform introduces per-sample variation matching the
+                   original ``A.Morphological(scale=(2, 3))`` intent.
+            p:     Probability of applying this transform (passed to base class).
+        """
+
+        def __init__(self, scale: tuple[int, int] = (2, 3), p: float = 0.3, **kwargs: Any) -> None:
+            super().__init__(p=p, **kwargs)
+            self.scale = scale
+
+        def apply(self, img: Any, **params: Any) -> Any:  # noqa: ANN401
+            """Erode ``img`` with a randomly-sized rectangular kernel."""
+            import cv2  # noqa: PLC0415 — keep cv2 import scoped
+            min_k, max_k = self.scale
+            k = random.randint(min_k, max_k)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            return cv2.erode(img, kernel, iterations=1)
+
+        def get_transform_init_args_names(self) -> tuple[str, ...]:
+            return ("scale",)
+
+except ImportError:
+    # albumentations not installed — define a placeholder so the module is
+    # still importable. Tests that need this class use pytest.importorskip.
+    ImageOnlyErosion = None  # type: ignore[assignment,misc]
 
 
 # Canonical scan-noise pipeline probabilities at full strength. Keys identify
@@ -89,7 +144,7 @@ def patch_albumentations_for_scan_noise(warmup_steps: int = 0) -> None:
                     contrast_limit=(-0.4, -0.1),   # reduce contrast (faint ink)
                     p=0.7,
                 ),
-                A.Morphological(scale=(2, 3), operation="erosion", p=0.3),
+                ImageOnlyErosion(scale=(2, 3), p=0.3),
             ], p=p_overrides["faint_ink"]),
             A.Rotate(
                 limit=2, border_mode=cv2.BORDER_REPLICATE, fill=255,
