@@ -158,6 +158,29 @@ def test_nested_openscore_layout_is_found(tmp_path: Path):
     assert int(data[3]) == 0
 
 
+def test_missing_scores_dir_does_not_crash(tmp_path: Path):
+    """scores_dir that does not exist → no crash → header-only CSV (no data rows).
+
+    A typo'd or wrong --scores-dir is exactly the failure class that produced
+    the original 0/145 bug, so this pins the contract: a missing scores_dir
+    yields an empty (header-only) CSV, never an exception. (Verified:
+    Path.rglob on a non-existent directory returns [] on CPython 3.14.4.)
+    """
+    from eval.score_stage_a_only import score_run
+
+    manifests = tmp_path / "m"
+    scores = tmp_path / "scores_that_does_not_exist"  # deliberately NOT created
+    out_csv = tmp_path / "r.csv"
+
+    _write_manifest(manifests, "some_piece", page0_boxes=2)
+    # scores dir is intentionally absent — score_run must not raise
+
+    score_run(manifest_dir=manifests, scores_dir=scores, out_csv=out_csv)
+
+    rows = out_csv.read_text().strip().splitlines()
+    assert len(rows) == 1, f"Expected header only (1 row), got {len(rows)}: {rows}"
+
+
 def test_main_cli_writes_csv(tmp_path: Path, monkeypatch):
     from eval import score_stage_a_only
 
