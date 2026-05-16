@@ -42,10 +42,15 @@ class TestFaintInkErosionWithBboxes:
         (scaled_probabilities + the internal builder is not exposed, so we
         reconstruct the relevant sub-transform here at p=1.0 to guarantee the
         erosion branch fires).
+
+        Determinism note: in A.OneOf the inner ``p`` values are *selection
+        weights*, not independent probabilities.  If RandomBrightnessContrast
+        were left at p=0.7 then ImageOnlyErosion would only be chosen ~59% of
+        the time, so assertions that depend on erosion actually running would
+        be vacuous on lucky draws.  Setting the sibling to p=0.0 disables it
+        entirely, leaving erosion as the only selectable branch — exactly the
+        same technique the buggy-path test uses for A.Morphological.
         """
-        # We reproduce the faint_ink OneOf exactly as it appears in scan_noise.py,
-        # but force both the OneOf and the erosion branch to p=1.0 so the
-        # erosion definitely fires every call.
         from src.train.scan_noise import ImageOnlyErosion  # imported after fix
 
         faint_ink_oneof = A.OneOf(
@@ -53,7 +58,7 @@ class TestFaintInkErosionWithBboxes:
                 A.RandomBrightnessContrast(
                     brightness_limit=(0.2, 0.5),
                     contrast_limit=(-0.4, -0.1),
-                    p=0.7,
+                    p=0.0,  # disabled — forces ImageOnlyErosion every call
                 ),
                 ImageOnlyErosion(scale=(2, 3), p=1.0),
             ],
@@ -63,6 +68,27 @@ class TestFaintInkErosionWithBboxes:
             [faint_ink_oneof],
             bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]),
         )
+
+    @staticmethod
+    def _make_structured_image(h: int, w: int) -> np.ndarray:
+        """Return a non-constant uint8 BGR image with drawn shapes.
+
+        A purely constant image (e.g. np.ones * 200) would produce an identical
+        output after cv2.erode because erosion of a constant field is still that
+        constant.  Drawn shapes ensure bright pixels are adjacent to dark pixels,
+        so the erosion kernel provably shrinks bright regions and changes at least
+        some pixel values.
+        """
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        img[:] = 30  # dark background
+        # Draw a filled white rectangle so erosion must shrink it
+        img[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = 220
+        # Draw a bright circle as a second region
+        cy, cx, r = h // 2, w // 2, min(h, w) // 6
+        ys, xs = np.ogrid[:h, :w]
+        mask = (ys - cy) ** 2 + (xs - cx) ** 2 <= r ** 2
+        img[mask] = 180
+        return img
 
     def _make_buggy_compose(self):
         """Reproduces the PRE-FIX bug: A.Morphological in a bbox-aware Compose.
@@ -111,9 +137,15 @@ class TestFaintInkErosionWithBboxes:
 
         This is the MAIN regression guard.  Before the fix this would crash
         with cv2.error (-215); after the fix it must complete cleanly.
+
+        Non-vacuousness: the sibling RandomBrightnessContrast is disabled
+        (p=0.0), so A.OneOf can only select ImageOnlyErosion, which fires
+        every call.  The structured input image (bright shapes on dark
+        background) guarantees erosion changes at least some pixel values —
+        asserting ``not np.array_equal`` would fail if erosion were a no-op.
         """
         transform = self._make_faint_ink_compose_using_source_module()
-        image = np.ones((640, 640, 3), dtype=np.uint8) * 200
+        image = self._make_structured_image(640, 640)
         bboxes = [[0.5, 0.5, 0.3, 0.3]]
         class_labels = [0]
 
@@ -122,11 +154,25 @@ class TestFaintInkErosionWithBboxes:
         assert result["image"].shape == (640, 640, 3), "image shape must be preserved"
         assert result["image"].dtype == np.uint8, "image dtype must remain uint8"
         assert len(result["bboxes"]) == 1, "bbox must survive the transform"
+        # Erosion with a >=2px kernel on a structured image MUST alter pixels.
+        # If ImageOnlyErosion were a no-op this assertion would fail, proving
+        # the test is non-vacuous.
+        assert not np.array_equal(result["image"], image), (
+            "ImageOnlyErosion must alter at least some pixels; "
+            "if this fails, the transform did not actually run"
+        )
 
     def test_image_only_erosion_preserves_multiple_bboxes(self):
-        """With several bboxes all must survive the transform unchanged."""
+        """With several bboxes all must survive the transform unchanged.
+
+        Non-vacuousness: sibling is disabled (p=0.0), so erosion fires every
+        call.  The random-pixel image has high local variance, guaranteeing the
+        erosion kernel changes pixel values (min-pooling over neighbouring
+        pixels in a noisy field always produces at least one different value).
+        """
+        rng = np.random.default_rng(seed=42)
         transform = self._make_faint_ink_compose_using_source_module()
-        image = (np.random.rand(480, 640, 3) * 255).astype(np.uint8)
+        image = (rng.random((480, 640, 3)) * 255).astype(np.uint8)
         bboxes = [
             [0.2, 0.2, 0.1, 0.1],
             [0.6, 0.4, 0.2, 0.15],
@@ -138,10 +184,27 @@ class TestFaintInkErosionWithBboxes:
         assert result["image"].shape == (480, 640, 3)
         assert result["image"].dtype == np.uint8
         assert len(result["bboxes"]) == 3
+        # Erosion on a noisy image must change at least some pixels.
+        assert not np.array_equal(result["image"], image), (
+            "ImageOnlyErosion must alter at least some pixels; "
+            "if this fails, the transform did not actually run"
+        )
 
     def test_image_only_erosion_no_bboxes(self):
-        """Edge case: empty bbox list must not cause issues either."""
+        """Edge case: empty bbox list must not cause issues either.
+
+        Non-vacuousness: sibling is disabled (p=0.0), so erosion fires every
+        call.  A constant image (np.ones * 128) would survive erosion unchanged
+        and make the image-changed assertion impossible to satisfy, so we use a
+        structured image with bright shapes on a dark background instead.
+        """
         transform = self._make_faint_ink_compose_using_source_module()
-        image = np.ones((320, 320, 3), dtype=np.uint8) * 128
+        image = self._make_structured_image(320, 320)
         result = transform(image=image, bboxes=[], class_labels=[])
         assert result["image"].shape == (320, 320, 3)
+        assert result["image"].dtype == np.uint8
+        # Erosion on a structured image must change at least some pixels.
+        assert not np.array_equal(result["image"], image), (
+            "ImageOnlyErosion must alter at least some pixels; "
+            "if this fails, the transform did not actually run"
+        )
