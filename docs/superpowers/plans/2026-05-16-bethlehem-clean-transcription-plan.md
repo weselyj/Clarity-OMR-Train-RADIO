@@ -410,23 +410,46 @@ ssh 10.10.1.29 'cd "C:/Users/Jonathan Wesely/Clarity-OMR-Train-RADIO" && dir /s 
 ```
 Expected: the `data:` path from the prior run's `args.yaml`. Use that exact path in Step 4.2.
 
-- [ ] **Step 4.2: Sync seder + launch retrain (detached)**
+- [ ] **Step 4.2: Sync seder + launch retrain (Scheduled Task, NOT Start-Process)**
 
-Run (detached via `Start-Process` so a Tailscale flap / SSH drop does not kill it — see WIKI clarity-omr):
-```bash
-ssh 10.10.1.29 'cd "C:/Users/Jonathan Wesely/Clarity-OMR-Train-RADIO" && git pull --ff-only origin main && powershell -NoProfile -Command "$p = Start-Process -FilePath venv-cu132/Scripts/python.exe -ArgumentList \"scripts/train_yolo.py\",\"--model\",\"yolo26m.pt\",\"--data\",\"<DATA_YAML_FROM_4.1>\",\"--name\",\"yolo26m_systems_faintink\",\"--noise\",\"--noise-warmup-steps\",\"500\",\"--device\",\"0\" -RedirectStandardOutput logs/yolo_faintink.out -RedirectStandardError logs/yolo_faintink.err -NoNewWindow -PassThru; \$p.Id | Out-File logs/yolo_faintink.pid -Encoding ascii; Write-Host (\"PID \" + \$p.Id)"'
+Launch via the **Windows Scheduled Task** mechanism (a self-logging worker `.ps1`
+at no-space `C:\radio_jobs\`, registered + run via `schtasks`). `Start-Process
+-NoNewWindow` via `ssh -Command` is reaped on ssh-session close — see WIKI
+clarity-omr and the 2026-05-16 handoff for the exact mechanism + the
+`$ErrorActionPreference`/git-pull gotcha. The worker decides `.done`/`.failed`
+on the python exit code and glob-discovers the real `best.pt` path (Ultralytics
+auto-increments the run dir if a prior `yolo26m_systems_faintink*` exists — make
+sure none does, so it lands at the base name).
+
+Train args (the worker runs this exactly):
+```
+venv-cu132/Scripts/python.exe scripts/train_yolo.py \
+  --model yolo26m.pt --data <DATA_YAML_FROM_4.1> \
+  --name yolo26m_systems_faintink \
+  --noise --noise-warmup-steps 500 --batch 4 --device 0
 ```
 
-- [ ] **Step 4.3: Poll to completion**
+**`--batch 4` is REQUIRED, not optional.** `train_yolo.py` has no argparse
+default for `--batch`, so omitting it lets Ultralytics auto-select (it picked
+8). At `imgsz=1920` on the 32 GB RTX 5090, batch=8 overflows VRAM and the WDDM
+driver's CUDA sysmem-fallback silently spills ~13 GiB to host RAM → ~143 s/it
+(~102 h/epoch), no OOM error. `batch=4` is the empirically proven value (it is
+exactly what the prior successful `yolo26m_systems` run used; see its
+`args.yaml`). Verdict at `GPU_mem ≤ ~30G` and ~1–5 s/it.
 
-Background poll (Bash `run_in_background`): every 120 s check the PID and for
-`runs/detect/runs/yolo26m_systems_faintink/weights/best.pt`. Exit on weights
-present (DONE) or PID gone without weights (DIED). One notification.
+- [ ] **Step 4.3: Poll to completion (ssh-independent, marker-based)**
+
+Background poll (Bash `run_in_background`): every ~600 s check, ssh-independently,
+for the worker's `logs/yolo_faintink.done` / `.failed` marker and the scheduled
+task's `Status`. DONE on `.done`; FAILED on `.failed` (the marker carries the
+exit code + log tail); DIED if the task is not `Running` and no marker appears
+on two consecutive polls. One notification on exit.
 
 - [ ] **Step 4.4: Confirm training completed cleanly**
 
-Read `logs/yolo_faintink.out` tail on seder: confirm epochs completed, no NaN
-cls_loss blow-up (the warmup guards this), `best.pt` written.
+Read `logs/yolo_faintink.log` tail on seder: confirm epochs completed, no NaN
+cls_loss blow-up (the warmup guards this), `best.pt` written, and read the
+`.done` marker for the resolved `best.pt` path (feeds Task 5).
 
 ### Task 5: Phase 2 gate
 
