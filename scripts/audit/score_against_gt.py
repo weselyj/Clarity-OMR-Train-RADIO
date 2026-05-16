@@ -3,8 +3,10 @@
 Three metrics (see spec 2026-05-16-bethlehem-clean-transcription-design):
   measure_recall  - fraction of GT measures present in the prediction
                     (Defect 1 signal: Stage A missed systems)
-  clef_accuracy   - per-part clef correctness; part 0 expects treble G2,
-                    part 1 expects bass F4 (Defect 2 signal)
+  clef_accuracy   - per-clef-occurrence correctness (every clef declaration
+                    counts; a single flipped system is visible, not masked by
+                    majority); part 0 expects treble G2, part 1 expects bass F4
+                    (Defect 2 signal)
   note_onset_f1   - per-part onset F1 by (measure, offset, midi); tracked
                     for regression visibility, not a gate
 
@@ -66,10 +68,10 @@ def score(pred_path: str, gt_path: str) -> dict:
         if expected is None:
             continue
         toks = _clef_tokens(pp) or ["<none>"]
-        majority = max(set(toks), key=toks.count)
-        total += 1
-        if majority == expected:
-            correct += 1
+        for t in toks:
+            total += 1
+            if t == expected:
+                correct += 1
     clef_accuracy = (correct / total) if total else 0.0
 
     tp = fp = fn = 0
