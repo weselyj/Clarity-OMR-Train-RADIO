@@ -215,12 +215,27 @@ class TestFaintInkErosionWithBboxes:
         """Regression guard: ImageOnlyErosion must honour Compose(seed=) for reproducibility.
 
         Two Compose instances constructed with the same seed=1234 must produce
-        pixel-identical outputs when given the same input image.  This would
-        FAIL with the old global-random.randint kernel draw (because the global
-        RNG state is not reset between the two Compose constructions), and PASS
-        after switching to self.py_random.randint (because Albumentations seeds
-        each transform's py_random from the Compose seed, making kernel-size
-        selection deterministic per seed).
+        pixel-identical output SEQUENCES across N=8 consecutive calls on the
+        same input image.  This is RELIABLY sensitive to the old bug:
+
+        - scale=(2, 50) gives ~49 possible kernel sizes, so the probability that
+          a single draw accidentally matches under the broken global-RNG is ~2%.
+          Over an 8-call sequence the probability that ALL 8 calls accidentally
+          agree is ~(1/49)^8 ≈ 1.7e-13 — effectively zero.  (With the old
+          scale=(2, 3) it was ~(1/2)^8 = 0.4% per sequence, and still only ~50%
+          for a single call.)
+        - Under the fix (self.py_random.randint), both Composes draw identically
+          from their seeded streams and the sequences match exactly.
+
+        This test uses its OWN local _make_seeded_compose with scale=(2, 50).
+        That wider range does NOT affect any other test or production code
+        (ImageOnlyErosion(scale=(2,3)) in src/train/scan_noise.py is unchanged,
+        and _make_faint_ink_compose_using_source_module still uses scale=(2,3)).
+
+        The input image is 128×128, comfortably larger than the 50px maximum
+        kernel.  Erosion with a large kernel may blank small features — that is
+        fine; the test only asserts the TWO seeded sequences are equal, not that
+        they differ from the input.
 
         Determinism API used: A.Compose(..., seed=<int>) — available in
         albumentations 2.0.8.  The sibling RandomBrightnessContrast is disabled
@@ -229,7 +244,10 @@ class TestFaintInkErosionWithBboxes:
         """
         from src.train.scan_noise import ImageOnlyErosion
 
-        def _make_seeded_compose():
+        N_CALLS = 8  # number of consecutive calls to compare per Compose
+
+        def _make_seeded_compose_wide():
+            """Local builder with scale=(2, 50) — used ONLY by this test."""
             return A.Compose(
                 [
                     A.OneOf(
@@ -239,7 +257,7 @@ class TestFaintInkErosionWithBboxes:
                                 contrast_limit=(-0.4, -0.1),
                                 p=0.0,  # disabled — forces ImageOnlyErosion every call
                             ),
-                            ImageOnlyErosion(scale=(2, 3), p=1.0),
+                            ImageOnlyErosion(scale=(2, 50), p=1.0),
                         ],
                         p=1.0,
                     ),
@@ -247,17 +265,20 @@ class TestFaintInkErosionWithBboxes:
                 seed=1234,
             )
 
+        # 128×128 is comfortably larger than the 50px maximum kernel.
         image = self._make_structured_image(128, 128)
 
-        compose_a = _make_seeded_compose()
-        compose_b = _make_seeded_compose()
+        compose_a = _make_seeded_compose_wide()
+        compose_b = _make_seeded_compose_wide()
 
-        out_a = compose_a(image=image.copy())["image"]
-        out_b = compose_b(image=image.copy())["image"]
+        seq_a = [compose_a(image=image.copy())["image"] for _ in range(N_CALLS)]
+        seq_b = [compose_b(image=image.copy())["image"] for _ in range(N_CALLS)]
 
-        assert np.array_equal(out_a, out_b), (
-            "Two A.Compose(seed=1234) instances with ImageOnlyErosion must produce "
-            "pixel-identical outputs for the same input.  A failure here means "
-            "ImageOnlyErosion is drawing kernel size from global random instead of "
-            "self.py_random, violating the Albumentations reproducibility contract."
-        )
+        for i, (frame_a, frame_b) in enumerate(zip(seq_a, seq_b)):
+            assert np.array_equal(frame_a, frame_b), (
+                f"Call {i}: two A.Compose(seed=1234, scale=(2,50)) instances "
+                f"produced different outputs for the same input.  This means "
+                f"ImageOnlyErosion is drawing kernel size from global random "
+                f"instead of self.py_random, violating the Albumentations "
+                f"reproducibility contract."
+            )
