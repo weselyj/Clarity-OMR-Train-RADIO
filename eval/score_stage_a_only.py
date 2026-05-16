@@ -25,11 +25,19 @@ def expected_p1_staves(mxl_path: Path) -> int:
 
 
 def score_run(manifest_dir: Path, scores_dir: Path, out_csv: Path) -> None:
+    # Build a one-time recursive index {stem: path} so nested layouts like
+    # <Composer>/_/<Title>/<piece>.mxl are found.  When two files share a stem,
+    # sorted() gives deterministic resolution (lexicographically first path wins).
+    mxl_index: dict[str, Path] = {}
+    for p in sorted(scores_dir.rglob("*.mxl")):
+        if p.stem not in mxl_index:
+            mxl_index[p.stem] = p
+
     rows: list[tuple[str, int, int, int]] = []
     for manifest in sorted(manifest_dir.glob("*_stage_a.jsonl")):
         piece = manifest.stem.removesuffix("_stage_a")
-        mxl = scores_dir / f"{piece}.mxl"
-        if not mxl.exists():
+        mxl = mxl_index.get(piece)
+        if mxl is None:
             continue
         try:
             expected = expected_p1_staves(mxl)

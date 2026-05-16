@@ -114,6 +114,50 @@ def test_overdetected_is_zero_missing(tmp_path: Path):
     assert int(data[3]) == 0
 
 
+def _write_fake_score_nested(scores_dir: Path, composer: str, title: str, piece: str, n_parts: int) -> None:
+    """Write a minimal MusicXML nested under scores_dir/<Composer>/_/<Title>/<piece>.mxl."""
+    import music21
+    nested = scores_dir / composer / "_" / title
+    nested.mkdir(parents=True, exist_ok=True)
+    s = music21.stream.Score()
+    for i in range(n_parts):
+        p = music21.stream.Part()
+        p.partName = f"Part{i}"
+        m = music21.stream.Measure()
+        m.append(music21.note.Note("C4", quarterLength=4))
+        p.append(m)
+        s.append(p)
+    s.write("musicxml", fp=str(nested / f"{piece}.mxl"))
+
+
+def test_nested_openscore_layout_is_found(tmp_path: Path):
+    """Pieces nested like <Composer>/_/<Title>/<piece>.mxl must be found and scored.
+
+    This is the real openscore_lieder directory structure; flat lookup silently
+    skips every piece (the bug this test covers).
+    """
+    from eval.score_stage_a_only import score_run
+
+    manifests = tmp_path / "manifests"
+    scores = tmp_path / "scores"
+    out_csv = tmp_path / "recall.csv"
+
+    piece = "lc28688206"
+    _write_manifest(manifests, piece, page0_boxes=2)
+    _write_fake_score_nested(scores, "Brahms", "LiederOp49", piece, n_parts=2)
+
+    score_run(manifest_dir=manifests, scores_dir=scores, out_csv=out_csv)
+
+    rows = out_csv.read_text().strip().splitlines()
+    # Must have header + one data row (not just header-only, which is the bug)
+    assert len(rows) == 2, f"Expected header + 1 data row, got {len(rows)} rows: {rows}"
+    data = rows[1].split(",")
+    assert data[0] == piece
+    assert int(data[1]) == 2
+    assert int(data[2]) == 2
+    assert int(data[3]) == 0
+
+
 def test_main_cli_writes_csv(tmp_path: Path, monkeypatch):
     from eval import score_stage_a_only
 
