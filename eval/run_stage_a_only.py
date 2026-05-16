@@ -7,13 +7,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import List
 
-from PIL import Image
-from ultralytics import YOLO
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from src.models.system_postprocess import extend_left_for_brace
+from PIL import Image  # noqa: E402
+from ultralytics import YOLO  # noqa: E402
+
+from src.models.system_postprocess import extend_left_for_brace  # noqa: E402
 
 
 def _render_pages(pdf_path: Path, dpi: int) -> List[Image.Image]:
