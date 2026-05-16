@@ -237,7 +237,7 @@ scp '10.10.1.29:C:/Users/Jonathan Wesely/Downloads/bethlehem_v4.musicxml' /tmp/b
 python scripts/audit/score_against_gt.py /tmp/bethlehem_v4.musicxml \
   /home/ari/musicxml/Scanned_20251208-0833_20260516.musicxml
 ```
-Expected: measure_recall ≈ 0.76 (13/17), clef_accuracy = 0.5 (bass part wrong), note_onset_f1 low. Confirms the harness reproduces the known v4 gap.
+Expected: measure_recall ≈ 0.76 (13/17), clef_accuracy ≈ 0.83 (5/6 — per clef-occurrence: part0 G2,G2,G2 = 3/3; part1 F4,F4,**G2** = 2/3, the one flipped bass system visible, not masked), note_onset_f1 ≈ 0.08. Confirms the harness reproduces the known v4 gap. (Original plan said clef_accuracy 0.5 — wrong; the metric is per clef-occurrence. The smoke exposed that per-part-majority voting masked the single flipped bass system; fixed in commit 77d4963.)
 
 - [ ] **Step 1.6: Commit**
 
