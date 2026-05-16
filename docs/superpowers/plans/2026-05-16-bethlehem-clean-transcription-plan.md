@@ -415,11 +415,21 @@ Expected: the `data:` path from the prior run's `args.yaml`. Use that exact path
 Launch via the **Windows Scheduled Task** mechanism (a self-logging worker `.ps1`
 at no-space `C:\radio_jobs\`, registered + run via `schtasks`). `Start-Process
 -NoNewWindow` via `ssh -Command` is reaped on ssh-session close — see WIKI
-clarity-omr and the 2026-05-16 handoff for the exact mechanism + the
-`$ErrorActionPreference`/git-pull gotcha. The worker decides `.done`/`.failed`
-on the python exit code and glob-discovers the real `best.pt` path (Ultralytics
-auto-increments the run dir if a prior `yolo26m_systems_faintink*` exists — make
-sure none does, so it lands at the base name).
+clarity-omr and the 2026-05-16 handoff for the exact mechanism. The worker
+decides `.done`/`.failed` on the python exit code and glob-discovers the real
+`best.pt` path (Ultralytics auto-increments the run dir if a prior
+`yolo26m_systems_faintink*` exists — make sure none does, so it lands at the
+base name).
+
+**Worker must run BOTH the `git pull` AND the `python train_yolo.py` call under
+`$ErrorActionPreference = "Continue"` (restore `"Stop"` after), gating
+success solely on `$LASTEXITCODE`.** Under `"Stop"`, PowerShell turns ANY
+child-process stderr write into a fatal `NativeCommandError` — this killed the
+run twice: once on git's informational stderr, and once mid-training (~iter
+3317) on a benign `libpng warning: iCCP ... grayscale PNG` from a dataset image.
+Native-command stderr is normal output, not failure; only the exit code is.
+(PS 5.1 on seder has no `$PSNativeCommandUseErrorActionPreference`; the
+`Continue` wrapper is the fix.)
 
 Train args (the worker runs this exactly):
 ```
