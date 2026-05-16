@@ -263,10 +263,9 @@ Run:
 ```bash
 ssh 10.10.1.29 'cd "C:/Users/Jonathan Wesely/Clarity-OMR-Train-RADIO" && venv-cu132/Scripts/python.exe -c "import albumentations as A; print(A.__version__); print(hasattr(A, \"Morphological\"))"'
 ```
-Expected: prints version and `True`. **If `False`:** in Step 2.3 replace the
-`A.Morphological(...)` line with
-`A.Lambda(image=lambda x, **k: __import__("cv2").erode(x, __import__("numpy").ones((2,2), "uint8"), iterations=1), p=1.0)`
-inside the OneOf. Record which path was taken in the commit message.
+**RESOLVED by controller:** seder has albumentations **2.0.8**,
+`hasattr(A, "Morphological") == True`. Use `A.Morphological(...)` directly
+(Step 2.4) — no fallback needed. Implementer does not need seder for this.
 
 - [ ] **Step 2.2: Write the failing test**
 
@@ -281,25 +280,35 @@ def test_faint_ink_key_present_and_scaled():
     assert half["faint_ink"] == BASE_NOISE_PROBABILITIES["faint_ink"] * 0.5
 
 
-def test_faint_ink_transform_built():
-    """_build_transforms must include a transform gated by p_overrides['faint_ink']."""
-    import src.train.scan_noise as sn
-    captured = {}
+def test_faint_ink_transform_wired_into_pipeline():
+    """The real patched Albumentations pipeline must contain a transform gated
+    by the faint_ink probability. Exercises the actual closure — no production
+    test-hooks. Skipped where ultralytics/albumentations aren't importable
+    (CPU dev boxes); the Task 5 Bethlehem gate is the integration proof."""
+    pytest.importorskip("ultralytics")
+    pytest.importorskip("albumentations")
+    import ultralytics.data.augment as ua
+    from src.train.scan_noise import (
+        patch_albumentations_for_scan_noise,
+        BASE_NOISE_PROBABILITIES,
+    )
 
-    class _Probe(dict):
-        def __getitem__(self, k):
-            captured[k] = True
-            return 0.5
-    # _build_transforms is a closure; exercise via patch entrypoint indirection:
-    # assert the key is consumed by building with a probe mapping.
-    sn._assert_faint_ink_consumed(_Probe())  # helper added in impl
-    assert captured.get("faint_ink") is True
+    patch_albumentations_for_scan_noise(warmup_steps=0)
+    alb = ua.Albumentations(p=1.0)
+    probs = [getattr(t, "p", None) for t in alb.transform.transforms]
+    target = BASE_NOISE_PROBABILITIES["faint_ink"]  # 0.25 — unique among the groups
+    assert any(p is not None and abs(p - target) < 1e-9 for p in probs), \
+        f"no transform at faint_ink prob {target}; got {probs}"
 ```
+
+`pytest` and `ultralytics`/`albumentations` import: add `import pytest` at the
+top of the test file if not already present.
 
 - [ ] **Step 2.3: Run test to verify it fails**
 
 Run: `pytest tests/train/test_scan_noise.py -v -k faint_ink`
-Expected: FAIL — `faint_ink` not in dict / `_assert_faint_ink_consumed` missing.
+Expected: FAIL — `faint_ink` not in `BASE_NOISE_PROBABILITIES` (the
+key-present test fails; the pipeline test fails or skips). Capture output.
 
 - [ ] **Step 2.4: Implement the faint-ink arm**
 
@@ -333,19 +342,16 @@ Step 2.1 result for the erosion line:
             ], p=p_overrides["faint_ink"]),
 ```
 
-Add a module-level test helper near `scaled_probabilities`:
-
-```python
-def _assert_faint_ink_consumed(p_overrides) -> None:
-    """Test hook: touch p_overrides['faint_ink'] the same way _build_transforms does."""
-    _ = p_overrides["faint_ink"]
-```
+No production test-hook is added — the pipeline test exercises the real
+`patch_albumentations_for_scan_noise` closure directly.
 
 - [ ] **Step 2.5: Run tests to verify they pass**
 
 Run: `pytest tests/train/test_scan_noise.py -v`
-Expected: all PASS (existing + 2 new). The existing tests must still pass —
-adding a dict key must not change other probabilities.
+Expected: all existing tests PASS, `test_faint_ink_key_present_and_scaled`
+PASSES, `test_faint_ink_transform_wired_into_pipeline` PASSES (or SKIPS if
+ultralytics/albumentations unavailable locally — acceptable; Task 5 is the
+integration proof). Adding a dict key must not change other probabilities.
 
 - [ ] **Step 2.6: Commit**
 
@@ -482,5 +488,6 @@ If Phase 2 FAIL: escalate to the user's custom-corpus fallback (separate spec).
   fallback. The two discovery steps (3.1, 4.1) are real "locate existing
   artifact" tasks with exact commands, not TBDs.
 - **Type consistency:** `score()` returns the same dict keys used in Steps 1.5,
-  5.3. `BASE_NOISE_PROBABILITIES["faint_ink"]` consumed identically in impl and
-  the `_assert_faint_ink_consumed` test hook.
+  5.3. `BASE_NOISE_PROBABILITIES["faint_ink"]` is consumed by the real
+  `_build_transforms` closure; the pipeline test introspects the actual
+  patched `Albumentations` Compose (no production test-hook).
