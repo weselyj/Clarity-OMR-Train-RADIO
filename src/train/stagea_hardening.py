@@ -42,3 +42,35 @@ def should_halt(*, nonfinite: bool, reason: str) -> tuple[str, bool]:
     if nonfinite:
         return (f"stage-a halt: {reason}", True)
     return ("", False)
+
+
+@dataclass(frozen=True)
+class HardenedOverrides:
+    lr0: float
+    lrf: float
+    save_period: int
+    amp: bool
+    max_grad_norm: float
+
+
+def build_hardened_overrides(
+    *,
+    amp: bool,
+    save_period: int = 5,
+    max_grad_norm: float = 1.0,
+    lr0: float = 0.01,
+    lrf: float = 0.01,
+) -> HardenedOverrides:
+    """Pinned hardened recipe (spec §Pinned decisions). lr0/lrf stay at the
+    accuracy-validated 0.01 — stability goes into grad-clip + nan-guard + AMP
+    posture + active halt, not LR perturbation. save_period=5 bounds
+    mid-run-death waste to <=5 epochs. max_grad_norm=1.0 mirrors the proven
+    Stage-B clip (src/train/train.py:2988)."""
+    if save_period < 1:
+        raise ValueError(f"save_period must be >= 1, got {save_period}")
+    if max_grad_norm <= 0:
+        raise ValueError(f"max_grad_norm must be > 0, got {max_grad_norm}")
+    return HardenedOverrides(
+        lr0=lr0, lrf=lrf, save_period=save_period,
+        amp=amp, max_grad_norm=max_grad_norm,
+    )

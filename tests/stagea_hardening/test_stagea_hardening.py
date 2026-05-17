@@ -48,3 +48,32 @@ def test_should_halt_when_nonfinite():
 
 def test_should_not_halt_when_finite():
     assert should_halt(nonfinite=False, reason="") == ("", False)
+
+
+from src.train.stagea_hardening import (  # noqa: E402
+    HardenedOverrides,
+    build_hardened_overrides,
+)
+
+
+def test_hardened_overrides_pinned_defaults():
+    o = build_hardened_overrides(amp=True)
+    assert isinstance(o, HardenedOverrides)
+    assert o.lr0 == 0.01 and o.lrf == 0.01
+    assert o.save_period == 5
+    assert o.max_grad_norm == 1.0
+    assert o.amp is True
+
+
+def test_hardened_overrides_amp_passthrough():
+    assert build_hardened_overrides(amp=False).amp is False
+
+
+def test_hardened_overrides_rejects_bad_save_period():
+    with pytest.raises(ValueError, match="save_period"):
+        build_hardened_overrides(amp=True, save_period=0)
+
+
+def test_hardened_overrides_rejects_bad_max_grad_norm():
+    with pytest.raises(ValueError, match="max_grad_norm"):
+        build_hardened_overrides(amp=True, max_grad_norm=0.0)
