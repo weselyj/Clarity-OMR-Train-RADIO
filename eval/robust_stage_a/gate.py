@@ -4,7 +4,7 @@ Coordinate convention: Box = (x1, y1, x2, y2) in pixels, x2>x1, y2>y1.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 Box = tuple[float, float, float, float]
 
@@ -74,7 +74,7 @@ def match_predictions(
                        false_pred=sorted(false_pred))
 
 
-from eval.robust_stage_a.manifest import Scenario  # noqa: E402
+from eval.robust_stage_a.manifest import GtSystem, Scenario  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,7 @@ class ScenarioResult:
     passed: bool
 
 
-def _geometry_ok(gt, pred_box: Box, tol: float) -> tuple[bool, bool]:
+def _geometry_ok(gt: GtSystem, pred_box: Box, tol: float) -> tuple[bool, bool]:
     """Returns (geometry_ok, lyric_clipped). geometry_ok requires the pred to
     contain the GT system box and every lyric band; a missed lyric band sets
     lyric_clipped True (and geometry_ok False)."""
@@ -230,6 +230,9 @@ def verdict_to_report(
         f"scenarios: {verdict.n_scenarios - verdict.n_failed_scenarios}"
         f"/{verdict.n_scenarios} passed"
     )
+    # OK/REGRESSION below use a bare `>=` (no eps), matching combined_gate's
+    # decision only while NO_REGRESSION_EPS == 0.0. If a non-zero eps is ever
+    # introduced, thread it here too or this label can contradict GATE:.
     lines.append(
         f"lieder_recall: {verdict.lieder_recall:.4f} "
         f"(baseline {verdict.lieder_baseline:.4f}, "
