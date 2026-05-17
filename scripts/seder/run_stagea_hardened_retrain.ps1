@@ -53,7 +53,7 @@ $argList = @(
     "--model", $modelArg,
     "--data", $Data,
     "--name", $Name,
-    "--project", "runs/detect/runs",
+    "--project", "runs",
     "--epochs", $Epochs,
     "--batch", $Batch,
     "--device", "0",
@@ -67,7 +67,7 @@ $argList = @(
     Out-File -Encoding utf8 -Append $logOut
 
 # fix #1+#2: capture both streams to UTF-8 logs; success gates on exit code only
-& $py @argList *>> $logOut 2>> $logErr
+& $py @argList 1>> $logOut 2>> $logErr
 $code = $LASTEXITCODE
 
 if ($code -eq 0) {
