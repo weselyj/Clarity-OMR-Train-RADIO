@@ -140,18 +140,33 @@ def _patch_nan_guard(max_grad_norm: float | None = None) -> None:
 
 
 def _register_stagea_hardening(model, *, debug_anomaly: bool) -> None:
-    """Register the active halt-on-NaN callback (the thin seam). Feeds plain
-    scalars into the pure src.train.stagea_hardening logic; on a non-finite
-    state it attempts an explicit checkpoint save and sets trainer.stop so the
-    run does not waste epochs (the epoch-34 incident wasted ~20). If the EMA is
-    already non-finite, trainer.save_model() will not write a good EMA — the
-    last clean periodic/best checkpoint (from --save-period) is the last-good;
-    the acceptance runbook gates that checkpoint through validate_checkpoint_finite."""
+    """Register the active halt-on-NaN callbacks (the thin seam). Loss is
+    checked every batch (a cheap scalar); the full EMA finite-scan runs only
+    at epoch boundary — a per-batch full-state_dict scan would add hundreds of
+    GPU->CPU syncs per step over millions of steps. On a non-finite state it
+    attempts an explicit checkpoint save and sets trainer.stop so the run
+    stops promptly instead of wasting ~20 epochs as in the epoch-34 incident
+    (EMA NaN is an accumulating condition; catching it at the next epoch
+    boundary still prevents the multi-epoch waste). If the EMA is already
+    non-finite, trainer.save_model() will not write a good EMA — the last
+    clean periodic/best checkpoint (from --save-period) is the last-good; the
+    acceptance runbook gates it via validate_checkpoint_finite."""
     import torch
     from src.train.stagea_hardening import is_nonfinite_state, should_halt
 
     if debug_anomaly:
         torch.autograd.set_detect_anomaly(True)
+
+    def _loss_scalar(trainer):
+        loss = getattr(trainer, "loss", None)
+        if loss is None:
+            return None
+        if hasattr(loss, "item"):
+            try:
+                return float(loss.item())
+            except Exception:
+                return None
+        return float(loss)
 
     def _ema_finite(trainer) -> bool:
         ema = getattr(trainer, "ema", None)
@@ -159,34 +174,37 @@ def _register_stagea_hardening(model, *, debug_anomaly: bool) -> None:
         if m is None:
             return True
         for t in m.state_dict().values():
-            if hasattr(t, "isfinite") and not bool(torch.isfinite(t).all().item()):
+            if (hasattr(t, "isfinite") and t.is_floating_point()
+                    and not bool(torch.isfinite(t).all().item())):
                 return False
         return True
 
-    def _check(trainer) -> None:
-        loss = getattr(trainer, "loss", None)
-        if loss is None:
-            loss_f = None
-        elif hasattr(loss, "item"):
-            try:
-                loss_f = float(loss.item())
-            except Exception:
-                loss_f = None
-        else:
-            loss_f = float(loss)
-        nf, reason = is_nonfinite_state(loss_f, _ema_finite(trainer))
+    def _halt(trainer, msg: str) -> None:
+        print(f"[stagea-hardening] {msg} at epoch "
+              f"{getattr(trainer, 'epoch', '?')}; saving + halting")
+        try:
+            trainer.save_model()
+        except Exception as exc:  # never let the guard itself crash the run
+            print(f"[stagea-hardening] save_model raised: {exc!r}")
+        trainer.stop = True
+
+    def _check_loss(trainer) -> None:
+        # Hot path: per-batch, loss scalar only (no EMA scan).
+        nf, reason = is_nonfinite_state(_loss_scalar(trainer), True)
         msg, halt = should_halt(nonfinite=nf, reason=reason)
         if halt:
-            print(f"[stagea-hardening] {msg} at epoch "
-                  f"{getattr(trainer, 'epoch', '?')}; saving + halting")
-            try:
-                trainer.save_model()
-            except Exception as exc:  # never let the guard itself crash the run
-                print(f"[stagea-hardening] save_model raised: {exc!r}")
-            trainer.stop = True
+            _halt(trainer, msg)
 
-    model.add_callback("on_train_batch_end", _check)
-    model.add_callback("on_fit_epoch_end", _check)
+    def _check_full(trainer) -> None:
+        # Epoch boundary: loss + full EMA finite-scan (acceptable cost).
+        nf, reason = is_nonfinite_state(_loss_scalar(trainer),
+                                        _ema_finite(trainer))
+        msg, halt = should_halt(nonfinite=nf, reason=reason)
+        if halt:
+            _halt(trainer, msg)
+
+    model.add_callback("on_train_batch_end", _check_loss)
+    model.add_callback("on_fit_epoch_end", _check_full)
 
 
 def main() -> None:
