@@ -219,3 +219,32 @@ def recall_from_stagea_csv(path: str | _Path) -> float:
             total_expected += int(row["expected_p1_staves"])
             total_detected += int(row["detected_p1_staves"])
     return (total_detected / total_expected) if total_expected else 0.0
+
+
+def verdict_to_report(
+    verdict: GateVerdict, scenario_results: list[ScenarioResult]
+) -> str:
+    lines = []
+    lines.append(f"GATE: {'PASS' if verdict.passed else 'FAIL'}")
+    lines.append(
+        f"scenarios: {verdict.n_scenarios - verdict.n_failed_scenarios}"
+        f"/{verdict.n_scenarios} passed"
+    )
+    lines.append(
+        f"lieder_recall: {verdict.lieder_recall:.4f} "
+        f"(baseline {verdict.lieder_baseline:.4f}, "
+        f"{'OK' if verdict.lieder_recall >= verdict.lieder_baseline else 'REGRESSION'})"
+    )
+    lines.append(
+        f"lyric_system_recall: {verdict.lyric_recall:.4f} "
+        f"(baseline {verdict.lyric_recall_baseline:.4f}, "
+        f"{'OK' if verdict.lyric_recall >= verdict.lyric_recall_baseline else 'REGRESSION'})"
+    )
+    for r in scenario_results:
+        flag = "PASS" if r.passed else "FAIL"
+        lines.append(
+            f"  [{flag}] {r.scenario_id} ({r.archetype}) "
+            f"false={r.false} missed={r.missed} "
+            f"geom={r.geometry_fail} lyric_clip={r.lyric_clip}"
+        )
+    return "\n".join(lines)

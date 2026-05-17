@@ -199,3 +199,22 @@ def test_recall_from_stagea_csv_empty_is_zero(tmp_path):
     csv.write_text("piece,expected_p1_staves,detected_p1_staves,missing_count\n",
                    encoding="utf-8")
     assert recall_from_stagea_csv(csv) == 0.0
+
+
+from eval.robust_stage_a.gate import verdict_to_report  # noqa: E402
+
+
+def test_verdict_to_report_pass_and_fail():
+    sc = _sc([GtSystem((0, 0, 10, 10), False, [])])
+    ok = score_scenario(sc, [Pred((0, 0, 10, 10), 0.9)])
+    v = combined_gate([ok], 1.0, 1.0, 0.94, 0.93)
+    txt = verdict_to_report(v, [ok])
+    assert "GATE: PASS" in txt
+    assert "scenarios: 1/1 passed" in txt
+
+    bad = score_scenario(Scenario("bad", "deed", "j", True, []),
+                          [Pred((0, 0, 5, 5), 0.9)])
+    v2 = combined_gate([bad], 1.0, 1.0, 0.94, 0.93)
+    txt2 = verdict_to_report(v2, [bad])
+    assert "GATE: FAIL" in txt2
+    assert "bad" in txt2 and "deed" in txt2
