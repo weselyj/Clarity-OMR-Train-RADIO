@@ -115,7 +115,7 @@ def validate_checkpoint_finite(
                 continue
             sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
             for tname, t in sd.items():
-                if hasattr(t, "isfinite"):
+                if hasattr(t, "isfinite") and t.is_floating_point():
                     yield (
                         f"{ckpt_key}.{tname}",
                         bool(torch.isfinite(t).all().item()),
