@@ -132,3 +132,74 @@ def score_scenario(
         false=false, missed=missed, geometry_fail=geometry_fail,
         lyric_clip=lyric_clip, passed=passed,
     )
+
+
+NO_REGRESSION_EPS = 0.0  # strict: new must be >= baseline (per spec)
+
+
+@dataclass(frozen=True)
+class GateVerdict:
+    passed: bool
+    n_scenarios: int
+    n_failed_scenarios: int
+    failed_scenario_ids: list[str]
+    lyric_recall: float
+    lyric_recall_baseline: float
+    lieder_recall: float
+    lieder_baseline: float
+
+
+def lyric_system_recall(
+    scenarios: list[Scenario],
+    preds_by_scenario: dict[str, list[Pred]],
+    match_iou: float = 0.5,
+    contain_tol: float = 2.0,
+) -> float:
+    """Fraction of GT systems that carry lyrics which are detected with a
+    matching pred whose box also fully contains the lyric band(s).
+    1.0 when there are no lyric-bearing GT systems."""
+    total = 0
+    detected = 0
+    for sc in scenarios:
+        if sc.is_non_music:
+            continue
+        preds = preds_by_scenario.get(sc.scenario_id, [])
+        m = match_predictions([g.box for g in sc.gt_systems], preds,
+                              match_iou=match_iou)
+        matched_pred_for_gt = {gi: pi for gi, pi in m.matched}
+        for gi, g in enumerate(sc.gt_systems):
+            if not g.has_lyrics:
+                continue
+            total += 1
+            pi = matched_pred_for_gt.get(gi)
+            if pi is None:
+                continue
+            ok, _ = _geometry_ok(g, preds[pi].box, contain_tol)
+            if ok:
+                detected += 1
+    return 1.0 if total == 0 else detected / total
+
+
+def combined_gate(
+    scenario_results: list[ScenarioResult],
+    lyric_recall: float,
+    lyric_recall_baseline: float,
+    lieder_recall: float,
+    lieder_baseline: float,
+    eps: float = NO_REGRESSION_EPS,
+) -> GateVerdict:
+    failed = [r.scenario_id for r in scenario_results if not r.passed]
+    all_scenarios_pass = not failed
+    no_lieder_regression = lieder_recall >= lieder_baseline - eps
+    no_lyric_regression = lyric_recall >= lyric_recall_baseline - eps
+    return GateVerdict(
+        passed=(all_scenarios_pass and no_lieder_regression
+                and no_lyric_regression),
+        n_scenarios=len(scenario_results),
+        n_failed_scenarios=len(failed),
+        failed_scenario_ids=failed,
+        lyric_recall=lyric_recall,
+        lyric_recall_baseline=lyric_recall_baseline,
+        lieder_recall=lieder_recall,
+        lieder_baseline=lieder_baseline,
+    )

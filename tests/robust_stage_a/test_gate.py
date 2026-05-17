@@ -114,3 +114,65 @@ def test_non_music_scenario_any_pred_is_false():
     sc = _sc([], is_non_music=True)
     r = score_scenario(sc, [Pred((0, 0, 10, 10), 0.99)])
     assert r.false == 1 and r.passed is False
+
+
+from eval.robust_stage_a.gate import (  # noqa: E402
+    lyric_system_recall,
+    combined_gate,
+)
+
+
+def test_lyric_system_recall_counts_only_lyric_systems():
+    sc = _sc([
+        GtSystem((0, 0, 100, 60), True, [(5, 50, 95, 60)]),    # lyric, detected
+        GtSystem((0, 100, 100, 160), True, [(5, 150, 95, 160)]),  # lyric, clipped
+        GtSystem((0, 200, 100, 250), False, []),                # non-lyric, ignored
+    ])
+    preds = [
+        Pred((0, 0, 100, 60), 0.9),       # covers sys0 + its lyric band
+        Pred((0, 100, 100, 145), 0.9),    # clips sys1 lyric band
+        Pred((0, 200, 100, 250), 0.9),
+    ]
+    # 2 lyric systems, 1 detected cleanly -> 0.5
+    assert lyric_system_recall([sc], {"s": preds}) == pytest.approx(0.5)
+
+
+def test_lyric_system_recall_is_one_when_no_lyric_systems():
+    sc = _sc([GtSystem((0, 0, 100, 50), False, [])])
+    assert lyric_system_recall([sc], {"s": [Pred((0, 0, 100, 50), 0.9)]}) == 1.0
+
+
+def test_combined_gate_pass():
+    sc = _sc([GtSystem((0, 0, 100, 50), False, [])])
+    results = [score_scenario(sc, [Pred((0, 0, 100, 50), 0.9)])]
+    v = combined_gate(results, lyric_recall=1.0, lyric_recall_baseline=1.0,
+                       lieder_recall=0.94, lieder_baseline=0.93)
+    assert v.passed is True
+    assert v.n_failed_scenarios == 0
+
+
+def test_combined_gate_fails_on_one_bad_scenario():
+    sc_ok = Scenario("ok", "a", "i", False, [GtSystem((0, 0, 10, 10), False, [])])
+    sc_bad = Scenario("bad", "a", "j", True, [])
+    results = [
+        score_scenario(sc_ok, [Pred((0, 0, 10, 10), 0.9)]),
+        score_scenario(sc_bad, [Pred((0, 0, 5, 5), 0.9)]),  # pred on non-music
+    ]
+    v = combined_gate(results, 1.0, 1.0, 0.94, 0.93)
+    assert v.passed is False
+    assert v.failed_scenario_ids == ["bad"]
+
+
+def test_combined_gate_fails_on_lieder_regression():
+    sc = _sc([GtSystem((0, 0, 10, 10), False, [])])
+    results = [score_scenario(sc, [Pred((0, 0, 10, 10), 0.9)])]
+    v = combined_gate(results, 1.0, 1.0, lieder_recall=0.92, lieder_baseline=0.93)
+    assert v.passed is False
+
+
+def test_combined_gate_fails_on_lyric_recall_regression():
+    sc = _sc([GtSystem((0, 0, 10, 10), False, [])])
+    results = [score_scenario(sc, [Pred((0, 0, 10, 10), 0.9)])]
+    v = combined_gate(results, lyric_recall=0.80, lyric_recall_baseline=0.95,
+                      lieder_recall=0.94, lieder_baseline=0.93)
+    assert v.passed is False
