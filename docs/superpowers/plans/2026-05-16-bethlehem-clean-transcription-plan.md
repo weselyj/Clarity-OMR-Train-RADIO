@@ -455,11 +455,28 @@ task's `Status`. DONE on `.done`; FAILED on `.failed` (the marker carries the
 exit code + log tail); DIED if the task is not `Running` and no marker appears
 on two consecutive polls. One notification on exit.
 
-- [ ] **Step 4.4: Confirm training completed cleanly**
+- [ ] **Step 4.4: Confirm training completed cleanly + validate `best.pt` provenance**
 
-Read `logs/yolo_faintink.log` tail on seder: confirm epochs completed, no NaN
-cls_loss blow-up (the warmup guards this), `best.pt` written, and read the
-`.done` marker for the resolved `best.pt` path (feeds Task 5).
+Do NOT trust exit-0/`.done` alone. The 2026-05-16 run proved a NaN blow-up
+**can still occur mid-training** (EMA went NaN at epoch 34 — the
+`--noise-warmup-steps 500` ramp does NOT guard this; warmup only covers the
+first 500 steps). What saved that run: Ultralytics skips checkpoint saves while
+the EMA is NaN/Inf and `EarlyStopping(patience=20)` halted it, so `best.pt`
+remained the last pre-NaN best (epoch 33, mAP50 0.995, mAP50-95 0.930).
+
+Required validation (read-only, on seder):
+1. `runs/detect/runs/yolo26m_systems_faintink/results.csv` — find the first
+   epoch with `nan`/empty/0 metrics; note whether it persisted.
+2. End-of-log: quote `Best results observed at epoch X` + any `EarlyStopping`
+   line + `N epochs completed`.
+3. Confirm `best.pt`'s epoch is **strictly before** the NaN onset and that
+   epoch's val mAP is sane; load `best.pt` and assert **zero non-finite weight
+   tensors**.
+4. Read the `.done` marker for the resolved `best.pt` path (feeds Task 5).
+
+`best.pt` is usable for Task 5 only if it is a pre-NaN checkpoint with good
+mAP and all-finite weights. (A future clean retrain may want gradient clipping
+/ lower LR / AMP-loss-scale review to prevent the epoch-~34 NaN entirely.)
 
 ### Task 5: Phase 2 gate
 
