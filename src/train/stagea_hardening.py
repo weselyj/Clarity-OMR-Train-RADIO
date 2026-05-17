@@ -31,3 +31,14 @@ def is_nonfinite_state(
     if grad_norm is not None and (math.isnan(grad_norm) or math.isinf(grad_norm)):
         return (True, f"grad_norm non-finite ({grad_norm!r})")
     return (False, "")
+
+
+def should_halt(*, nonfinite: bool, reason: str) -> tuple[str, bool]:
+    """Halt policy. Mirrors src/train/train.py:_should_sanity_halt's
+    (message, should_halt) contract so post-mortem tooling can grep the
+    message. Defense-in-depth policy: halt immediately on any non-finite
+    state — do not let EMA corruption waste epochs (the epoch-34 incident
+    wasted ~20 epochs before EarlyStopping)."""
+    if nonfinite:
+        return (f"stage-a halt: {reason}", True)
+    return ("", False)

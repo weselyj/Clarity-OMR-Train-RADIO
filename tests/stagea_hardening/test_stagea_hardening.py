@@ -35,3 +35,16 @@ def test_grad_norm_nan_is_nonfinite():
 
 def test_grad_norm_none_is_ignored():
     assert is_nonfinite_state(0.5, ema_finite=True, grad_norm=None) == (False, "")
+
+
+from src.train.stagea_hardening import should_halt  # noqa: E402
+
+
+def test_should_halt_when_nonfinite():
+    msg, halt = should_halt(nonfinite=True, reason="EMA weights non-finite")
+    assert halt is True
+    assert msg == "stage-a halt: EMA weights non-finite"
+
+
+def test_should_not_halt_when_finite():
+    assert should_halt(nonfinite=False, reason="") == ("", False)
