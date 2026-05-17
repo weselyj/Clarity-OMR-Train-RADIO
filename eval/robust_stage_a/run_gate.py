@@ -34,12 +34,10 @@ from eval.robust_stage_a.gate import (  # noqa: E402
 from eval.robust_stage_a.manifest import load_manifest  # noqa: E402
 
 
-def _infer(image_path: str, weights: str, conf: float) -> list[Pred]:
-    """Run the Stage-A YOLO detector on one image. Uses Ultralytics directly
-    (same engine the existing scripts/audit/dump_system_crops.py uses)."""
-    from ultralytics import YOLO  # local import: keeps the module CPU-importable
-
-    model = YOLO(weights)
+def _infer(image_path: str, model, conf: float) -> list[Pred]:
+    """Run the Stage-A YOLO detector on one image with a preloaded model.
+    Uses Ultralytics directly (same engine scripts/audit/dump_system_crops.py
+    uses)."""
     res = model.predict(image_path, conf=conf, verbose=False)[0]
     out: list[Pred] = []
     for b in res.boxes:
@@ -67,13 +65,16 @@ def main() -> int:
     args = ap.parse_args()
 
     scenarios = load_manifest(args.manifest)
+    from ultralytics import YOLO  # deferred: keeps the module CPU-importable
+
+    model = YOLO(str(args.yolo_weights))
     preds_by_scenario: dict[str, list[Pred]] = {}
     results = []
     for sc in scenarios:
         img = sc.image
         if args.image_root is not None and not Path(img).is_absolute():
             img = str(args.image_root / img)
-        preds = _infer(img, str(args.yolo_weights), args.conf)
+        preds = _infer(img, model, args.conf)
         preds_by_scenario[sc.scenario_id] = preds
         results.append(score_scenario(sc, preds))
 
