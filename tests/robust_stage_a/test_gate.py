@@ -56,3 +56,61 @@ def test_match_one_pred_cannot_take_two_gt():
     assert len(m.matched) == 1
     assert m.missed_gt == [1]
     assert m.false_pred == []
+
+
+from eval.robust_stage_a.gate import score_scenario  # noqa: E402
+from eval.robust_stage_a.manifest import GtSystem, Scenario  # noqa: E402
+
+
+def _sc(gt_systems, is_non_music=False):
+    return Scenario("s", "arch", "img.png", is_non_music, gt_systems)
+
+
+def test_scenario_perfect_passes():
+    sc = _sc([GtSystem((0, 0, 100, 50), False, [])])
+    preds = [Pred((0, 0, 100, 50), 0.9)]
+    r = score_scenario(sc, preds)
+    assert (r.false, r.missed, r.geometry_fail, r.lyric_clip) == (0, 0, 0, 0)
+    assert r.passed is True
+
+
+def test_scenario_false_system_fails():
+    sc = _sc([GtSystem((0, 0, 100, 50), False, [])])
+    preds = [Pred((0, 0, 100, 50), 0.9), Pred((300, 300, 400, 350), 0.8)]
+    r = score_scenario(sc, preds)
+    assert r.false == 1 and r.passed is False
+
+
+def test_scenario_missed_system_fails():
+    sc = _sc([GtSystem((0, 0, 100, 50), False, []),
+              GtSystem((0, 100, 100, 150), False, [])])
+    preds = [Pred((0, 0, 100, 50), 0.9)]
+    r = score_scenario(sc, preds)
+    assert r.missed == 1 and r.passed is False
+
+
+def test_scenario_geometry_fail_when_pred_does_not_cover_gt():
+    # pred matches by IoU>=0.5 but does not contain the full GT system
+    sc = _sc([GtSystem((0, 0, 100, 50), False, [])])
+    preds = [Pred((0, 0, 100, 40), 0.9)]  # iou 4000/5000=0.8, but clips bottom
+    r = score_scenario(sc, preds)
+    assert r.geometry_fail == 1 and r.lyric_clip == 0 and r.passed is False
+
+
+def test_scenario_lyric_clip_counts_as_geometry_and_lyricclip():
+    sc = _sc([GtSystem((0, 0, 100, 60), True, [(5, 50, 95, 60)])])
+    # pred covers the staff but cuts off the lyric band (y stops at 45)
+    preds = [Pred((0, 0, 100, 45), 0.95)]
+    r = score_scenario(sc, preds)
+    assert r.geometry_fail == 1 and r.lyric_clip == 1 and r.passed is False
+
+
+def test_non_music_scenario_passes_with_zero_preds():
+    sc = _sc([], is_non_music=True)
+    assert score_scenario(sc, []).passed is True
+
+
+def test_non_music_scenario_any_pred_is_false():
+    sc = _sc([], is_non_music=True)
+    r = score_scenario(sc, [Pred((0, 0, 10, 10), 0.99)])
+    assert r.false == 1 and r.passed is False

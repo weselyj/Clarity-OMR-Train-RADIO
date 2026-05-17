@@ -72,3 +72,63 @@ def match_predictions(
     missed_gt = [gi for gi in range(len(gt_boxes)) if gi not in used_gt]
     return MatchResult(matched=matched, missed_gt=missed_gt,
                        false_pred=sorted(false_pred))
+
+
+from eval.robust_stage_a.manifest import Scenario  # noqa: E402
+
+
+@dataclass(frozen=True)
+class ScenarioResult:
+    scenario_id: str
+    archetype: str
+    false: int
+    missed: int
+    geometry_fail: int
+    lyric_clip: int
+    passed: bool
+
+
+def _geometry_ok(gt, pred_box: Box, tol: float) -> tuple[bool, bool]:
+    """Returns (geometry_ok, lyric_clipped). geometry_ok requires the pred to
+    contain the GT system box and every lyric band; a missed lyric band sets
+    lyric_clipped True (and geometry_ok False)."""
+    sys_ok = contains(pred_box, gt.box, tol)
+    lyric_clipped = any(
+        not contains(pred_box, lb, tol) for lb in gt.lyric_bands
+    )
+    return (sys_ok and not lyric_clipped), lyric_clipped
+
+
+def score_scenario(
+    scenario: Scenario,
+    preds: list[Pred],
+    match_iou: float = 0.5,
+    contain_tol: float = 2.0,
+) -> ScenarioResult:
+    if scenario.is_non_music:
+        n_false = len(preds)
+        return ScenarioResult(
+            scenario.scenario_id, scenario.archetype,
+            false=n_false, missed=0, geometry_fail=0, lyric_clip=0,
+            passed=(n_false == 0),
+        )
+
+    gt_boxes = [g.box for g in scenario.gt_systems]
+    m = match_predictions(gt_boxes, preds, match_iou=match_iou)
+    geometry_fail = 0
+    lyric_clip = 0
+    for gi, pi in m.matched:
+        ok, clipped = _geometry_ok(
+            scenario.gt_systems[gi], preds[pi].box, contain_tol)
+        if not ok:
+            geometry_fail += 1
+        if clipped:
+            lyric_clip += 1
+    false = len(m.false_pred)
+    missed = len(m.missed_gt)
+    passed = (false == 0 and missed == 0 and geometry_fail == 0)
+    return ScenarioResult(
+        scenario.scenario_id, scenario.archetype,
+        false=false, missed=missed, geometry_fail=geometry_fail,
+        lyric_clip=lyric_clip, passed=passed,
+    )
