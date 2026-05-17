@@ -203,3 +203,19 @@ def combined_gate(
         lieder_recall=lieder_recall,
         lieder_baseline=lieder_baseline,
     )
+
+
+import csv as _csv  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+
+def recall_from_stagea_csv(path: str | _Path) -> float:
+    """Aggregate recall from an eval/score_stage_a_only.py CSV:
+    sum(detected_p1_staves) / sum(expected_p1_staves). 0.0 if no rows."""
+    total_expected = 0
+    total_detected = 0
+    with _Path(path).open(newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            total_expected += int(row["expected_p1_staves"])
+            total_detected += int(row["detected_p1_staves"])
+    return (total_detected / total_expected) if total_expected else 0.0

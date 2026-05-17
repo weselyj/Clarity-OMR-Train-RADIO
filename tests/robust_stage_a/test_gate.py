@@ -176,3 +176,26 @@ def test_combined_gate_fails_on_lyric_recall_regression():
     v = combined_gate(results, lyric_recall=0.80, lyric_recall_baseline=0.95,
                       lieder_recall=0.94, lieder_baseline=0.93)
     assert v.passed is False
+
+
+from eval.robust_stage_a.gate import recall_from_stagea_csv  # noqa: E402
+
+
+def test_recall_from_stagea_csv(tmp_path):
+    # mirrors eval/score_stage_a_only.py output schema
+    csv = tmp_path / "r.csv"
+    csv.write_text(
+        "piece,expected_p1_staves,detected_p1_staves,missing_count\n"
+        "a,3,3,0\n"
+        "b,4,2,2\n",
+        encoding="utf-8",
+    )
+    # total expected 7, detected 5 -> 5/7
+    assert recall_from_stagea_csv(csv) == pytest.approx(5 / 7)
+
+
+def test_recall_from_stagea_csv_empty_is_zero(tmp_path):
+    csv = tmp_path / "r.csv"
+    csv.write_text("piece,expected_p1_staves,detected_p1_staves,missing_count\n",
+                   encoding="utf-8")
+    assert recall_from_stagea_csv(csv) == 0.0
