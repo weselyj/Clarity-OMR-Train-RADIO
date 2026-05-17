@@ -99,3 +99,21 @@ def test_scan_reports_first_offender_and_count():
 
 def test_scan_empty_is_ok_zero():
     assert scan_state_for_nonfinite([]) == (True, 0, 0, None)
+
+
+import inspect  # noqa: E402
+
+from src.train import stagea_hardening as _sh  # noqa: E402
+
+
+def test_validate_checkpoint_finite_is_importable_without_torch():
+    # The module must import on CPU with no torch installed; the torch
+    # import must be LOCAL to validate_checkpoint_finite (seam posture,
+    # mirrors run_gate._infer). Assert the symbol exists and that no
+    # top-level `import torch` exists in the module source.
+    assert hasattr(_sh, "validate_checkpoint_finite")
+    assert callable(_sh.validate_checkpoint_finite)
+    src = inspect.getsource(_sh)
+    module_head = src.split("def validate_checkpoint_finite", 1)[0]
+    assert "\nimport torch" not in module_head
+    assert "    import torch" in inspect.getsource(_sh.validate_checkpoint_finite)

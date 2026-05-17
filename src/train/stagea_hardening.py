@@ -93,3 +93,32 @@ def scan_state_for_nonfinite(
             if first_key is None:
                 first_key = name
     return (n_nonfinite == 0, n_nonfinite, total, first_key)
+
+
+def validate_checkpoint_finite(
+    path: str,
+) -> tuple[bool, int, int, str | None]:
+    """Thin torch seam (NOT unit-tested locally — torch lives on seder's
+    venv-cu132; same posture as eval/robust_stage_a/run_gate.py:_infer).
+    Loads an Ultralytics checkpoint on CPU and scans every tensor in the
+    'model' and 'ema' state_dicts for NaN/Inf, delegating the count to the
+    pure scan_state_for_nonfinite. Returns
+    (ok, n_nonfinite_tensors, total, first_offending_key)."""
+    import torch  # local: keeps the module CPU-importable without torch
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    def _named_tensors():
+        for ckpt_key in ("model", "ema"):
+            obj = ckpt.get(ckpt_key) if isinstance(ckpt, dict) else None
+            if obj is None:
+                continue
+            sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
+            for tname, t in sd.items():
+                if hasattr(t, "isfinite"):
+                    yield (
+                        f"{ckpt_key}.{tname}",
+                        bool(torch.isfinite(t).all().item()),
+                    )
+
+    return scan_state_for_nonfinite(_named_tensors())
