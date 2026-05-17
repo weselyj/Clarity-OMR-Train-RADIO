@@ -95,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         help="Enable torch.autograd.set_detect_anomaly (slow; off by default). "
              "Use only to capture a recurring NaN's origin.",
     )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Resume Ultralytics training from the checkpoint passed as "
+             "--model (restores epoch/optimizer/LR state). The seder worker "
+             "sets this with --model <run>/weights/last.pt after a mid-run "
+             "death; a plain warm-start would re-run the full epoch schedule.",
+    )
     return parser.parse_args()
 
 
@@ -244,6 +253,8 @@ def main() -> None:
     )
     if args.compile:
         train_kwargs["compile"] = True
+    if args.resume:
+        train_kwargs["resume"] = True
     model.train(**train_kwargs)
 
 
