@@ -8,12 +8,14 @@ lieder recall >= 0.930. Do NOT overwrite the validated faint-ink best.pt
 
 ## 0. Pre-flight caveats (READ FIRST — from Task 5/6/7 review)
 
-- **No stale `last.pt` before a fresh run.** Ultralytics `resume=True` (bool)
-  resolves the checkpoint via a CWD glob for the newest `last*.pt`, not the
-  worker's explicit `$lastPt`. Before the FIRST hardened run, confirm no
-  `runs/detect/runs/yolo26m_systems_hardened/weights/last.pt` exists (a stale
-  one would make the worker think it must resume). The worker only adds
-  `--resume` when that `last.pt` is present.
+- **No stale `last.pt` before a fresh run.** The worker adds `--resume`
+  (and `--model <last.pt>`) iff
+  `runs/detect/runs/yolo26m_systems_hardened/weights/last.pt` exists. Before
+  the FIRST hardened run, confirm that file does NOT exist, AND that no other
+  stale `last*.pt` from a prior run is in the `runs/` tree — depending on
+  Ultralytics' resume resolution either the explicit path or the newest
+  `last*.pt` could be picked up; a clean tree makes the first run
+  unambiguously fresh.
 - **Verify the checkpoint path after the first epoch.** The worker uses
   `--project runs`; Ultralytics writes detect runs to
   `runs/detect/runs/<name>/weights/`. After the first `--save-period`
@@ -50,6 +52,9 @@ Watch `logs\radio_stagea_hardened.out.log` for `[nan-guard]` / `[stagea-hardenin
   provenance fails, fall back to the highest-epoch `--save-period` checkpoint
   under `runs/detect/runs/yolo26m_systems_hardened/weights/`.
 
+> Run all commands in sections 3-5 from the repo root on seder
+> (`cd %USERPROFILE%\Clarity-OMR-Train-RADIO`).
+
 ## 3. Provenance gate (mandatory, blocks scoring)
 
     venv-cu132\Scripts\python.exe -c "from src.train.stagea_hardening import validate_checkpoint_finite as v; ok,n,t,k=v(r'runs/detect/runs/yolo26m_systems_hardened/weights/best.pt'); print('ok',ok,'nonfinite',n,'total',t,'first',k); import sys; sys.exit(0 if (ok and t>0) else 1)"
@@ -78,7 +83,17 @@ Compute aggregate recall with the Sub-plan-A reader and compare to baseline:
 
 ## 5. Verdict
 
-B PASS iff: training ended clean-or-guard-halted AND step 3 prints ok=True
-with total>0 AND step 4 prints PASS (new >= base, base = 0.930). Record the
-outcome + the [nan-guard]/[stagea-hardening] log evidence in the Sub-plan-B
-handoff and update memory `project_radio_robust_stagea`.
+First determine the training outcome from the markers + stdout log:
+`logs\radio_stagea_hardened.failed` present => B-FAIL on the training
+criterion; STOP (do not run steps 3-4). `logs\radio_stagea_hardened.done`
+present => the run ended clean OR guard-halted (both exit 0). To record
+which, grep `logs\radio_stagea_hardened.out.log` for a
+`[stagea-hardening] ... halting` line: present => guard-halt; absent =>
+clean completion. Either clean or guard-halt satisfies the training
+criterion.
+
+B PASS iff: `.done` (clean or guard-halted, NOT `.failed`) AND step 3
+prints ok=True with total>0 AND step 4 prints PASS (new >= base,
+base = 0.930). Record the outcome + the [nan-guard]/[stagea-hardening]
+log evidence in the Sub-plan-B handoff and update memory
+`project_radio_robust_stagea`.
