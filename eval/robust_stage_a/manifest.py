@@ -81,6 +81,9 @@ def load_manifest(path: str | Path) -> list[Scenario]:
         if is_non_music and gt_raw:
             raise ValueError(
                 f"{where}: is_non_music=True requires empty gt_systems")
+        if not is_non_music and not gt_raw:
+            raise ValueError(
+                f"{where}: is_non_music=False requires non-empty gt_systems")
 
         gt_systems: list[GtSystem] = []
         for j, g in enumerate(gt_raw):

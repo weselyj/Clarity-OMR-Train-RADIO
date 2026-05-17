@@ -112,3 +112,12 @@ def test_rejects_lyric_system_without_bands(tmp_path):
     ])
     with pytest.raises(ValueError, match="has_lyrics.*lyric_bands"):
         load_manifest(p)
+
+
+def test_rejects_music_scenario_with_no_systems(tmp_path):
+    p = _write(tmp_path, [
+        {"scenario_id": "x", "archetype": "a", "image": "i.png",
+         "is_non_music": False, "gt_systems": []}
+    ])
+    with pytest.raises(ValueError, match="is_non_music.*gt_systems"):
+        load_manifest(p)
