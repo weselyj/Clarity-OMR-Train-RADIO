@@ -77,3 +77,25 @@ def test_hardened_overrides_rejects_bad_save_period():
 def test_hardened_overrides_rejects_bad_max_grad_norm():
     with pytest.raises(ValueError, match="max_grad_norm"):
         build_hardened_overrides(amp=True, max_grad_norm=0.0)
+
+
+from src.train.stagea_hardening import scan_state_for_nonfinite  # noqa: E402
+
+
+def test_scan_all_finite_is_ok():
+    items = [("model.a", True), ("model.b", True), ("ema.a", True)]
+    assert scan_state_for_nonfinite(items) == (True, 0, 3, None)
+
+
+def test_scan_reports_first_offender_and_count():
+    items = [("model.a", True), ("model.b", False),
+             ("ema.a", False), ("ema.b", True)]
+    ok, n, total, first = scan_state_for_nonfinite(items)
+    assert ok is False
+    assert n == 2
+    assert total == 4
+    assert first == "model.b"
+
+
+def test_scan_empty_is_ok_zero():
+    assert scan_state_for_nonfinite([]) == (True, 0, 0, None)

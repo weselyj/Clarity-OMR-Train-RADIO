@@ -74,3 +74,22 @@ def build_hardened_overrides(
         lr0=lr0, lrf=lrf, save_period=save_period,
         amp=amp, max_grad_norm=max_grad_norm,
     )
+
+
+def scan_state_for_nonfinite(
+    items: Iterable[tuple[str, bool]],
+) -> tuple[bool, int, int, str | None]:
+    """Pure provenance core. `items` = (tensor_name, is_all_finite) pairs.
+    Returns (ok, n_nonfinite_tensors, total, first_offending_key);
+    ok == (n_nonfinite == 0). The torch seam computes the per-tensor bool;
+    this only counts, so it is fully CPU-testable without torch."""
+    total = 0
+    n_nonfinite = 0
+    first_key: str | None = None
+    for name, is_finite in items:
+        total += 1
+        if not is_finite:
+            n_nonfinite += 1
+            if first_key is None:
+                first_key = name
+    return (n_nonfinite == 0, n_nonfinite, total, first_key)
