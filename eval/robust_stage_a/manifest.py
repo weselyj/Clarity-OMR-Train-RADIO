@@ -94,6 +94,10 @@ def load_manifest(path: str | Path) -> list[Scenario]:
                 raise ValueError(f"{gwhere}: lyric_bands must be a list")
             bands = [_as_box(b, f"{gwhere}.lyric_bands[{k}]")
                      for k, b in enumerate(bands_raw)]
+            if has_lyrics and not bands:
+                raise ValueError(
+                    f"{gwhere}: has_lyrics=True requires a non-empty "
+                    f"lyric_bands list")
             gt_systems.append(GtSystem(box=box, has_lyrics=has_lyrics,
                                        lyric_bands=bands))
 

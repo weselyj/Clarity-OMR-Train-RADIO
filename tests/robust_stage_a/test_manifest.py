@@ -101,3 +101,14 @@ def test_rejects_duplicate_scenario_ids(tmp_path):
     ])
     with pytest.raises(ValueError, match="duplicate"):
         load_manifest(p)
+
+
+def test_rejects_lyric_system_without_bands(tmp_path):
+    p = _write(tmp_path, [
+        {"scenario_id": "x", "archetype": "a", "image": "i.png",
+         "is_non_music": False,
+         "gt_systems": [{"box": [0, 0, 100, 50], "has_lyrics": True,
+                         "lyric_bands": []}]}
+    ])
+    with pytest.raises(ValueError, match="has_lyrics.*lyric_bands"):
+        load_manifest(p)
