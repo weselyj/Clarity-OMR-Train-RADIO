@@ -73,10 +73,32 @@ def parse_args() -> argparse.Namespace:
             "Default 0 = no warmup, full strength from step 0."
         ),
     )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Explicit gradient-clip max_norm (overrides Ultralytics' opaque "
+             "internal value). Mirrors the proven Stage-B clip=1.0. Only "
+             "applied when --nan-guard is on (it owns the clip_grad_norm_ hook).",
+    )
+    parser.add_argument(
+        "--save-period",
+        type=int,
+        default=5,
+        help="Save a checkpoint every N epochs (enables resume-from-last on a "
+             "mid-run death; bounds wasted work). Default 5.",
+    )
+    parser.add_argument(
+        "--debug-anomaly",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable torch.autograd.set_detect_anomaly (slow; off by default). "
+             "Use only to capture a recurring NaN's origin.",
+    )
     return parser.parse_args()
 
 
-def _patch_nan_guard() -> None:
+def _patch_nan_guard(max_grad_norm: float | None = None) -> None:
     """Wrap torch.nn.utils.clip_grad_norm_ to zero out NaN/Inf gradients before they corrupt weights.
 
     AMP's GradScaler detects and skips steps when its scaled grads have inf, but
@@ -111,19 +133,76 @@ def _patch_nan_guard() -> None:
         if any_nan:
             nan_event_count[0] += 1
             print(f"[nan-guard] zeroed NaN/Inf grads (occurrence #{nan_event_count[0]})")
-        return original_clip(params, max_norm, *args, **kwargs)
+        effective_max_norm = max_grad_norm if max_grad_norm is not None else max_norm
+        return original_clip(params, effective_max_norm, *args, **kwargs)
 
     torch.nn.utils.clip_grad_norm_ = safe_clip
+
+
+def _register_stagea_hardening(model, *, debug_anomaly: bool) -> None:
+    """Register the active halt-on-NaN callback (the thin seam). Feeds plain
+    scalars into the pure src.train.stagea_hardening logic; on a non-finite
+    state it attempts an explicit checkpoint save and sets trainer.stop so the
+    run does not waste epochs (the epoch-34 incident wasted ~20). If the EMA is
+    already non-finite, trainer.save_model() will not write a good EMA — the
+    last clean periodic/best checkpoint (from --save-period) is the last-good;
+    the acceptance runbook gates that checkpoint through validate_checkpoint_finite."""
+    import torch
+    from src.train.stagea_hardening import is_nonfinite_state, should_halt
+
+    if debug_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+
+    def _ema_finite(trainer) -> bool:
+        ema = getattr(trainer, "ema", None)
+        m = getattr(ema, "ema", None) if ema is not None else None
+        if m is None:
+            return True
+        for t in m.state_dict().values():
+            if hasattr(t, "isfinite") and not bool(torch.isfinite(t).all().item()):
+                return False
+        return True
+
+    def _check(trainer) -> None:
+        loss = getattr(trainer, "loss", None)
+        if loss is None:
+            loss_f = None
+        elif hasattr(loss, "item"):
+            try:
+                loss_f = float(loss.item())
+            except Exception:
+                loss_f = None
+        else:
+            loss_f = float(loss)
+        nf, reason = is_nonfinite_state(loss_f, _ema_finite(trainer))
+        msg, halt = should_halt(nonfinite=nf, reason=reason)
+        if halt:
+            print(f"[stagea-hardening] {msg} at epoch "
+                  f"{getattr(trainer, 'epoch', '?')}; saving + halting")
+            try:
+                trainer.save_model()
+            except Exception as exc:  # never let the guard itself crash the run
+                print(f"[stagea-hardening] save_model raised: {exc!r}")
+            trainer.stop = True
+
+    model.add_callback("on_train_batch_end", _check)
+    model.add_callback("on_fit_epoch_end", _check)
 
 
 def main() -> None:
     args = parse_args()
     if args.nan_guard:
-        _patch_nan_guard()
+        _patch_nan_guard(max_grad_norm=args.max_grad_norm)
     if args.noise:
         from src.train.scan_noise import patch_albumentations_for_scan_noise
         patch_albumentations_for_scan_noise(warmup_steps=args.noise_warmup_steps)
+    from src.train.stagea_hardening import build_hardened_overrides
+    hardened = build_hardened_overrides(
+        amp=args.amp, save_period=args.save_period,
+        max_grad_norm=args.max_grad_norm,
+    )
     model = YOLO(args.model)
+    _register_stagea_hardening(model, debug_anomaly=args.debug_anomaly)
     train_kwargs = dict(
         data=str(args.data),
         epochs=args.epochs,
@@ -138,9 +217,12 @@ def main() -> None:
         flipud=0, fliplr=0,
         mosaic=0, mixup=0,
         save=True,
+        save_period=hardened.save_period,
+        lr0=hardened.lr0,
+        lrf=hardened.lrf,
         patience=args.patience,
         workers=args.workers,
-        amp=args.amp,
+        amp=hardened.amp,
     )
     if args.compile:
         train_kwargs["compile"] = True
